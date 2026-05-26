@@ -184,6 +184,42 @@ cudaError_t dispatch_matmul(
     cudaStream_t   stream = 0);
 
 // ---------------------------------------------------------------------------
+// Fused RMSNorm + FP4 pack (single kernel)
+// ---------------------------------------------------------------------------
+// Input: FP32 projection output, RMSNorm weight
+// Output: FP4 packed + per-block scales
+// Replaces: fused_rmsnorm → pack_fp4 (2 kernels → 1 kernel)
+cudaError_t fused_rmsnorm_pack(
+    void*           x_out_fp4,
+    float*          x_out_scale,
+    const float*    proj,            // FP32 input (from gemv_fp4)
+    const float*    weight,          // RMSNorm weight
+    int             N,               // num elements
+    float           eps,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
+// Fused O-projection + RMSNorm + FP4 pack (convenience: 2 kernels)
+// ---------------------------------------------------------------------------
+// Replaces: gemv_fp4(W_o) → fused_rmsnorm → pack_fp4(x) (3 kernels → 2 kernels)
+// Allocates internal temp buffer.
+cudaError_t fused_o_norm_pack(
+    void*           x_out_fp4,
+    float*          x_out_scale,
+    float*          scratch1,        // unused (kept for API compat)
+    int*            scratch2,        // unused
+    float*          scratch3,        // unused
+    const void*     attn_fp4,
+    const float*    attn_scale,
+    const void*     W_o_fp4,
+    const float*    W_o_scale,
+    const float*    rmsnorm_weight,
+    int             K,               // input features (q_dim)
+    int             N,               // output features (hidden_dim)
+    float           eps,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
 // CUDA Graphs (decode overhead reduction)
 // ---------------------------------------------------------------------------
 cudaError_t capture_decode_graph(

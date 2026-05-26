@@ -63,6 +63,7 @@ set(KERNEL_SOURCES
     src/kernels/decode.cu
     src/kernels/cuda_graphs.cu
     src/kernels/fused_decode.cu
+    src/kernels/fused_o_norm.cu
 )
 
 # ---------------------------------------------------------------------------

@@ -198,10 +198,10 @@ int main(int argc, char** argv) {
             check(blackwell::kernels::pack_fp4(attn_fp4, b.attn_out, attn_scale, q_dim, 0), "pack attn");
             check(blackwell::kernels::gemv_fp4(b.proj_out, attn_fp4, attn_scale,
                 W_o_fp4[l], W_o_scale[l], q_dim, kHiddenDim, 0), "gemv_o");
-            check(blackwell::kernels::fused_rmsnorm(
-                b.x_fp32, b.proj_out, rmsnorm_w[l],
-                kHiddenDim, 1e-5f, 0), "rmsnorm");
-            check(blackwell::kernels::pack_fp4(b.x_fp4, b.x_fp32, b.x_scale, kHiddenDim, 0), "pack x");
+            // Fused RMSNorm + FP4 pack (was 2 kernels: rmsnorm + pack)
+            check(blackwell::kernels::fused_rmsnorm_pack(
+                b.x_fp4, b.x_scale, b.proj_out, rmsnorm_w[l],
+                kHiddenDim, 1e-5f, 0), "rmsnorm_pack");
         }
     }
     cudaDeviceSynchronize();
@@ -233,10 +233,9 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_fp4(attn_fp4, b.attn_out, attn_scale, q_dim, 0);
             blackwell::kernels::gemv_fp4(b.proj_out, attn_fp4, attn_scale,
                 W_o_fp4[l], W_o_scale[l], q_dim, kHiddenDim, 0);
-            blackwell::kernels::fused_rmsnorm(
-                b.x_fp32, b.proj_out, rmsnorm_w[l],
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.x_fp4, b.x_scale, b.proj_out, rmsnorm_w[l],
                 kHiddenDim, 1e-5f, 0);
-            blackwell::kernels::pack_fp4(b.x_fp4, b.x_fp32, b.x_scale, kHiddenDim, 0);
         }
     }
     printf("done\n");
@@ -270,10 +269,9 @@ int main(int argc, char** argv) {
         blackwell::kernels::pack_fp4(attn_fp4, b.attn_out, attn_scale, q_dim, graph_stream);
         blackwell::kernels::gemv_fp4(b.proj_out, attn_fp4, attn_scale,
             W_o_fp4[l], W_o_scale[l], q_dim, kHiddenDim, graph_stream);
-        blackwell::kernels::fused_rmsnorm(
-            b.x_fp32, b.proj_out, rmsnorm_w[l],
+        blackwell::kernels::fused_rmsnorm_pack(
+            b.x_fp4, b.x_scale, b.proj_out, rmsnorm_w[l],
             kHiddenDim, 1e-5f, graph_stream);
-        blackwell::kernels::pack_fp4(b.x_fp4, b.x_fp32, b.x_scale, kHiddenDim, graph_stream);
     }
 
     cudaStreamEndCapture(graph_stream, &graph);
@@ -329,10 +327,9 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_fp4(attn_fp4, b.attn_out, attn_scale, q_dim, 0);
             blackwell::kernels::gemv_fp4(b.proj_out, attn_fp4, attn_scale,
                 W_o_fp4[l], W_o_scale[l], q_dim, kHiddenDim, 0);
-            blackwell::kernels::fused_rmsnorm(
-                b.x_fp32, b.proj_out, rmsnorm_w[l],
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.x_fp4, b.x_scale, b.proj_out, rmsnorm_w[l],
                 kHiddenDim, 1e-5f, 0);
-            blackwell::kernels::pack_fp4(b.x_fp4, b.x_fp32, b.x_scale, kHiddenDim, 0);
         }
     }
     float total_direct = t2.end();
@@ -343,8 +340,6 @@ int main(int argc, char** argv) {
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
     cudaStreamDestroy(graph_stream);
-
-    cudaFree(attn_fp4); cudaFree(attn_scale);
 
     cudaFree(attn_fp4); cudaFree(attn_scale);
 
