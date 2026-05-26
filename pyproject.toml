@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "cmake>=3.26", "pybind11>=2.12"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackwell-inference"
+version = "0.1.0"
+description = "Custom CUDA kernels for LLM inference on RTX 5060 Ti (SM_120 / Blackwell)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "you@example.com"},
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ---------------------------------------------------------------------------
+# Build options
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "gtest>=1.12",
+    "cmake>=3.26",
+]
+build = [
+    "setuptools>=61.0",
+    "wheel",
+    "pybind11>=2.12",
+    "cmake>=3.26",
+]
+
+# ---------------------------------------------------------------------------
+# Key build env / CUDA hints
+# ---------------------------------------------------------------------------
+[tool.setuptools]
+package-dir = {}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+exclude = ["tests*"]
