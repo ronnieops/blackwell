@@ -35,6 +35,23 @@ static constexpr int kGEMVBlock = 256;  // threads per GEMV block
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Dequant 16 FP4 values from smem_raw → FP16 smem_fp16
+// All 16 share the same block scale.
+// raw_src points to 16 bytes of FP4 data in shared memory.
+__device__ __forceinline__ void dequant_stripe_from_smem(
+    __half* __restrict__ fp16_dst,
+    const uint8_t* __restrict__ raw_src,
+    float scale) {
+
+    alignas(16) uint8_t buf[16];
+    *reinterpret_cast<uint4*>(buf) = *reinterpret_cast<const uint4*>(raw_src);
+    __nv_fp4_e2m1* vals = reinterpret_cast<__nv_fp4_e2m1*>(buf);
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        fp16_dst[j] = __float2half(static_cast<float>(vals[j]) * scale);
+    }
+}
+
 // Load 16 FP4 values via uint4 vector load, dequant with block-scale, store FP16.
 // Each uint4 = 16 bytes = 16 __nv_fp4_e2m1 values.
 // All 16 values share the same scale (belong to same 16-element block).
@@ -92,9 +109,19 @@ __global__ void gemm_fp4_kernel(
     int block_col = blockIdx.y * TN;
     if (block_row >= M || block_col >= N_) return;
 
-    // Shared memory: dequantized FP16 tiles
-    __shared__ __half smem_A[TM * TK];  // 128×64 = 16384 B
-    __shared__ __half smem_B[TK * TN];  // 64×128 = 16384 B
+    // Dynamic shared memory layout (80 KB total, requested at launch time)
+    // Offsets into dynamic smem pool:
+    //   [0 .. TM*TK):          smem_raw_A    — raw FP4 A (8 KB)
+    //   [TM*TK .. TM*TK+TK*TN): smem_raw_B    — raw FP4 B (8 KB)
+    //   [+0 .. 2*TM*TK):       smem_A[2]      — FP16 A double-buffered (32 KB)
+    //   [+0 .. 2*TK*TN):       smem_B[2]      — FP16 B double-buffered (32 KB)
+    extern __shared__ uint8_t smem_dyn[];
+    uint8_t* smem_raw_A = smem_dyn;
+    uint8_t* smem_raw_B = smem_dyn + TM * TK;
+    __half* smem_A0 = reinterpret_cast<__half*>(smem_dyn + TM * TK + TK * TN);
+    __half* smem_A1 = smem_A0 + TM * TK;
+    __half* smem_B0 = smem_A1 + TM * TK;
+    __half* smem_B1 = smem_B0 + TK * TN;
 
     int warp_id = threadIdx.x / 32;
     int warp_m = warp_id % 4;
@@ -102,6 +129,8 @@ __global__ void gemm_fp4_kernel(
 
     int frag_m_start = warp_m * FM_PER_WARP;  // 0, 2, 4, or 6
     int frag_n_start = warp_n * FN_PER_WARP;  // 0 or 4
+
+    int num_tiles = K_ / TK;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     namespace wmma = nvcuda::wmma;
@@ -116,52 +145,73 @@ __global__ void gemm_fp4_kernel(
         wmma::fill_fragment(frag_c[i], 0.0f);
     }
 
-    // Number of scale blocks along K
     int num_K_blks = (K_ + B - 1) / B;
+    int num_N_blks = (N_ + B - 1) / B;
+    const int tid = threadIdx.x;
+    const int nthreads = blackwell::kGEMMThreads;
 
-    // Outer K-tiling loop
-    for (int k_start = 0; k_start < K_; k_start += TK) {
-        // ----- Load A tile [TM × TK]: 8192 FP4 values -----
-        // Each thread: 2× uint4 (32 FP4 values), each uint4 = one 16-element scale block
-        for (int i = threadIdx.x; i < (TM * TK) / 16; i += blackwell::kGEMMThreads) {
-            int flat16 = i * 16;
-            int m_loc = flat16 / TK;
-            int k_loc = flat16 % TK;
-            int m_glob = block_row + m_loc;
-            int k_glob = k_start + k_loc;
+    // ----- First K-tile: synchronous load + dequant → FP16 stage 0 (smem_A0/smem_B0) -----
+    for (int i = tid; i < (TM * TK) / 16; i += nthreads) {
+        int flat16 = i * 16;
+        int m_loc = flat16 / TK;
+        int k_loc = flat16 % TK;
+        int m_glob = block_row + m_loc;
+        int blk_m = m_glob / B;
+        int blk_k = k_loc / B;
+        float sc = A_scale[blk_m * num_K_blks + blk_k];
+        load_dequant_stripe<TK>(
+            &smem_A0[m_loc * TK + k_loc],
+            A_fp4, m_glob, k_loc, K_, sc, M, K_);  // k_glob = k_loc (k_start=0)
+    }
+    for (int i = tid; i < (TK * TN) / 16; i += nthreads) {
+        int flat16 = i * 16;
+        int k_loc = flat16 / TN;
+        int n_loc = flat16 % TN;
+        int n_glob = block_col + n_loc;
+        int blk_k = k_loc / B;
+        int blk_n = n_glob / B;
+        float sc = B_scale[blk_k * num_N_blks + blk_n];
+        load_dequant_stripe<TN>(
+            &smem_B0[k_loc * TN + n_loc],
+            B_fp4, k_loc, n_glob, N_, sc, K_, N_);  // k_glob = k_loc (k_start=0)
+    }
+    __syncthreads();
 
-            if (m_glob < M && k_glob < K_) {
-                int blk_m = m_glob / B;
-                int blk_k = k_glob / B;
-                float sc = A_scale[blk_m * num_K_blks + blk_k];
-                load_dequant_stripe<TK>(
-                    &smem_A[m_loc * TK + k_loc],
-                    A_fp4, m_glob, k_glob, K_, sc, M, K_);
+    // ----- Pipelined K-tiles: cp.async overlaps with WMMA compute -----
+    int pipe_stage = 0;
+    for (int t = 0; t < num_tiles; ++t) {
+        int next_k_start = (t + 1) * TK;
+
+        // Issue cp.async for next tile (unless this is the last)
+        if (next_k_start < K_) {
+            for (int i = tid; i < (TM * TK) / 16; i += nthreads) {
+                int flat16 = i * 16;
+                int m_loc = flat16 / TK;
+                int k_loc = flat16 % TK;
+                int m_glob = block_row + m_loc;
+                int k_glob = next_k_start + k_loc;
+                const void* src = reinterpret_cast<const void*>(
+                    A_fp4 + m_glob * K_ + k_glob);
+                void* dst = smem_raw_A + m_loc * TK + k_loc;
+                __pipeline_memcpy_async(dst, src, 16);
             }
-        }
-        __syncthreads();
-
-        // ----- Load B tile [TK × TN]: 8192 FP4 values -----
-        int num_N_blks = (N_ + B - 1) / B;
-        for (int i = threadIdx.x; i < (TK * TN) / 16; i += blackwell::kGEMMThreads) {
-            int flat16 = i * 16;
-            int k_loc = flat16 / TN;
-            int n_loc = flat16 % TN;
-            int k_glob = k_start + k_loc;
-            int n_glob = block_col + n_loc;
-
-            if (k_glob < K_ && n_glob < N_) {
-                int blk_k = k_glob / B;
-                int blk_n = n_glob / B;
-                float sc = B_scale[blk_k * num_N_blks + blk_n];
-                load_dequant_stripe<TN>(
-                    &smem_B[k_loc * TN + n_loc],
-                    B_fp4, k_glob, n_glob, N_, sc, K_, N_);
+            for (int i = tid; i < (TK * TN) / 16; i += nthreads) {
+                int flat16 = i * 16;
+                int k_loc = flat16 / TN;
+                int n_loc = flat16 % TN;
+                int k_glob = next_k_start + k_loc;
+                int n_glob = block_col + n_loc;
+                const void* src = reinterpret_cast<const void*>(
+                    B_fp4 + k_glob * N_ + n_glob);
+                void* dst = smem_raw_B + k_loc * TN + n_loc;
+                __pipeline_memcpy_async(dst, src, 16);
             }
+            __pipeline_commit();
         }
-        __syncthreads();
 
-        // ----- 4× m16n16k16 WMMA (cover K=64) -----
+        // ----- WMMA compute on current FP16 buffer -----
+        __half* cur_A = (pipe_stage == 0) ? smem_A0 : smem_A1;
+        __half* cur_B = (pipe_stage == 0) ? smem_B0 : smem_B1;
         for (int k_s = 0; k_s < TK; k_s += 16) {
             #pragma unroll
             for (int fm = 0; fm < FM_PER_WARP; ++fm) {
@@ -169,21 +219,55 @@ __global__ void gemm_fp4_kernel(
                 #pragma unroll
                 for (int fn = 0; fn < FN_PER_WARP; ++fn) {
                     int abs_fn = frag_n_start + fn;
-
-                    // A fragment: rows [abs_fm*16, abs_fm*16+16), cols [k_s, k_s+16)
                     wmma::load_matrix_sync(frag_a,
-                        smem_A + abs_fm * 16 * TK + k_s, TK);
-                    // B fragment: rows [k_s, k_s+16), cols [abs_fn*16, abs_fn*16+16)
+                        cur_A + abs_fm * 16 * TK + k_s, TK);
                     wmma::load_matrix_sync(frag_b,
-                        smem_B + k_s * TN + abs_fn * 16, TN);
-
+                        cur_B + k_s * TN + abs_fn * 16, TN);
                     wmma::mma_sync(frag_c[fm * FN_PER_WARP + fn],
                         frag_a, frag_b,
                         frag_c[fm * FN_PER_WARP + fn]);
                 }
             }
         }
-        __syncthreads();
+
+        // Wait for cp.async + dequant raw → next FP16 buffer
+        if (next_k_start < K_) {
+            __pipeline_wait_prior(0);
+            __syncthreads();
+
+            // Dequant raw → next FP16 stage
+            __half* next_A = (pipe_stage == 0) ? smem_A1 : smem_A0;
+            __half* next_B = (pipe_stage == 0) ? smem_B1 : smem_B0;
+            for (int i = tid; i < (TM * TK) / 16; i += nthreads) {
+                int flat16 = i * 16;
+                int m_loc = flat16 / TK;
+                int k_loc = flat16 % TK;
+                int m_glob = block_row + m_loc;
+                int k_glob = next_k_start + k_loc;
+                int blk_m = m_glob / B;
+                int blk_k = k_glob / B;
+                float sc = A_scale[blk_m * num_K_blks + blk_k];
+                dequant_stripe_from_smem(
+                    &next_A[m_loc * TK + k_loc],
+                    &smem_raw_A[m_loc * TK + k_loc], sc);
+            }
+            for (int i = tid; i < (TK * TN) / 16; i += nthreads) {
+                int flat16 = i * 16;
+                int k_loc = flat16 / TN;
+                int n_loc = flat16 % TN;
+                int k_glob = next_k_start + k_loc;
+                int n_glob = block_col + n_loc;
+                int blk_k = k_glob / B;
+                int blk_n = n_glob / B;
+                float sc = B_scale[blk_k * num_N_blks + blk_n];
+                dequant_stripe_from_smem(
+                    &next_B[k_loc * TN + n_loc],
+                    &smem_raw_B[k_loc * TN + n_loc], sc);
+            }
+            __syncthreads();
+        }
+
+        pipe_stage ^= 1;  // flip for next iteration
     }
 
     // ----- Store results: each warp writes 8× 16×16 output fragments -----
@@ -278,7 +362,28 @@ cudaError_t gemm_fp4_block_scaled(
         N_arg / blackwell::kGEMMTileN
     );
 
-    gemm_fp4_kernel<<<grid, blackwell::kGEMMThreads, 0, stream>>>(
+    // Dynamic shared memory: 80 KB for 2-stage cp.async pipeline
+    //   smem_raw_A: TM*TK = 8192 B
+    //   smem_raw_B: TK*TN = 8192 B
+    //   smem_A[2]:  2*TM*TK*2 = 32768 B (FP16)
+    //   smem_B[2]:  2*TK*TN*2 = 32768 B (FP16)
+    //   Total: 81920 B
+    constexpr int kSmemGEMM = blackwell::kGEMMTileM * blackwell::kGEMMTileK
+                            + blackwell::kGEMMTileK * blackwell::kGEMMTileN      // raw FP4
+                            + 2 * blackwell::kGEMMTileM * blackwell::kGEMMTileK * 2  // FP16 A double
+                            + 2 * blackwell::kGEMMTileK * blackwell::kGEMMTileN * 2; // FP16 B double
+
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp4_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kSmemGEMM);
+        if (e != cudaSuccess) return e;
+        attr_set = true;
+    }
+
+    gemm_fp4_kernel<<<grid, blackwell::kGEMMThreads, kSmemGEMM, stream>>>(
         C,
         static_cast<const Fp4*>(A_fp4),
         static_cast<const Fp4*>(B_fp4),

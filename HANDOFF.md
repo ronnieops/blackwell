@@ -17,7 +17,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | ------ | ------ | ---- |
 | Project skeleton | ✅ | CMake build, pyproject, dirs, static lib links clean |
 | pack_fp4 / unpack_fp4 | ✅ | Verified correct. E2M1 ±{0.25,0.5,1.0,2.0}, scale=absmax/3 |
-| gemm_fp4_block_scaled | ✅ Optimized | **22–33 GB/s** (6.2× vs 3–5 GB/s). 128×128×64 CTA, 8 warps, vec4 loads |
+| gemm_fp4_block_scaled | ✅ Pipelined | **25–38 GB/s** (+14% via cp.async 2-stage pipeline). 136 regs, 80 KB smem |
 | gemv_fp4 | ✅ Dynamic K tiling | Handles any K (multiple of 16). K=2048, K=4096 verified. 22–67 GB/s |
 | fused_rmsnorm | ✅ | Warp-reduced sum, single block (4096 max elements) |
 | apply_swiglu | ✅ | Elementwise silu(gate) × up |
@@ -59,7 +59,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 
 | Issue | Severity | Root Cause | Fix Path |
 | ----- | -------- | ---------- | -------- |
-| GEMM 22–33 GB/s (4–7% of peak) | 🟡 Still under target | 128×128×64 tile helps, but no cp.async pipeline, no warp specialization | Add 2-stage cp.async pipeline, swizzle layout, occupancy tuning |
+| GEMM 25–38 GB/s (5–7.6% of peak) | 🟡 Still under target | cp.async pipeline gives +14%, but dequant still serialized | Warp specialization: producer warps load+dequant, consumer warps WMMA |
 | GEMV K=64 hardcoded | ✅ Fixed | Dynamic K-tiling: any K multiple of 16. K=2048/K=4096 verified | Unlocks Qwen3-1.7B decode (hidden_dim=2048) |
 | SwiGLU GB/s > theoretical peak | 🟡 Measurement artifact | Timer resolution too coarse (~3us kernel) | Batch more elements or use CUDA events correctly |
 | FP4 rel error = 1.0 for small inputs | 🟢 Expected | E2M1 can't represent values < 0.5×scale below 0 → quantize to 0 | Acceptable for LLM weights (usually >0.1); use FP8/FP6 where accuracy critical |
@@ -73,9 +73,10 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | - | ---- | -------- | ----- |
 | # | Task | Priority | Notes |
 | - | ---- | -------- | ----- |
-| 5 | Add cp.async 2-stage pipeline to GEMM | High | Overlap FP4→FP16 dequant with WMMA compute. Target: 80+ GB/s |
+| 5 | Add cp.async 2-stage pipeline to GEMM | ✅ Complete | 25–38 GB/s (+14%). 136 regs, 80 KB smem |
 | 6 | Dynamic K GEMV (hidden_dim=2048) | ✅ Complete | GEMV handles any K. K=2048, K=4096 verified rel_err=0 |
-| 7 | KV-cache decode (compact bandwidth-first) | Medium | Next after GEMM + GEMV are healthy |
+| 7 | Warp specialization for GEMM | Medium | Producer warps: load+dequant. Consumer warps: WMMA. Target: 80+ GB/s |
+| 8 | KV-cache decode | Medium | Next step toward end-to-end decode |
 | 8 | Prefill kernels (separate from decode) | Medium | Depends on GEMM optimization |
 | 9 | CUDA Graphs for decode launch overhead | Low | Current GEMV latency = 3us — launch overhead dominates |
 | 10 | Profiling hooks (Nsight Compute) | Low | Needed for optimization iterations |
@@ -135,8 +136,8 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep 
 **Last validated**: 2026-05-26, ~15:24 UTC  
 **Build**: ✅ Clean (libblackwell_kernels.a, bench/phase_a)  
 **Run**: ✅ No segfault, no FAIL lines, all output values reasonable  
-**GEMM**: 22–33 GB/s (6.2× improvement over baseline). 128×128×64 CTA, 8 warps, vec4 loads. 156 regs, 0 spill, 32 KB smem.  
-**GEMV**: All outputs non-zero, latency 2–4us dominated by launch overhead (unchanged)  
+**GEMM**: 25–38 GB/s (+14% via cp.async). 128×128×64 CTA, 8 warps, vec4 loads. 136 regs, 0 spill, 80 KB dynamic smem.  
+**GEMV**: Dynamic K-tiling works. K=2048/K=4096 verified. rel_err=0. 37 regs.  
 **Public symbols**: All 18 present, none in anonymous namespace  
 **CMake fix**: `CUDA::CUDA` → `CUDA::cudart` (CMake 3.28 incompatibility)  
 
