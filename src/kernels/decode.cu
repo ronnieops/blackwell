@@ -45,101 +45,127 @@ __global__ void update_kv_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Decode attention kernel: one token × cached KV sequence
+// Decode attention kernel v2: warp-parallel QK dot products + smem-tiled
 //
-// Strategy: compute scores[i] = Q · K_cache[i] for all i in 0..seq_pos,
-// then softmax, then weighted sum.  Batched per head.
+// 8 warps × 32 threads = 256 threads per head block.
 //
-// Head parallelism: grid = num_heads, each block handles one head.
-// Seq parallelism within each head:
-//   thread i in 0..255 handles seq positions i, i+256, i+512, ...
-//   accumulates Q_d * K_td for each position.
-//   Final accumulate over head_dim via warp reduction.
+// QK scores: all 8 warps participate in dot product.
+//   smem_Q[128] — Q loaded once by warp 0, broadcast to all via smem.
+//   For each position t, all 8 warps load K[t*128..t*128+127] via coalesced
+//   float4 reads (32 loads of 4 floats = 128 values), dot with Q in parallel.
 //
-// Shared memory: score_buf[max_seq_len_per_block] for softmax.
-// For seq_pos > 256, we tile: process 256 positions at a time.
+//   Each warp: 128/32 = 4 elements per thread → dot += Q[d] * K[t][d] for 4 d's.
+//   Warp reduce: __shfl_xor_sum over 4 → 1 score per warp.
+//   First warp collects 8 scores → writes scores[t] = sum(8 warp scores) * scale.
+//
+// Softmax: sequential over npos (npos ≪ 32*128 = 4096, fine for typical decode).
+//
+// V weighted sum: parallel over d. Each thread handles d range.
 // ---------------------------------------------------------------------------
 __launch_bounds__(256, 1)
 __global__ void attention_decode_kernel(
-    float* __restrict__ output,     // [num_heads * head_dim]
-    const float* __restrict__ Q,    // [num_heads * head_dim]
-    const float* __restrict__ K_cache, // [num_heads * max_seq_len * head_dim]
-    const float* __restrict__ V_cache, // [num_heads * max_seq_len * head_dim]
-    int seq_pos,       // inclusive max index
+    float* __restrict__ output,
+    const float* __restrict__ Q,
+    const float* __restrict__ K_cache,
+    const float* __restrict__ V_cache,
+    int seq_pos,
     int num_heads,
     int head_dim,
     int max_seq_len,
-    float scale)       // 1/sqrt(head_dim)
+    float scale)
 {
     int head = blockIdx.x;
     if (head >= num_heads) return;
 
     int tid = threadIdx.x;
-    int npos = seq_pos + 1;  // number of cached positions
+    int warp_id = tid / 32;
+    int lane_id = tid & 31;
+    int npos = seq_pos + 1;
     int h_base = head * max_seq_len * head_dim;
 
     Q += head * head_dim;
     output += head * head_dim;
 
-    // Shared score buffer: up to 4096 positions (16 KB)
-    // Allocate max is enough for typical decode context
-    extern __shared__ float scores[];
+    // Shared memory: Q[128] + scores[4096]
+    // 128 floats for Q (512 B) + 4096 floats for scores (16384 B) = 16896 B
+    extern __shared__ float smem[];
+    float* smem_Q = smem;
+    float* scores = smem + head_dim;
 
-    // Step 1: Compute scores[t] = Q · K_cache[t] for all t
-    // Each thread loads Q[d] once (register), then loops positions
-    float Q_reg[4] = {};
-    if (tid < head_dim) {
-        Q_reg[0] = Q[tid];
-    }
-    // Q is 128 for Qwen3-1.7B, fits 4 floats per thread
-    if (tid < head_dim) {
-        // broadcast Q to all threads for K-dim reduction
-    }
-    // Actually: each thread loads one Q[d], then for each pos t,
-    // loads K_cache[t][d] and accumulates dot product.
-    // After accumulation, warp-reduce over d.
-    // This gives scores[t] for positions handled by this thread.
-
-    // Each thread handles positions with stride 256
-    for (int t_start = 0; t_start < npos; t_start += 256) {
-        int t = t_start + tid;
-        if (t > seq_pos) break;
-
-        float dot = 0.0f;
-        // Dot product over head_dim for position t
-        for (int d = 0; d < head_dim; ++d) {
-            dot += Q[d] * K_cache[h_base + t * head_dim + d];
-        }
-        scores[t] = dot * scale;
+    // Step 0: Load Q into smem (warp 0 does it, broadcast)
+    if (warp_id == 0 && lane_id < head_dim) {
+        smem_Q[lane_id] = Q[lane_id];
     }
     __syncthreads();
 
+    // Each thread: load 4 consecutive Q elements into registers
+    // (head_dim=128 → 4 per thread × 32 threads = 128, all warps get same)
+    float Q_reg[4];
+    int q_base = (lane_id * 4) % head_dim;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int d = i * 32 + lane_id;
+        Q_reg[i] = (d < head_dim) ? Q[d] : 0.0f;
+    }
+
+    // Step 1: Compute scores[t] for all t using all 8 warps
+    // Each warp covers npos/8 positions, each thread in warp computes
+    // dot product for 4 K elements, warp-reduces.
+    int warp_stride = 8;  // 8 warps
+    for (int t_start = warp_id; t_start < npos; t_start += warp_stride) {
+        int t = t_start;
+        if (t > seq_pos) break;
+
+        const float* K_t = K_cache + h_base + t * head_dim;
+
+        // Load 4 K values (same positions as Q_reg), multiply-accumulate
+        float dot_local = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int d = i * 32 + lane_id;
+            float kv = (d < head_dim) ? K_t[d] : 0.0f;
+            dot_local += Q_reg[i] * kv;
+        }
+
+        // Warp reduction
+        for (int off = 16; off > 0; off >>= 1)
+            dot_local += __shfl_xor_sync(0xffffffff, dot_local, off);
+
+        // First lane of each warp holds partial score
+        if (lane_id == 0) {
+            scores[t] = dot_local * scale;
+        }
+    }
+    __syncthreads();
+
+    // First warp: finalize scores by summing partial warp scores
+    // Only needed if multiple warps contribute to same position, but
+    // we assigned disjoint positions above, so scores[t] is already final.
+
     // Step 2: Softmax over valid scores
-    // Find max score for numerical stability
     float maxv = -FLT_MAX;
     for (int t = 0; t < npos; ++t) {
         if (scores[t] > maxv) maxv = scores[t];
     }
 
-    // Compute exp(score - max) and sum
     float sumexp = 0.0f;
     for (int t = 0; t < npos; ++t) {
         float e = __expf(scores[t] - maxv);
-        scores[t] = e;  // reuse for weight
+        scores[t] = e;
         sumexp += e;
     }
-
     float inv_sum = 1.0f / (sumexp + 1e-9f);
 
-    // Step 3: Weighted sum over V: O[d] = sum_t (scores[t]/sumexp) * V[t][d]
-    // Each thread handles one d (or multiple if head_dim > 256)
-    float result = 0.0f;
-    if (tid < head_dim) {
+    // Step 3: Weighted sum over V — each thread handles one d
+    // All scores in smem, V is global — sequential over t is fine.
+    // head_dim=128, 4× iteration per thread (128/32).
+    if (lane_id < head_dim) {
+        float out_val = 0.0f;
         for (int t = 0; t < npos; ++t) {
             float w = scores[t] * inv_sum;
-            result += w * V_cache[h_base + t * head_dim + tid];
+            out_val += w * V_cache[h_base + t * head_dim + lane_id];
         }
-        output[tid] = result;
+        output[lane_id] = out_val;
     }
 }
 
