@@ -14,3 +14,4 @@ Makefile
 compile_commands.json
 .vscode/
 .idea/
+build_old_attempt/
