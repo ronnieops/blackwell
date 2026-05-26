@@ -15,3 +15,5 @@ compile_commands.json
 .vscode/
 .idea/
 build_old_attempt/
+bench/test_decode
+build_old_attempt/

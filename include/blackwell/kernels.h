@@ -88,6 +88,20 @@ cudaError_t apply_swiglu(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
+// Decode attention (single token × KV cache)
+// ---------------------------------------------------------------------------
+cudaError_t attention_decode(
+    float*          output,      // [num_heads * head_dim] result
+    const float*    Q,           // [num_heads * head_dim] query (dequantized)
+    const float*    K_cache,     // [num_heads * max_seq_len * head_dim] KV cache
+    const float*    V_cache,     // [num_heads * max_seq_len * head_dim]
+    int             seq_pos,     // current position (inclusive)
+    int             num_heads,
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
 // Attention (prefill)
 // ---------------------------------------------------------------------------
 cudaError_t attention_fp4(

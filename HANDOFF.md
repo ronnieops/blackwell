@@ -23,8 +23,10 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | apply_swiglu | ✅ | Elementwise silu(gate) × up |
 | fused_rope | ✅ | In-place rotation, smem cos/sin cache |
 | dispatch_matmul | ✅ | Routes GEMM vs GEMV by KernelMode |
+| attention_decode | ✅ New | Single-token decode attention. Verified: 2 cached tokens → correct softmax output |
+| update_kv_cache | ✅ New | Writes K/V at seq_pos. Verified: 2 positions correct |
 | attention_fp4 | 🟡 Stub | Returns cudaErrorNotReady |
-| KV-cache (update/load) | 🟡 Stub | Returns cudaErrorNotReady |
+| KV-cache (load) | 🟡 Stub | load_kv_cache_qkgv still returns cudaErrorNotReady |
 | prefill/decode runner | 🟡 Stub | Returns cudaErrorNotReady |
 | CUDA Graphs | 🟡 Stub | capture/launch/destroy stubs |
 | Phase A benchmark | ✅ | bench/phase_a + PHASE_A_RESULTS.md |
@@ -75,8 +77,9 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | - | ---- | -------- | ----- |
 | 5 | Add cp.async 2-stage pipeline to GEMM | ✅ Complete | 25–38 GB/s (+14%). 136 regs, 80 KB smem |
 | 6 | Dynamic K GEMV (hidden_dim=2048) | ✅ Complete | GEMV handles any K. K=2048, K=4096 verified rel_err=0 |
-| 7 | Warp specialization for GEMM | Medium | Producer warps: load+dequant. Consumer warps: WMMA. Target: 80+ GB/s |
-| 8 | KV-cache decode | Medium | Next step toward end-to-end decode |
+| 7 | KV-cache update + decode attention | ✅ Complete | Verified with 2 cached tokens → correct output ~2.0 |
+| 8 | Warp specialization | ❌ Abandoned | Register thrashing (255 reg + 132 B spill). Pipeline overlap already milked |
+| 9 | End-to-end decode benchmark | High | Chain: Q_gen → kv_update → attention_decode → GEMV. Measure latency vs llama.cpp 114 t/s |
 | 8 | Prefill kernels (separate from decode) | Medium | Depends on GEMM optimization |
 | 9 | CUDA Graphs for decode launch overhead | Low | Current GEMV latency = 3us — launch overhead dominates |
 | 10 | Profiling hooks (Nsight Compute) | Low | Needed for optimization iterations |
@@ -138,7 +141,8 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep 
 **Run**: ✅ No segfault, no FAIL lines, all output values reasonable  
 **GEMM**: 25–38 GB/s (+14% via cp.async). 128×128×64 CTA, 8 warps, vec4 loads. 136 regs, 0 spill, 80 KB dynamic smem.  
 **GEMV**: Dynamic K-tiling works. K=2048/K=4096 verified. rel_err=0. 37 regs.  
-**Public symbols**: All 18 present, none in anonymous namespace  
+**Public symbols**: 19 present (added `attention_decode`). All outside anonymous namespace.  
+**New decode kernels**: `update_kv_cache`, `attention_decode` — both verified correct.  
 **CMake fix**: `CUDA::CUDA` → `CUDA::cudart` (CMake 3.28 incompatibility)  
 
 ---
