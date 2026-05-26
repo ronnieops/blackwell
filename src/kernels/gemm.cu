@@ -9,7 +9,11 @@
 //
 // GEMV (decode path):
 //   y(1×N) = x(1×K) @ W(K×N)
-//   K=64 fixed (single tile). Dynamic K tiling separated into gemv_fp4_batched.
+//   y[1×N] = Σ_k x[k] × W[k][n]  for n in 0..N-1
+//   Dynamic K-tiling: loop over K in 64-element chunks.
+//   256 threads/block, grid = ceil(N/256).
+//   Each thread: loop over K, load W[k][n_out] (coalesced within warp),
+//   x[k] broadcast via L1 (all threads read same address).
 
 #include <cuda_runtime.h>
 #include <cuda_fp4.h>
@@ -25,17 +29,11 @@ namespace {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr int kNumWarpsGEMV = 2;
-static constexpr int kThreadsGEMV  = kNumWarpsGEMV * 32; // 64
-static constexpr int kGEMVOutputsPerBlock = kThreadsGEMV; // 64
+static constexpr int kGEMVBlock = 256;  // threads per GEMV block
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-__device__ __forceinline__ float dequant_fp4(__nv_fp4_e2m1 v, float scale) {
-    return static_cast<float>(v) * scale;
-}
 
 // Load 16 FP4 values via uint4 vector load, dequant with block-scale, store FP16.
 // Each uint4 = 16 bytes = 16 __nv_fp4_e2m1 values.
@@ -216,54 +214,42 @@ __global__ void gemm_fp4_kernel(
 
 // ===========================================================================
 // GEMV kernel: decode path — one token × weight matrix
+//
+// Dynamic K-tiling: handles any K that is a multiple of kFP4BlockSize (16).
+//   y[n] = Σ_{k=0}^{K-1} x[k] × W[k][n]
+//
+// Memory access:
+//   W[k][n]: for fixed k, threads access consecutive n addresses → coalesced.
+//            Across k, stride is N elements (row-major K×N).
+//   x[k]:    all threads read same address → L1 broadcast.
+//
+// No shared memory needed — W is strided along K (can't vectorize), x is tiny.
 // ===========================================================================
-__launch_bounds__(kThreadsGEMV, 1)
+__launch_bounds__(kGEMVBlock, 1)
 __global__ void gemv_fp4_kernel(
     float* __restrict__ y_out,
     const __nv_fp4_e2m1* __restrict__ x_fp4,
     const float* __restrict__ x_scale,
     const __nv_fp4_e2m1* __restrict__ W_fp4,
     const float* __restrict__ W_scale,
-    int in_features, int out_features) {
+    int K, int N) {
 
-    using Fp4 = __nv_fp4_e2m1;
-    constexpr int K = blackwell::kGEMMTileK;   // 64
-    constexpr int B  = blackwell::kFP4BlockSize; // 16
-    static_assert(K % B == 0, "");
+    constexpr int B = blackwell::kFP4BlockSize; // 16
+    int n_out = blockIdx.x * kGEMVBlock + threadIdx.x;
+    if (n_out >= N) return;
 
-    const int lane_id = threadIdx.x & 31;
-    const int warp_id = threadIdx.x >> 5;
-    const int n_out   = warp_id * 32 + lane_id;  // 0..63
-    if (n_out >= out_features) return;
-
-    __half w_hp[K / B];
-    #pragma unroll
-    for (int kb = 0; kb < K / B; ++kb) {
-        int k_idx = kb * B + lane_id;
-        int w_idx = n_out * in_features + k_idx;
-        float scale = W_scale[n_out / B];
-        float v = (k_idx < in_features)
-                  ? dequant_fp4(W_fp4[w_idx], scale)
-                  : 0.0f;
-        w_hp[kb] = __float2half(v);
-    }
-    __syncthreads();
-
-    __half x_hp[K / B];
-    if (lane_id < K / B) {
-        float v = dequant_fp4(x_fp4[lane_id * B], x_scale[lane_id]);
-        x_hp[lane_id] = __float2half(v);
-    }
-    #pragma unroll
-    for (int kb = 0; kb < K / B; ++kb) {
-        x_hp[kb] = __shfl_sync(0xffffffff, x_hp[kb], 0);
-    }
-    __syncthreads();
+    int n_blk = n_out / B;
+    int num_N_blks = (N + B - 1) / B;
 
     float acc = 0.0f;
-    #pragma unroll
-    for (int kb = 0; kb < K / B; ++kb) {
-        acc += __half2float(x_hp[kb]) * __half2float(w_hp[kb]);
+    for (int k = 0; k < K; ++k) {
+        int k_blk = k / B;
+        // x[k] — same address for all threads → L1 broadcast
+        float xv = static_cast<float>(x_fp4[k]) * x_scale[k_blk];
+        // W[k][n_out] — coalesced within warp (consecutive n values)
+        float wv = static_cast<float>(W_fp4[k * N + n_out])
+                 * W_scale[k_blk * num_N_blks + n_blk];
+        acc += xv * wv;
     }
     y_out[n_out] = acc;
 }
@@ -307,13 +293,13 @@ cudaError_t gemv_fp4(
     int in_features_arg, int out_features, cudaStream_t stream) {
 
     using Fp4 = __nv_fp4_e2m1;
-    if (in_features_arg % blackwell::kFP4BlockSize != 0 ||
-        in_features_arg != blackwell::kGEMMTileK) {
+    // K must be multiple of FP4 block size (16). No longer restricted to 64.
+    if (in_features_arg % blackwell::kFP4BlockSize != 0) {
         return cudaErrorInvalidValue;
     }
 
-    int nb = (out_features + kGEMVOutputsPerBlock - 1) / kGEMVOutputsPerBlock;
-    gemv_fp4_kernel<<<dim3(nb), dim3(kThreadsGEMV), 0, stream>>>(
+    int nb = (out_features + kGEMVBlock - 1) / kGEMVBlock;
+    gemv_fp4_kernel<<<dim3(nb), dim3(kGEMVBlock), 0, stream>>>(
         y_out,
         static_cast<const Fp4*>(x_fp4), x_scale,
         static_cast<const Fp4*>(W_fp4), W_scale,

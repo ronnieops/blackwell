@@ -96,22 +96,28 @@ void test_pack(int n) {
 double bench_gemv(const float* W_h, int in_, int out_, int warm, int bench, double* gbps_out) {
     *gbps_out = 0;
     int nw = in_ * out_;
-    int nb_scales_x = in_ / 16;  // 1 per 16-element FP4 block
+    int nb_scales_x = in_ / 16;
+    int nb_scales_W = (in_ / 16) * (out_ / 16);  // 2D block scales: (K/16) × (N/16)
     float *d_W32, *d_x32, *d_y;
     void   *d_W4, *d_x4;
     float  *d_ws, *d_xs;
     cudaMalloc(&d_W32, nw*4); cudaMalloc(&d_x32, in_*4); cudaMalloc(&d_y, out_*4);
     cudaMalloc(&d_W4, nw); cudaMalloc(&d_x4, in_);
-    cudaMalloc(&d_ws, 4); cudaMalloc(&d_xs, nb_scales_x*4);
+    cudaMalloc(&d_ws, nb_scales_W*4); cudaMalloc(&d_xs, nb_scales_x*4);
 
     cudaMemcpy(d_W32, W_h, nw*4, cudaMemcpyHostToDevice);
     std::vector<float> x_h(in_, 1.f);
     cudaMemcpy(d_x32, x_h.data(), in_*4, cudaMemcpyHostToDevice);
 
+    // W_scale: one scale per (16,16) block, matching GEMM convention
+    // W_scale[(k/16) * (N/16) + (n/16)]
     float am = 0.f;
     for (int i = 0; i < nw; ++i) { float a = fabsf(W_h[i]); if (a > am) am = a; }
     float sv = am / 3.f;
-    cudaMemcpy(d_ws, &sv, 4, cudaMemcpyHostToDevice);
+    std::vector<float> W_scales_h(nb_scales_W, sv);
+    cudaMemcpy(d_ws, W_scales_h.data(), nb_scales_W*4, cudaMemcpyHostToDevice);
+
+    // pack_fp4 uses uniform scale (scale_in[0])
     if (!check(blackwell::kernels::pack_fp4(d_W4, d_W32, d_ws, nw, 0), "pack_fp4(W)")) return 0;
 
     // Pack x to FP4 with per-block scales
@@ -132,7 +138,7 @@ double bench_gemv(const float* W_h, int in_, int out_, int warm, int bench, doub
     }
     float ms = t.end() / bench;
 
-    size_t total = in_ + nw + nb_scales_x*4 + 4 + out_*4;
+    size_t total = in_ + nw + nb_scales_x*4 + nb_scales_W*4 + out_*4;
     *gbps_out = bw_gbps(total, ms);
 
     std::vector<float> y_gpu(out_);
@@ -254,12 +260,26 @@ int main() {
     // 1. Pack/Unpack correctness
     test_pack(512);
 
-    // 2. GEMV
-    printf("\n## 2. FP4 GEMV (Decode Path)\n\n");
+    // 2. GEMV — small K (legacy, backward-compat)
+    printf("\n## 2a. FP4 GEMV (Decode Path) — K=64\n\n");
     printf("| Op | Shape (out x in) | Lat (ms) | GB/s | Rel Err |\n| --- | --- | --- | --- | --- |\n");
-    int gemv_shapes[][2] = {{64,64},{128,64},{2048,64},{6144,64}};
+    int gemv_shapes_smallK[][2] = {{64,64},{128,64},{2048,64},{6144,64}};
     for (int i = 0; i < 4; ++i) {
-        int o = gemv_shapes[i][0], k = gemv_shapes[i][1];
+        int o = gemv_shapes_smallK[i][0], k = gemv_shapes_smallK[i][1];
+        std::vector<float> W(o * k, 1.f);
+        double gb = 0;
+        bench_gemv(W.data(), k, o, 10, 100, &gb);
+    }
+
+    // 2b. GEMV — dynamic K (real model hidden dim)
+    printf("\n## 2b. FP4 GEMV (Decode Path) — Dynamic K\n\n");
+    printf("| Op | Shape (out x in) | Lat (ms) | GB/s | Rel Err |\n| --- | --- | --- | --- | --- |\n");
+    int gemv_shapes_largeK[][2] = {
+        {64,2048}, {128,2048}, {2048,2048}, {6144,2048},
+        {2048,4096}
+    };
+    for (int i = 0; i < 5; ++i) {
+        int o = gemv_shapes_largeK[i][0], k = gemv_shapes_largeK[i][1];
         std::vector<float> W(o * k, 1.f);
         double gb = 0;
         bench_gemv(W.data(), k, o, 10, 100, &gb);

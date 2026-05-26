@@ -18,7 +18,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | Project skeleton | ✅ | CMake build, pyproject, dirs, static lib links clean |
 | pack_fp4 / unpack_fp4 | ✅ | Verified correct. E2M1 ±{0.25,0.5,1.0,2.0}, scale=absmax/3 |
 | gemm_fp4_block_scaled | ✅ Optimized | **22–33 GB/s** (6.2× vs 3–5 GB/s). 128×128×64 CTA, 8 warps, vec4 loads |
-| gemv_fp4 | ✅ Works, K=64 only | Launch-overhead-bound. Dynamic K tiling = blocker for real LLM |
+| gemv_fp4 | ✅ Dynamic K tiling | Handles any K (multiple of 16). K=2048, K=4096 verified. 22–67 GB/s |
 | fused_rmsnorm | ✅ | Warp-reduced sum, single block (4096 max elements) |
 | apply_swiglu | ✅ | Elementwise silu(gate) × up |
 | fused_rope | ✅ | In-place rotation, smem cos/sin cache |
@@ -60,7 +60,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | Issue | Severity | Root Cause | Fix Path |
 | ----- | -------- | ---------- | -------- |
 | GEMM 22–33 GB/s (4–7% of peak) | 🟡 Still under target | 128×128×64 tile helps, but no cp.async pipeline, no warp specialization | Add 2-stage cp.async pipeline, swizzle layout, occupancy tuning |
-| GEMV K=64 hardcoded | 🟡 Blocks real model | GEMV kernel only handles single K=64 tile | K-tiling loop in kernel or caller-side reduction |
+| GEMV K=64 hardcoded | ✅ Fixed | Dynamic K-tiling: any K multiple of 16. K=2048/K=4096 verified | Unlocks Qwen3-1.7B decode (hidden_dim=2048) |
 | SwiGLU GB/s > theoretical peak | 🟡 Measurement artifact | Timer resolution too coarse (~3us kernel) | Batch more elements or use CUDA events correctly |
 | FP4 rel error = 1.0 for small inputs | 🟢 Expected | E2M1 can't represent values < 0.5×scale below 0 → quantize to 0 | Acceptable for LLM weights (usually >0.1); use FP8/FP6 where accuracy critical |
 | CMake CUDA::CUDA target missing | ✅ Fixed | CMake 3.28 doesn't create CUDA::CUDA alias | Use CUDA::cudart instead |
@@ -74,7 +74,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | # | Task | Priority | Notes |
 | - | ---- | -------- | ----- |
 | 5 | Add cp.async 2-stage pipeline to GEMM | High | Overlap FP4→FP16 dequant with WMMA compute. Target: 80+ GB/s |
-| 6 | Dynamic K GEMV (hidden_dim=2048) | High | Unlocks real Qwen3-1.7B decode benchmarking |
+| 6 | Dynamic K GEMV (hidden_dim=2048) | ✅ Complete | GEMV handles any K. K=2048, K=4096 verified rel_err=0 |
 | 7 | KV-cache decode (compact bandwidth-first) | Medium | Next after GEMM + GEMV are healthy |
 | 8 | Prefill kernels (separate from decode) | Medium | Depends on GEMM optimization |
 | 9 | CUDA Graphs for decode launch overhead | Low | Current GEMV latency = 3us — launch overhead dominates |
