@@ -2,12 +2,12 @@
 
 ## Build State
 
-| Artifact | Path | Size | Last Modified |
-|----------|------|------|---------------|
-| Static lib | `build/libblackwell_kernels.a` | 256 KB | 2026-05-26 15:15 |
-| Benchmark binary | `bench/phase_a` | 1.2 MB ELF x86-64 | 2026-05-26 15:24 |
-| GTest tests | `build/` (no test binary) | — | GTest not found — tests disabled |
-| pybind11 module | `build/` (no .so) | — | pybind11 not found — bindings disabled |
+| Artifact         | Path                           | Size              | Last Modified                          |
+| ---------------- | ------------------------------ | ----------------- | -------------------------------------- |
+| Static lib       | `build/libblackwell_kernels.a` | 256 KB            | 2026-05-26 15:15                       |
+| Benchmark binary | `bench/phase_a`                | 1.2 MB ELF x86-64 | 2026-05-26 15:24                       |
+| GTest tests      | `build/` (no test binary)      | —                 | GTest not found — tests disabled       |
+| pybind11 module  | `build/` (no .so)              | —                 | pybind11 not found — bindings disabled |
 
 **Build command**: `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel`
 
@@ -40,6 +40,7 @@
 ## Key Code
 
 ### Public API (`include/blackwell/kernels.h`)
+
 ```cpp
 namespace blackwell { namespace kernels {
 enum class KernelMode { Prefill, Decode };
@@ -66,6 +67,7 @@ cudaError_t destroy_decode_graph(...);
 ```
 
 ### Tile Sizes (`include/blackwell/config.h`)
+
 ```cpp
 constexpr int kGEMMTileM = 16;   // WMMA fragment size
 constexpr int kGEMMTileN = 16;
@@ -79,19 +81,20 @@ constexpr int kMaxSharedMemBytesPerBlock = 101376;  // 99 KB
 
 ### Source files by role
 
-| File | Lines | Role | Status |
-|------|-------|------|--------|
-| `src/kernels/gemm.cu` | 251 | GEMM + GEMV kernel implementations | Working; GEMM 3–5 GB/s (needs optimization); GEMV K=64 hardcoded |
-| `src/kernels/quantize.cu` | 136 | FP4 pack/unpack + coalesced_copy | Verified correct |
-| `src/kernels/norm.cu` | 140 | RMSNorm + SwiGLU | Working |
-| `src/kernels/rope.cu` | 180 | RoPE (in-place + out-of-place) | Working |
-| `src/kernels/attention.cu` | 32 | Fused attention placeholder | Stub |
-| `src/kernels/decode.cu` | 41 | KV-cache update/load | Stub |
-| `src/kernels/prefill.cu` | 36 | Prefill layer orchestrator | Stub |
-| `src/kernels/cuda_graphs.cu` | 38 | CUDA Graph capture/launch/destroy | Stub |
-| `src/kernels/memory.cu` | 36 | Async copy / pipeline helpers | Stub |
+| File                         | Lines | Role                               | Status                                                           |
+| ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------- |
+| `src/kernels/gemm.cu`        | 251   | GEMM + GEMV kernel implementations | Working; GEMM 3–5 GB/s (needs optimization); GEMV K=64 hardcoded |
+| `src/kernels/quantize.cu`    | 136   | FP4 pack/unpack + coalesced_copy   | Verified correct                                                 |
+| `src/kernels/norm.cu`        | 140   | RMSNorm + SwiGLU                   | Working                                                          |
+| `src/kernels/rope.cu`        | 180   | RoPE (in-place + out-of-place)     | Working                                                          |
+| `src/kernels/attention.cu`   | 32    | Fused attention placeholder        | Stub                                                             |
+| `src/kernels/decode.cu`      | 41    | KV-cache update/load               | Stub                                                             |
+| `src/kernels/prefill.cu`     | 36    | Prefill layer orchestrator         | Stub                                                             |
+| `src/kernels/cuda_graphs.cu` | 38    | CUDA Graph capture/launch/destroy  | Stub                                                             |
+| `src/kernels/memory.cu`      | 36    | Async copy / pipeline helpers      | Stub                                                             |
 
 ### Source file timestamps vs build
+
 ```
 src/kernels/gemm.cu      2026-05-26 15:14  — most recent edit (GEMM/GEMV)
 include/blackwell/config.h 2026-05-26 15:07  — edited
@@ -99,6 +102,7 @@ bench/phase_a.cu         2026-05-26 15:21
 build/libblackwell_kernels.a 2026-05-26 15:15
 bench/phase_a            2026-05-26 15:24
 ```
+
 Bench binary built after library (separate nvcc link step). Consistent.
 
 ---
@@ -119,6 +123,7 @@ bench/phase_a.cu  (driver: calls public API, measures latency/BW)
 ```
 
 **Data flow** (GEMM prefill):
+
 1. Caller provides FP4-quantized A, B matrices + per-block scale arrays
 2. `dispatch_matmul` routes to `gemm_fp4_block_scaled` (Prefill) or `gemv_fp4` (Decode)
 3. Kernel loops K in 64-element tiles, loads FP4 → on-the-fly FP16 conversion → WMMA multiply-accumulate
@@ -132,24 +137,24 @@ bench/phase_a.cu  (driver: calls public API, measures latency/BW)
 
 ## Start Here
 
-Open **`src/kernels/gemm.cu`** (line 1) — GEMM is the primary performance bottleneck (3–5 GB/s) and the next optimization target per HANDOFF.md. It contains both `gemm_fp4_kernel` (WMMA-based) and `gemv_fp4_kernel` (K=64 hardcoded). The tile sizes in `include/blackwell/config.h` (kGEMMTile* = 16/16/64) are the starting point for optimization.
+Open **`src/kernels/gemm.cu`** (line 1) — GEMM is the primary performance bottleneck (3–5 GB/s) and the next optimization target per HANDOFF.md. It contains both `gemm_fp4_kernel` (WMMA-based) and `gemv_fp4_kernel` (K=64 hardcoded). The tile sizes in `include/blackwell/config.h` (kGEMMTile\* = 16/16/64) are the starting point for optimization.
 
 ---
 
 ## Discrepancies vs HANDOFF.md
 
-| Item | HANDOFF Claims | Actual | Match? |
-|------|---------------|--------|--------|
-| Git repo | ❌ Not initialized | No `.git` dir | ✅ |
-| libblackwell_kernels.a | ✅ Builds clean | 256 KB .a exists | ✅ |
-| bench/phase_a | ✅ Runs clean | 1.2 MB ELF exists | ✅ |
-| Public API symbols | 18 in blackwell::kernels:: (not anonymous) | 18 public + 9 anonymous kernels + 9 device_stubs = 36 total T symbols | ✅ |
-| GEMM throughput | 3–5 GB/s | PHASE_A_RESULTS.md reports 3.6–5.3 GB/s | ✅ |
-| GEMV K=64 hardcoded | ✅ Confirmed | gemv_fp4 kernel uses single K=64 tile | ✅ |
-| Stub fns (cudaErrorNotReady) | attention, KV-cache, prefill, CUDA Graphs | Same 9 stubs found | ✅ |
-| Timestamps | Phase A complete ~15:24 UTC | bench/phase_a built 15:24, .a built 15:15 | ✅ |
-| GTest | "if not found → disabled" | Not found, no test binary | ✅ |
-| pybind11 | "if not found → disabled" | Not found, no .so | ✅ |
+| Item                         | HANDOFF Claims                             | Actual                                                                | Match? |
+| ---------------------------- | ------------------------------------------ | --------------------------------------------------------------------- | ------ |
+| Git repo                     | ❌ Not initialized                         | No `.git` dir                                                         | ✅     |
+| libblackwell_kernels.a       | ✅ Builds clean                            | 256 KB .a exists                                                      | ✅     |
+| bench/phase_a                | ✅ Runs clean                              | 1.2 MB ELF exists                                                     | ✅     |
+| Public API symbols           | 18 in blackwell::kernels:: (not anonymous) | 18 public + 9 anonymous kernels + 9 device_stubs = 36 total T symbols | ✅     |
+| GEMM throughput              | 3–5 GB/s                                   | PHASE_A_RESULTS.md reports 3.6–5.3 GB/s                               | ✅     |
+| GEMV K=64 hardcoded          | ✅ Confirmed                               | gemv_fp4 kernel uses single K=64 tile                                 | ✅     |
+| Stub fns (cudaErrorNotReady) | attention, KV-cache, prefill, CUDA Graphs  | Same 9 stubs found                                                    | ✅     |
+| Timestamps                   | Phase A complete ~15:24 UTC                | bench/phase_a built 15:24, .a built 15:15                             | ✅     |
+| GTest                        | "if not found → disabled"                  | Not found, no test binary                                             | ✅     |
+| pybind11                     | "if not found → disabled"                  | Not found, no .so                                                     | ✅     |
 
 **No discrepancies found.** Project state matches HANDOFF.md description exactly.
 
@@ -159,7 +164,7 @@ Open **`src/kernels/gemm.cu`** (line 1) — GEMM is the primary performance bott
 
 1. **GEMM 3–5 GB/s** (red block) — must hit 100+ GB/s for viable LLM inference. Small 16×16 tiles + no vectorized loads + no async copy.
 2. **GEMV K=64 hardcoded** (yellow block) — Qwen3-1.7B needs hidden_dim=2048 → 32 GEMV invocations per layer → launch overhead dominates.
-3. **sizeof(__nv_fp4_e2m1) = 1 byte** — allocations must be N*1, not N/2.
+3. **sizeof(\_\_nv_fp4_e2m1) = 1 byte** — allocations must be N\*1, not N/2.
 4. **No git history** — no rollback safety for major edits.
 5. **All stubs** — attention, KV-cache, prefill orchestrator, CUDA Graphs are non-functional.
 6. **WMMA code guarded by `__CUDA_ARCH__ >= 800`** — works on SM_120 (≥800), but non-SM_120 fallback doesn't exist.
