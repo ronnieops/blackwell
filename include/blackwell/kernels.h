@@ -148,6 +148,26 @@ cudaError_t load_kv_cache_qkgv(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
+// Fused QKV decode (single kernel: Q = x@Wq, K = x@Wk, V = x@Wv)
+// ---------------------------------------------------------------------------
+cudaError_t fused_qkv_gemv(
+    float*          Q_out,
+    float*          K_out,
+    float*          V_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_q_fp4,
+    const float*    W_q_scale,
+    const void*     W_k_fp4,
+    const float*    W_k_scale,
+    const void*     W_v_fp4,
+    const float*    W_v_scale,
+    int             hidden,
+    int             q_dim,
+    int             kv_dim,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
 // Prefill vs decode dispatch
 // ---------------------------------------------------------------------------
 enum class KernelMode { Prefill, Decode };

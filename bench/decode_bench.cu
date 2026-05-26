@@ -180,12 +180,12 @@ int main(int argc, char** argv) {
         for (int l = 0; l < kNumLayers; ++l) {
             int kvcache_base = l * kNumKVHeads * kMaxSeqLen * kHeadDim;
 
-            check(blackwell::kernels::gemv_fp4(b.Q, b.x_fp4, b.x_scale,
-                W_q_fp4[l], W_q_scale[l], kHiddenDim, q_dim, 0), "gemv_q");
-            check(blackwell::kernels::gemv_fp4(b.K, b.x_fp4, b.x_scale,
-                W_k_fp4[l], W_k_scale[l], kHiddenDim, kv_dim, 0), "gemv_k");
-            check(blackwell::kernels::gemv_fp4(b.V, b.x_fp4, b.x_scale,
-                W_v_fp4[l], W_v_scale[l], kHiddenDim, kv_dim, 0), "gemv_v");
+            check(blackwell::kernels::fused_qkv_gemv(b.Q, b.K, b.V,
+                b.x_fp4, b.x_scale,
+                W_q_fp4[l], W_q_scale[l],
+                W_k_fp4[l], W_k_scale[l],
+                W_v_fp4[l], W_v_scale[l],
+                kHiddenDim, q_dim, kv_dim, 0), "fused_qkv");
             check(blackwell::kernels::update_kv_cache(
                 b.k_cache + kvcache_base, b.v_cache + kvcache_base,
                 b.K, b.V, 0, seq_pos,
@@ -253,12 +253,12 @@ int main(int argc, char** argv) {
     cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal);
     for (int l = 0; l < kNumLayers; ++l) {
         int kvcache_base = l * kNumKVHeads * kMaxSeqLen * kHeadDim;
-        blackwell::kernels::gemv_fp4(b.Q, b.x_fp4, b.x_scale,
-            W_q_fp4[l], W_q_scale[l], kHiddenDim, q_dim, graph_stream);
-        blackwell::kernels::gemv_fp4(b.K, b.x_fp4, b.x_scale,
-            W_k_fp4[l], W_k_scale[l], kHiddenDim, kv_dim, graph_stream);
-        blackwell::kernels::gemv_fp4(b.V, b.x_fp4, b.x_scale,
-            W_v_fp4[l], W_v_scale[l], kHiddenDim, kv_dim, graph_stream);
+        blackwell::kernels::fused_qkv_gemv(b.Q, b.K, b.V,
+            b.x_fp4, b.x_scale,
+            W_q_fp4[l], W_q_scale[l],
+            W_k_fp4[l], W_k_scale[l],
+            W_v_fp4[l], W_v_scale[l],
+            kHiddenDim, q_dim, kv_dim, graph_stream);
         blackwell::kernels::update_kv_cache(
             b.k_cache + kvcache_base, b.v_cache + kvcache_base,
             b.K, b.V, 0, graph_seq_pos,
@@ -312,12 +312,12 @@ int main(int argc, char** argv) {
     for (int iter = 0; iter < bench; ++iter) {
         for (int l = 0; l < kNumLayers; ++l) {
             int kvcache_base = l * kNumKVHeads * kMaxSeqLen * kHeadDim;
-            blackwell::kernels::gemv_fp4(b.Q, b.x_fp4, b.x_scale,
-                W_q_fp4[l], W_q_scale[l], kHiddenDim, q_dim, 0);
-            blackwell::kernels::gemv_fp4(b.K, b.x_fp4, b.x_scale,
-                W_k_fp4[l], W_k_scale[l], kHiddenDim, kv_dim, 0);
-            blackwell::kernels::gemv_fp4(b.V, b.x_fp4, b.x_scale,
-                W_v_fp4[l], W_v_scale[l], kHiddenDim, kv_dim, 0);
+            blackwell::kernels::fused_qkv_gemv(b.Q, b.K, b.V,
+                b.x_fp4, b.x_scale,
+                W_q_fp4[l], W_q_scale[l],
+                W_k_fp4[l], W_k_scale[l],
+                W_v_fp4[l], W_v_scale[l],
+                kHiddenDim, q_dim, kv_dim, 0);
             blackwell::kernels::update_kv_cache(
                 b.k_cache + kvcache_base, b.v_cache + kvcache_base,
                 b.K, b.V, 0, graph_seq_pos,

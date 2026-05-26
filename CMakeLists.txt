@@ -62,6 +62,7 @@ set(KERNEL_SOURCES
     src/kernels/prefill.cu
     src/kernels/decode.cu
     src/kernels/cuda_graphs.cu
+    src/kernels/fused_decode.cu
 )
 
 # ---------------------------------------------------------------------------
