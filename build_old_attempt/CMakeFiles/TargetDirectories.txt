@@ -1,0 +1,4 @@
+/mnt/data/dev/projects/blackwell/build/CMakeFiles/blackwell_kernels.dir
+/mnt/data/dev/projects/blackwell/build/CMakeFiles/test.dir
+/mnt/data/dev/projects/blackwell/build/CMakeFiles/edit_cache.dir
+/mnt/data/dev/projects/blackwell/build/CMakeFiles/rebuild_cache.dir

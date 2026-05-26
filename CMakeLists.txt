@@ -79,7 +79,7 @@ target_compile_options(blackwell_config INTERFACE
 # ---------------------------------------------------------------------------
 add_library(blackwell_kernels STATIC ${KERNEL_SOURCES})
 target_link_libraries(blackwell_kernels PRIVATE
-    CUDA::CUDA
+    CUDA::cudart
     blackwell_config
 )
 target_compile_options(blackwell_kernels PRIVATE
@@ -105,7 +105,7 @@ if(GTest_FOUND)
     target_link_libraries(blackwell_tests PRIVATE
         blackwell_kernels
         GTest::gtest
-        CUDA::CUDA
+        CUDA::cudart
     )
     target_compile_options(blackwell_tests PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
@@ -128,7 +128,7 @@ if(BUILD_PYTHON_BINDINGS)
         )
         target_sources(blackwell_pybind PRIVATE ${KERNEL_SOURCES})
         target_include_directories(blackwell_pybind PRIVATE include)
-        target_link_libraries(blackwell_pybind PRIVATE CUDA::CUDA)
+        target_link_libraries(blackwell_pybind PRIVATE CUDA::cudart)
     else()
         message(STATUS "pybind11 not found — Python bindings disabled (pip install pybind11).")
     endif()

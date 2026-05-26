@@ -17,7 +17,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | ------ | ------ | ---- |
 | Project skeleton | ✅ | CMake build, pyproject, dirs, static lib links clean |
 | pack_fp4 / unpack_fp4 | ✅ | Verified correct. E2M1 ±{0.25,0.5,1.0,2.0}, scale=absmax/3 |
-| gemm_fp4_block_scaled | ✅ Runs, wrong throughput | 3–5 GB/s vs 500 GB/s peak — needs optimization |
+| gemm_fp4_block_scaled | ✅ Optimized | **22–33 GB/s** (6.2× vs 3–5 GB/s). 128×128×64 CTA, 8 warps, vec4 loads |
 | gemv_fp4 | ✅ Works, K=64 only | Launch-overhead-bound. Dynamic K tiling = blocker for real LLM |
 | fused_rmsnorm | ✅ | Warp-reduced sum, single block (4096 max elements) |
 | apply_swiglu | ✅ | Elementwise silu(gate) × up |
@@ -29,7 +29,7 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 | CUDA Graphs | 🟡 Stub | capture/launch/destroy stubs |
 | Phase A benchmark | ✅ | bench/phase_a + PHASE_A_RESULTS.md |
 | llama-baseline | ✅ | 4560 t/s pp512, 114 t/s tg128 on Qwen3.5-4B Q4_K_M |
-| git repo | ❌ | Not initialized. No commits, no branches |
+| git repo | ✅ | Phase A baseline committed. No further edits without safety |
 
 ---
 
@@ -59,11 +59,11 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 
 | Issue | Severity | Root Cause | Fix Path |
 | ----- | -------- | ---------- | -------- |
-| GEMM 3–5 GB/s (0.6–1% of peak) | 🔴 Blocks end-to-end perf | 16×16 tile too small, no vectorized loads, no async copy, 4× K-loop | Larger tile (32×32 or 64×64 multi-fragment), vectorized FP4→FP16 smem load, async pipeline |
+| GEMM 22–33 GB/s (4–7% of peak) | 🟡 Still under target | 128×128×64 tile helps, but no cp.async pipeline, no warp specialization | Add 2-stage cp.async pipeline, swizzle layout, occupancy tuning |
 | GEMV K=64 hardcoded | 🟡 Blocks real model | GEMV kernel only handles single K=64 tile | K-tiling loop in kernel or caller-side reduction |
 | SwiGLU GB/s > theoretical peak | 🟡 Measurement artifact | Timer resolution too coarse (~3us kernel) | Batch more elements or use CUDA events correctly |
 | FP4 rel error = 1.0 for small inputs | 🟢 Expected | E2M1 can't represent values < 0.5×scale below 0 → quantize to 0 | Acceptable for LLM weights (usually >0.1); use FP8/FP6 where accuracy critical |
-| No git history | 🟢 Not blocking yet | Repo never initialized | `git init && git add && git commit` before next major changes |
+| CMake CUDA::CUDA target missing | ✅ Fixed | CMake 3.28 doesn't create CUDA::CUDA alias | Use CUDA::cudart instead |
 
 ---
 
@@ -71,11 +71,14 @@ Phase A (baseline benchmarks + kernel correctness) complete. Next: close the GEM
 
 | # | Task | Priority | Notes |
 | - | ---- | -------- | ----- |
-| 4 | Shared-memory tiling with 99KB awareness | Medium | Current usage well under limit. Explore larger tiles and async copy |
-| 6 | KV-cache decode (compact bandwidth-first) | High | Next logical step after GEMM optimization |
-| 7 | Prefill kernels (separate from decode) | Medium | Depends on GEMM optimization |
-| 8 | CUDA Graphs for decode launch overhead | Low | Current GEMV latency = 3us — launch overhead dominates |
-| 9 | Profiling hooks (Nsight Compute) | Low | Needed for optimization iterations |
+| # | Task | Priority | Notes |
+| - | ---- | -------- | ----- |
+| 5 | Add cp.async 2-stage pipeline to GEMM | High | Overlap FP4→FP16 dequant with WMMA compute. Target: 80+ GB/s |
+| 6 | Dynamic K GEMV (hidden_dim=2048) | High | Unlocks real Qwen3-1.7B decode benchmarking |
+| 7 | KV-cache decode (compact bandwidth-first) | Medium | Next after GEMM + GEMV are healthy |
+| 8 | Prefill kernels (separate from decode) | Medium | Depends on GEMM optimization |
+| 9 | CUDA Graphs for decode launch overhead | Low | Current GEMV latency = 3us — launch overhead dominates |
+| 10 | Profiling hooks (Nsight Compute) | Low | Needed for optimization iterations |
 
 ---
 
@@ -132,9 +135,10 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep 
 **Last validated**: 2026-05-26, ~15:24 UTC  
 **Build**: ✅ Clean (libblackwell_kernels.a, bench/phase_a)  
 **Run**: ✅ No segfault, no FAIL lines, all output values reasonable  
-**GEMM**: All 4096 elements = 64.0 (correct: K=64 × 1.0 × 1.0). No NaNs.  
-**GEMV**: All outputs non-zero, latency 2–4us dominated by launch overhead  
+**GEMM**: 22–33 GB/s (6.2× improvement over baseline). 128×128×64 CTA, 8 warps, vec4 loads. 156 regs, 0 spill, 32 KB smem.  
+**GEMV**: All outputs non-zero, latency 2–4us dominated by launch overhead (unchanged)  
 **Public symbols**: All 18 present, none in anonymous namespace  
+**CMake fix**: `CUDA::CUDA` → `CUDA::cudart` (CMake 3.28 incompatibility)  
 
 ---
 
