@@ -223,6 +223,16 @@ cudaError_t fused_rmsnorm_pack(
 // ---------------------------------------------------------------------------
 // Fused O-projection + RMSNorm + FP4 pack (convenience: 2 kernels)
 // ---------------------------------------------------------------------------
+cudaError_t gemv_int8_from_fp4(
+    float*          y_out,
+    const void*     x_fp4,        // FP4 input (same as gemv_fp4_v2)
+    const float*    x_fp4_scale,  // FP4 per-block scales
+    const void*     W_t_int8,     // INT8 transposed: [N × K]
+    const float*    W_t_scale,    // INT8 transposed: [N/16 × K/16]
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // Replaces: gemv_fp4(W_o) → fused_rmsnorm → pack_fp4(x) (3 kernels → 2 kernels)
 // Allocates internal temp buffer.
 cudaError_t fused_o_norm_pack(

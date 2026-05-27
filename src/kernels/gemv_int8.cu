@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda/std/cmath>
+#include <cuda_fp4.h>
 #include "blackwell/kernels.h"
 #include "blackwell/config.h"
 
@@ -56,6 +57,72 @@ __global__ void gemv_int8_kernel(
         #pragma unroll
         for (int j = 0; j < B; ++j) {
             acc += static_cast<float>(x_ptr[j]) * x_sc * 
+                   static_cast<float>(w_buf[j]) * w_sc;
+        }
+    }
+
+    y_out[n_out] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Fused INT8 GEMV kernel — reads FP4 input, converts to INT8 inline
+// Eliminates: unpack_fp4 + pack_int8 + gemv_int8 (3 launches → 1 launch)
+// ---------------------------------------------------------------------------
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_int8_from_fp4_kernel(
+    float* __restrict__ y_out,
+    const __nv_fp4_e2m1* __restrict__ x_fp4,
+    const float* __restrict__ x_fp4_scale,      // [K/16]
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,        // [N/16 × K/16]
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    if (n_out >= N) return;
+
+    int num_K_blks = K / B;
+    int n_blk = n_out / B;
+
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        // Load 16 FP4 input values (16 bytes = uint4)
+        alignas(16) __nv_fp4_e2m1 x_buf[B];
+        *reinterpret_cast<uint4*>(x_buf) = 
+            *reinterpret_cast<const uint4*>(&x_fp4[kb * B]);
+
+        // Apply FP4 scales to get FP32 values and compute INT8 block scale
+        float fp4_sc = x_fp4_scale[kb];
+        float vals[B];
+        float block_max = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < B; ++j) {
+            float v = static_cast<float>(x_buf[j]) * fp4_sc;
+            vals[j] = v;
+            float av = fabsf(v);
+            if (av > block_max) block_max = av;
+        }
+
+        // Compute INT8 scale for this 16-element input block
+        float i8_sc = block_max / 127.0f;
+        if (i8_sc < 1e-10f) i8_sc = 1e-10f;
+
+        // Load 16 INT8 weight values
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        alignas(16) int8_t w_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+
+        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+
+        // Quantize x values to INT8 and accumulate
+        #pragma unroll
+        for (int j = 0; j < B; ++j) {
+            float x_qf = roundf(vals[j] / i8_sc);
+            x_qf = fminf(127.0f, fmaxf(-127.0f, x_qf));
+            int8_t x_q = static_cast<int8_t>(static_cast<int>(x_qf));
+            acc += static_cast<float>(x_q) * i8_sc *
                    static_cast<float>(w_buf[j]) * w_sc;
         }
     }
@@ -155,6 +222,28 @@ cudaError_t gemv_int8(
     gemv_int8_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
         y_out,
         static_cast<const int8_t*>(x_int8), x_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t gemv_int8_from_fp4(
+    float*          y_out,
+    const void*     x_fp4,
+    const float*    x_fp4_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int nb = (N + kINT8Block - 1) / kINT8Block;
+    gemv_int8_from_fp4_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
+        y_out,
+        static_cast<const __nv_fp4_e2m1*>(x_fp4), x_fp4_scale,
         static_cast<const int8_t*>(W_t_int8), W_t_scale,
         K, N);
     return cudaPeekAtLastError();
