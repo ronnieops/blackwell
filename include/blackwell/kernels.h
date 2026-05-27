@@ -326,6 +326,16 @@ cudaError_t transpose_fp4_weights(
     int             N,
     cudaStream_t    stream = 0);
 
+// INT8 transpose: W (K×N) → W_t (N×K), scales (K/16 × N/16) → (N/16 × K/16)
+cudaError_t transpose_int8_weights(
+    void*           dst,          // [N × K] INT8 transposed
+    float*          dst_scale,    // [N/16 × K/16] transposed
+    const void*     src,          // [K × N] INT8 original
+    const float*    src_scale,    // [K/16 × N/16] original
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Fused gate + up MLP GEMV (single kernel)
 // ---------------------------------------------------------------------------

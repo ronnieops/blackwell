@@ -1,21 +1,15 @@
-// src/kernels/gemv_int8.cu — INT8 block-scaled GEMV
+// src/kernels/gemv_int8.cu — INT8 block-scaled GEMV + pack + transpose
 //
 // INT8 GEMV path: eliminates FP4 cast overhead (static_cast<float> per element).
-// Uses FP16 WMMA for matrix multiply to leverage tensor core throughput.
-// Block-scaled quantization: weights in INT8 [0..255], scales in FP32 per 16×16 block.
+// Block-scaled quantization: weights in INT8 [-128..127], scales in FP32 per 16×16 block.
 // Activations in INT8, scales per 16-element K-block.
-//
-// Architecture:
-//   - nvcuda::wmma with FP16 input fragments
-//   - INT8 weights loaded as FP16 via wmma::mma_sync
-//   - Accumulation in FP16 fragments → FP32 output
-//   - Per-block scaling using FP32 scale factors
 //
 // Weight format: W_t [N×K] INT8 (transposed row-major).
 // Scale format:  W_scale [N/16 × K/16] FP32 per block.
 // Activation:    x_int8 [K], x_scale [K/16] FP32 per block.
 
 #include <cuda_runtime.h>
+#include <cuda/std/cmath>
 #include "blackwell/kernels.h"
 #include "blackwell/config.h"
 
@@ -27,10 +21,6 @@ constexpr int kINT8Block = 256;
 
 // ---------------------------------------------------------------------------
 // INT8 GEMV kernel — per-thread dot products, transposed weights
-//
-// Each thread handles one output n_out.
-// Inner loop: K/16 iterations, loads 16 INT8 weights + 16 INT8 activations.
-// Applies scales per-block, accumulates in FP32.
 // ---------------------------------------------------------------------------
 __launch_bounds__(kINT8Block, 1)
 __global__ void gemv_int8_kernel(
@@ -63,7 +53,6 @@ __global__ void gemv_int8_kernel(
         // Load x values for this K-block
         const int8_t* x_ptr = x_int8 + kb * B;
 
-        // Dot product: INT8→FP32 with per-block scales
         #pragma unroll
         for (int j = 0; j < B; ++j) {
             acc += static_cast<float>(x_ptr[j]) * x_sc * 
@@ -74,11 +63,80 @@ __global__ void gemv_int8_kernel(
     y_out[n_out] = acc;
 }
 
+// ---------------------------------------------------------------------------
+// INT8 pack kernel: FP32 → INT8 with per-block scales
+// Block size = 16. Scale = absmax(block) / 127.0
+// ---------------------------------------------------------------------------
+__global__ void pack_int8_kernel(
+    int8_t* __restrict__ out,
+    const float* __restrict__ in,
+    const float* __restrict__ scales,   // [num_block] pre-computed scales
+    int num_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_elements) return;
+
+    int blk = idx / 16;
+    float sc = scales[blk];
+    float v = in[idx] / sc;
+    v = fminf(127.0f, fmaxf(-127.0f, roundf(v)));
+    out[idx] = static_cast<int8_t>(static_cast<int>(v));
+}
+
+// ---------------------------------------------------------------------------
+// INT8 transpose: W (K×N) → W_t (N×K)
+// ---------------------------------------------------------------------------
+__global__ void transpose_int8_kernel(
+    int8_t* __restrict__ dst,      // [N × K]
+    const int8_t* __restrict__ src, // [K × N]
+    int K, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = K * N;
+    if (idx >= total) return;
+    int k = idx / N;
+    int n = idx % N;
+    dst[n * K + k] = src[k * N + n];
+}
+
+// ---------------------------------------------------------------------------
+// INT8 scale transpose: W_scale (K/16 × N/16) → W_t_scale (N/16 × K/16)
+// ---------------------------------------------------------------------------
+__global__ void transpose_scales_int8_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int num_K_blks, int num_N_blks)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_K_blks * num_N_blks;
+    if (idx >= total) return;
+    int kb = idx / num_N_blks;
+    int nb = idx % num_N_blks;
+    dst[nb * num_K_blks + kb] = src[kb * num_N_blks + nb];
+}
+
 } // anonymous namespace
 
 // ===========================================================================
 // Public API
 // ===========================================================================
+
+cudaError_t pack_int8(
+    void*           out_int8,
+    const float*    in_fp32,
+    const float*    scale_out,
+    int             num_elements,
+    cudaStream_t    stream)
+{
+    if (num_elements <= 0 || num_elements % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int threads = 256;
+    int blocks = (num_elements + threads - 1) / threads;
+    pack_int8_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<int8_t*>(out_int8), in_fp32, scale_out, num_elements);
+    return cudaPeekAtLastError();
+}
 
 cudaError_t gemv_int8(
     float*          y_out,
@@ -99,6 +157,33 @@ cudaError_t gemv_int8(
         static_cast<const int8_t*>(x_int8), x_scale,
         static_cast<const int8_t*>(W_t_int8), W_t_scale,
         K, N);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t transpose_int8_weights(
+    void*           dst,
+    float*          dst_scale,
+    const void*     src,
+    const float*    src_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    int total = K * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    transpose_int8_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<int8_t*>(dst), static_cast<const int8_t*>(src), K, N);
+
+    int num_K_blks = K / 16;
+    int num_N_blks = N / 16;
+    int total_scales = num_K_blks * num_N_blks;
+    blocks = (total_scales + threads - 1) / threads;
+
+    transpose_scales_int8_kernel<<<blocks, threads, 0, stream>>>(
+        dst_scale, src_scale, num_K_blks, num_N_blks);
+
     return cudaPeekAtLastError();
 }
 
