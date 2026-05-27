@@ -298,6 +298,25 @@ cudaError_t gemv_fp4_batched(
     int             M,         // batch size (number of simultaneous tokens)
     cudaStream_t    stream = 0);
 
+// Pack FP32 to INT8 with per-block scales
+cudaError_t pack_int8(
+    void*           out_int8,
+    const float*    in_fp32,
+    const float*    scale_out,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
+// INT8 block-scaled GEMV (warp-level dot products, transposed weights)
+cudaError_t gemv_int8(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 cudaError_t transpose_fp4_weights(
     void*           dst,          // [N × K] FP4 transposed
     float*          dst_scale,    // [N/16 × K/16] transposed
