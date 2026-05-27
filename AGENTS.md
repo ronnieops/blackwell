@@ -24,6 +24,7 @@ Primary goal: benchmark FP4 forward pass throughput vs llama.cpp (Q4_K_M) baseli
 - `pack_fp4` / `unpack_fp4` — FP4 E2M1 quant/dequant (verified)
 - `gemv_fp4` — decode path, v1 (strided), 22 GB/s
 - `gemv_fp4_v2` — decode path, vectorized uint4, transposed weights, 55–164 GB/s, **2.5×** faster than v1
+- `gemv_int8` — INT8 block-scaled GEMV, 348 GB/s, **2.1×** bandwidth vs FP4 v2
 - `transpose_fp4_weights` — W (K×N) → W_t (N×K) + scales
 - `gemv_fp4` — K dynamic (any multiple of 16), no hardcoded limit
 - `gemm_fp4_block_scaled` — prefill path, 128×128×64 WMMA tiles, 2-stage cp.async
