@@ -93,10 +93,23 @@ cudaError_t apply_swiglu(
 cudaError_t attention_decode(
     float*          output,      // [num_heads * head_dim] result
     const float*    Q,           // [num_heads * head_dim] query (dequantized)
-    const float*    K_cache,     // [num_heads * max_seq_len * head_dim] KV cache
-    const float*    V_cache,     // [num_heads * max_seq_len * head_dim]
+    const float*    K_cache,     // [num_kv_heads * max_seq_len * head_dim] KV cache
+    const float*    V_cache,     // [num_kv_heads * max_seq_len * head_dim]
     int             seq_pos,     // current position (inclusive)
-    int             num_heads,
+    int             num_heads,   // num Q heads
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
+// GQA-aware version: num_kv_heads may differ from num_heads
+cudaError_t attention_decode_gqa(
+    float*          output,
+    const float*    Q,
+    const float*    K_cache,
+    const float*    V_cache,
+    int             seq_pos,
+    int             num_q_heads,
+    int             num_kv_heads,
     int             head_dim,
     int             max_seq_len,
     cudaStream_t    stream = 0);
@@ -217,6 +230,47 @@ cudaError_t fused_o_norm_pack(
     int             K,               // input features (q_dim)
     int             N,               // output features (hidden_dim)
     float           eps,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
+// Optimized GEMV v2 (vectorized FP4 block loads, transposed weights)
+// ---------------------------------------------------------------------------
+// Requires transposed weight layout: W_t [N×K] row-major.
+// Use transpose_fp4_weights() to convert existing [K×N] weights.
+cudaError_t gemv_fp4_v2(
+    float*          y_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_t_fp4,      // TRANSPOSED: [N × K]
+    const float*    W_t_scale,    // TRANSPOSED: [N/16 × K/16]
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+cudaError_t transpose_fp4_weights(
+    void*           dst,          // [N × K] FP4 transposed
+    float*          dst_scale,    // [N/16 × K/16] transposed
+    const void*     src,          // [K × N] FP4 original
+    const float*    src_scale,    // [K/16 × N/16] original
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
+// Fused gate + up MLP GEMV (single kernel)
+// ---------------------------------------------------------------------------
+// Computes both projections in one kernel. Uses transposed weights.
+cudaError_t fused_gate_up_gemv(
+    float*          gate_out,
+    float*          up_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_gate_t_fp4,    // TRANSPOSED: [N × K]
+    const float*    W_gate_t_scale, // TRANSPOSED
+    const void*     W_up_t_fp4,     // TRANSPOSED
+    const float*    W_up_t_scale,   // TRANSPOSED
+    int             K,
+    int             N,               // output dim
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------

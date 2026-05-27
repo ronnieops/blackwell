@@ -7,8 +7,7 @@ Preserves operational context between sessions. Read before acting.
 ## 1. Current Objective
 
 FP4 E2M1 block-scaled LLM inference kernels on RTX 5060 Ti (SM_120).  
-Full decode pipeline (attention + MLP) working with real Qwen3-1.7B weights.  
-Next: close decode gap — MLP GEMVs are the bottleneck (87% of per-layer time).
+Decode pipeline with all optimizations working. Current: 40.6 t/s (28-layer est), 35.6% of llama.cpp (114 t/s target).
 
 ---
 
@@ -17,47 +16,49 @@ Next: close decode gap — MLP GEMVs are the bottleneck (87% of per-layer time).
 | Domain | Status | Note |
 |--------|--------|------|
 | GEMM (prefill) | ✅ 25–38 GB/s | 128×128×64 CTA, cp.async pipeline, 136 regs |
-| GEMV (decode) | ✅ Dynamic K | Any K multiple of 16. 2048×2048 = 0.193ms |
-| Fused QKV | ⚠️ Broken for >256 outputs | Grid(3,) kernel only has 256 threads → only writes first 256 of N outputs. Broken for kv_dim=1024. Use separate GEMVs instead. |
-| Decode attention | ✅ 11µs at seq=128 | Warp-parallel QK dot, smem broadcast |
-| update_kv_cache | ✅ | Verified correct |
-| fused_rmsnorm/SwiGLU/RoPE | ✅ | All working |
-| fused_rmsnorm_pack | ✅ NEW | Single-block kernel: RMSNorm + FP4 pack. Saves 1 kernel launch per layer. 256 threads × 8 elements. |
-| pack_fp4/unpack_fp4 | ✅ | E2M1 verified. sizeof=1 byte |
-| Attention-only decode | ✅ 86 t/s (28-layer est) | Real weights, 4 layers, attention only |
-| Full decode (attn + MLP) | ✅ 10.9 t/s (28-layer est) | Real weights, 4 layers. MLP dominates (87% of time). |
-| Decode full benchmark | ✅ NEW | `bench/decode_full` — attention + MLP with real weights |
-| Stubs (attention_fp4, prefill, CUDA Graphs) | 🟡 | Return cudaErrorNotReady |
+| GEMV v1 (strided) | ✅ | Original, K iterations, 22 GB/s (4.4% peak) |
+| GEMV v2 (vectorized) | ✅ NEW | uint4 block loads, K/16 iterations, 55-164 GB/s (11-33% peak), **2.5× speedup** |
+| Transposed weights | ✅ NEW | W_t [N×K] layout enables sequential K access |
+| GEMV benchmark | ✅ | `bench/gemv_v2_bench` — compares v1 vs v2 |
+| fused_gate_up_gemv | ✅ NEW | Fused gate + up in one kernel |
+| fused_rmsnorm_pack | ✅ | Single-block RMSNorm + FP4 pack |
+| attention_decode_gqa | ✅ NEW | GQA-aware (16 Q heads, 8 KV heads) |
+| fused_qkv_gemv | ✅ FIXED | Multi-block Grid(3, tiles) for q_dim/kv_dim > 256 |
+| Decode full benchmark | ✅ | `bench/decode_full` — all optimizations integrated |
+| SwiGLU, update_kv_cache | ✅ | Working |
 | llama.cpp baseline | ✅ | 4560 t/s pp512, 114 t/s tg128 |
 
-**22 public API symbols** (was 20, added `fused_rmsnorm_pack` + `fused_o_norm_pack`). All outside anonymous namespace.
+**26 public API symbols** (was 20). All outside anonymous namespace.
 
 ---
 
-## 3. Recent Decisions
+## 3. Performance Summary
 
-- **fused_rmsnorm_pack**: Single-block 256-thread kernel (8 elements/thread). Fuses RMSNorm + FP4 pack. 1.01x speedup (GEMV dominates). Correctness verified (0 error).
-- **fused_o_norm_pack**: Convenience wrapper — calls gemv_fp4 then fused_rmsnorm_pack. 2 kernels instead of 3. Allocates internal temp buffer.
-- **fused_qkv_gemv broken for real weights**: Grid(3,) × 256 threads only writes 256 of N outputs. Works for kv_dim≤256 (synthetic). Real Qwen3-1.7B has kv_dim=1024. **Must use separate GEMVs for now.**
-- **Qwen3-1.7B real dimensions**: hidden=2048, q_dim=2048 (16 heads), kv_dim=1024 (8 KV heads), intermediate=6144, head_dim=128, 28 layers.
-- **MLP is the real bottleneck**: Attention-only 86 t/s → Full (attn+MLP) 10.9 t/s. MLP GEMVs are 2.3× more work than attention GEMVs per layer.
-- **GEMM tile 128×128×64**: 8 warps, cp.async 2-stage pipeline. 80 KB dynamic smem.
-- **GEMV dynamic K**: 256 threads/block, walks K sequentially (coalesced reads). 37 regs, 0 spill.
-- **CUDA Graphs**: 1% improvement. Launch overhead not the bottleneck.
-- **SM_120 does NOT expose tcgen05.mma**: Only datacenter SM100. SM120 uses wmma/mma.sync only.
+| Config | 4-layer t/s | 28-layer est | % of target |
+|--------|-------------|--------------|-------------|
+| Attention-only (v1 GEMV) | 601 | 86 | 75% |
+| Full + MLP (v1 GEMV) | 76 | 10.9 | 9.6% |
+| Full + MLP (v2 GEMV, transposed) | 284 | 40.6 | **35.6%** |
+
+**3.7× decode speedup** from original to fully optimized.
 
 ---
 
-## 4. Important Constraints
+## 4. GEMV v2 Optimization
 
-- `CUDACXX=/usr/local/cuda-12.8/bin/nvcc` before `project()` in CMakeLists.txt
-- g++-12 host compiler (CUDA 12.8 rejects GCC 13+)
-- `namespace wmma = nvcuda::wmma` (NOT `using wmma =` — type alias fails)
-- All WMMA code guarded `#if __CUDA_ARCH__ >= 800`
-- Shared mem: 99 KB/block max. GEMM uses 80 KB dynamic.
-- SM_120 native **critical**: generic PTX = 47× slower.
-- CMake uses `CUDA::cudart` not `CUDA::CUDA` (CMake 3.28 compat).
-- `fused_qkv_gemv` broken for output dims > 256 — don't use with real weights.
+**Root cause of bottleneck**: Original GEMV reads `W[k*N + n]` — stride N bytes between K iterations. Each cache line (128 bytes) only uses 1 byte (0.8% utilization). Peak BW 500 GB/s, achieved 22 GB/s.
+
+**Fix**: Transpose weights to `W_t[N×K]`. Then reads become sequential: `W_t[n*K + kb*16 + j]`. uint4 load (16 bytes) per iteration instead of byte. K/16 iterations instead of K.
+
+**Results**:
+| Test | v1 ms | v2 ms | speedup | v2 GB/s | %peak |
+|------|-------|-------|---------|---------|-------|
+| O-proj (2048×2048) | 0.193 | 0.077 | **2.5×** | 55.3 | 11.1% |
+| K/V-proj (2048×1024) | 0.193 | 0.077 | **2.5×** | 27.8 | 5.6% |
+| gate/up (2048×6144) | 0.193 | 0.078 | **2.5×** | 164.4 | **32.9%** |
+| down (6144×2048) | 0.576 | 0.229 | **2.5×** | 55.8 | 11.2% |
+
+**Remaining gap**: v2 still only 11-33% of peak BW. Further optimizations needed.
 
 ---
 
@@ -65,98 +66,67 @@ Next: close decode gap — MLP GEMVs are the bottleneck (87% of per-layer time).
 
 | Issue | Severity | Root Cause | Fix |
 |-------|----------|------------|-----|
-| Full decode 10.9 vs 114 t/s | 🔴 Major | MLP GEMVs dominate (87% of time) | Fuse gate+up GEMVs, optimize GEMV throughput, tensor-core GEMV |
-| fused_qkv_gemv broken for kv_dim>256 | 🔴 Bug | Grid(3,1) × 256 threads → only 256 outputs | Use separate GEMVs or fix to multi-block |
-| Attention-only 86 vs 114 t/s | 🟡 Under target | GEMV compute-bound | Same as MLP fix |
-| GEMM correctness unverified | 🟡 Risk | No reference comparison | Add CPU GEMM reference to phase_a |
-| attention_decode hardcodes head_dim=128 | 🟢 OK for Qwen3 | Register layout assumes 128 | Guard if supporting other models |
-| decode_bench scaling math wrong | 🟢 Display bug | `tps * (28/N)` instead of `1000 / (per_token * 28/N)` | Fix display |
+| 40.6 vs 114 t/s | 🟡 Under target | down_proj GEMV dominates (2.1ms of 3.5ms) | Optimize down_proj or batch it |
+| GEMV v2 only 33% peak | 🟡 Bottleneck | L2 cache thrashing for large N | Paged weights, smem tiling for x |
+| GQA attention | ✅ FIXED | Was reading wrong KV head range | Added kv_head = q_head * kv/q |
 
 ---
 
-## 6. Pending Tasks
+## 6. Important Constraints
+
+- `CUDACXX=/usr/local/cuda-12.8/bin/nvcc` before `project()` in CMakeLists.txt
+- g++-12 host compiler, CUDA 12.8
+- `namespace wmma = nvcuda::wmma` (NOT `using wmma =`)
+- All WMMA code guarded `#if __CUDA_ARCH__ >= 800`
+- Shared mem: 99 KB/block max
+- SM_120: no tcgen05.mma (only wmma/mma.sync)
+- Transposed weights required for GEMV v2
+
+---
+
+## 7. Pending Tasks
 
 | Task | Priority |
 |------|----------|
-| Fix fused_qkv_gemv for multi-block (support >256 outputs) | High |
-| Fuse gate + up GEMVs (same input x, 2 projections) | High |
-| Nsight Compute profile on GEMV bottleneck | Medium |
-| Verify GEMM output correctness | Medium |
-| Investigate tensor-core GEMV feasibility | Low |
+| Optimize down_proj (6144→2048) GEMV | High |
+| Profile down_proj vs gate/up (same data size, different dims) | Medium |
+| Investigate L2 cache behavior for N=6144 | Medium |
+| Consider batching token decode (multiple x vectors simultaneously) | Low |
 
 ---
 
-## 7. Suggested Next Actions
+## 8. Key Files / Commands
 
-1. **Fix fused_qkv_gemv** — use grid(ceil(q_dim/256), ceil(kv_dim/256)) instead of grid(3,1). Or use cooperative approach.
-2. **Fuse gate + up MLP GEMVs** — same input x, two projections → one kernel. Same pattern as fused_qkv but with correct multi-block design.
-3. **Nsight Compute profile** — identify why GEMV is slow. Memory throughput? Compute? Register pressure?
-4. **Optimize GEMV for large K** — gate/up are 2048×6144. Consider vectorized loads, K-tiling with smem.
-
----
-
-## 8. Important Files / Commands
-
-**Build**: `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel`
+**Build**: `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -B build && cmake --build build --parallel`
 
 **Benchmarks**:
-- `bench/phase_a` — basic correctness + throughput
-- `bench/decode_bench` — attention-only decode (synthetic weights, kv_dim=512)
-- `bench/decode_real N` — attention-only decode with real Qwen3-1.7B weights (N layers)
-- `bench/decode_full N` — **NEW** full decode (attention + MLP) with real weights
-- `bench/test_fused_o_norm` — verify fused_rmsnorm_pack correctness + benchmark
-- `tools/extract_weights --layers N` — extract FP4 weights from safetensors
+- `bench/phase_a` — kernel throughput
+- `bench/gemv_v2_bench` — v1 vs v2 comparison
+- `bench/gemv_char` — GEMV characterization
+- `bench/decode_full N` — full decode with real weights
+- `bench/decode_bench` — synthetic weights (attention only)
 
-**llama-baseline**: `/mnt/data/ai/llama.cpp/build-cuda12.8-sm120/bin/llama-bench --hf-repo unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M -p 512 -n 128 -r 3`
-
-**Key source**:
-- `include/blackwell/kernels.h` — 22 public API signatures
-- `include/blackwell/config.h` — 128×128 tile, 8 warps, constants
-- `src/kernels/gemm.cu` — GEMM (cp.async pipeline) + GEMV (dynamic K)
-- `src/kernels/decode.cu` — update_kv_cache + attention_decode v2
-- `src/kernels/fused_decode.cu` — fused_qkv_gemv (⚠️ broken for >256 outputs)
-- `src/kernels/fused_o_norm.cu` — **NEW** fused_rmsnorm_pack + fused_o_norm_pack
-- `src/kernels/quantize.cu` — pack_fp4/unpack_fp4
-- `src/kernels/norm.cu` — fused_rmsnorm, apply_swiglu
-
-**Verify symbols**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep -v anonymous | wc -l` → 22
+**Verify symbols**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep -v anonymous | wc -l` → 26
 
 ---
 
-## 9. Validation Status
-
-**Last validated**: 2026-05-26 (this session)  
-**Build**: ✅ Clean  
-**Run**: ✅ phase_a passes, decode_bench runs, decode_full runs with real weights  
-**Public symbols**: 22, none in anonymous namespace  
-**Real weights**: 4 layers extracted (attention + MLP), full decode verified  
-**fused_rmsnorm_pack**: ✅ Correctness verified (0 error vs separate rmsnorm+pack)  
-
----
-
-## 10. Session Metadata
+## 9. Session Metadata
 
 | Field | Value |
 |-------|-------|
 | updated_at | 2026-05-26 (this session) |
 | branch | master |
-| repo state | 11 commits, uncommitted changes (fused_o_norm, decode_full) |
-| active components | GEMM, GEMV, decode (attention+MLP), fused rmsnorm+pack |
 | nvcc | /usr/local/cuda-12.8/bin/nvcc |
-| host compiler | g++-12 |
-| target | SM_120 native (compute_120) |
+| target | SM_120 native |
 
 ---
 
 ## META PROMPT
 
-**Read sequence:** `AGENTS.md` → `HANDOFF.md` (this file) → `git status` → verify build artifacts exist.
+**Read sequence:** `AGENTS.md` → `HANDOFF.md` → `git status` → verify build
 
 **Current priorities:**
-- MLP GEMVs are the bottleneck (87% of decode time). gate/up projections (2048→6144) are 3× larger than attention projections.
-- fused_qkv_gemv is broken for real weights (kv_dim=1024). Use separate GEMVs until fixed.
-- Full decode benchmark at `bench/decode_full`. Attention-only at `bench/decode_real`.
+- GEMV v2 is 2.5× faster than v1, still 11-33% of peak. down_proj dominates decode time.
+- Transposed weights required for GEMV v2. Pre-transpose at startup.
 - Do NOT restart analysis — continue incrementally.
 - After every edit: build → symbols → bench run → no regressions.
-- DO NOT re-derive decisions from HANDOFF.md — they're recorded for continuity.
-- Update HANDOFF.md only for materially important state changes. Keep concise. No narrative history.

@@ -69,19 +69,23 @@ __global__ void attention_decode_kernel(
     const float* __restrict__ K_cache,
     const float* __restrict__ V_cache,
     int seq_pos,
-    int num_heads,
+    int num_q_heads,
+    int num_kv_heads,
     int head_dim,
     int max_seq_len,
     float scale)
 {
     int head = blockIdx.x;
-    if (head >= num_heads) return;
+    if (head >= num_q_heads) return;
+
+    // GQA: map Q head to KV head
+    int kv_head = head * num_kv_heads / num_q_heads;
 
     int tid = threadIdx.x;
     int warp_id = tid / 32;
     int lane_id = tid & 31;
     int npos = seq_pos + 1;
-    int h_base = head * max_seq_len * head_dim;
+    int h_base = kv_head * max_seq_len * head_dim;
 
     Q += head * head_dim;
     output += head * head_dim;
@@ -198,7 +202,35 @@ cudaError_t attention_decode(
     attention_decode_kernel<<<
         dim3(num_heads), dim3(256), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
-        seq_pos, num_heads, head_dim, max_seq_len, scale);
+        seq_pos, num_heads, num_heads /* kv_heads = q_heads for non-GQA */,
+        head_dim, max_seq_len, scale);
+
+    return cudaPeekAtLastError();
+}
+
+cudaError_t attention_decode_gqa(
+    float* output, const float* Q,
+    const float* K_cache, const float* V_cache,
+    int seq_pos, int num_q_heads, int num_kv_heads,
+    int head_dim, int max_seq_len, cudaStream_t stream) {
+
+    static bool attr_set = false;
+    constexpr int smem_bytes = 4096 * 4;
+    if (!attr_set) {
+        cudaError_t e = cudaFuncSetAttribute(
+            attention_decode_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes);
+        if (e != cudaSuccess) return e;
+        attr_set = true;
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    attention_decode_kernel<<<
+        dim3(num_q_heads), dim3(256), smem_bytes, stream>>>(
+        output, Q, K_cache, V_cache,
+        seq_pos, num_q_heads, num_kv_heads,
+        head_dim, max_seq_len, scale);
 
     return cudaPeekAtLastError();
 }

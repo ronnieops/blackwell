@@ -84,6 +84,29 @@ DevWeight upload_weight(const WeightFile& w) {
     return d;
 }
 
+// Transposed weight for v2 GEMV
+struct DevWeightT {
+    void* data;      // [dim0 × dim1] transposed
+    float* scales;   // [dim0/16 × dim1/16] transposed
+};
+
+DevWeightT upload_transposed_weight(const WeightFile& w) {
+    DevWeightT d;
+    size_t n = (size_t)w.dim1 * w.dim0;  // same total bytes
+    cudaMalloc(&d.data, n);
+    size_t nscales = (size_t)w.num_K_blocks * w.num_N_blocks;
+    cudaMalloc(&d.scales, nscales * 4);
+
+    // Upload original, then transpose on GPU
+    DevWeight orig = upload_weight(w);
+    blackwell::kernels::transpose_fp4_weights(
+        d.data, d.scales, orig.data, orig.scales,
+        w.dim1, w.dim0, 0);
+    cudaFree(orig.data);
+    cudaFree(orig.scales);
+    return d;
+}
+
 int main(int argc, char** argv) {
     int num_layers = 4;
     if (argc > 1) num_layers = atoi(argv[1]);
@@ -111,14 +134,14 @@ int main(int argc, char** argv) {
         char path[256];
         snprintf(path, 256, fmt, l);
         WeightFile w = load_weight(path);
-        DevWeight d = upload_weight(w);
-        printf("  %s: %d×%d\n", path, w.dim1, w.dim0);
+        DevWeightT d = upload_transposed_weight(w);
+        printf("  %s: %d×%d (transposed)\n", path, w.dim1, w.dim0);
         return d;
     };
 
     struct LayerWeights {
-        DevWeight Wq, Wk, Wv, Wo;
-        DevWeight Wgate, Wup, Wdown;
+        DevWeightT Wq, Wk, Wv, Wo;
+        DevWeightT Wgate, Wup, Wdown;
     };
     std::vector<LayerWeights> lw(num_layers);
 
@@ -191,33 +214,35 @@ int main(int argc, char** argv) {
             int kv_base = l * num_kv_heads * max_seq * head_dim;
             // Attention
             // Separate GEMVs (fused_qkv limited to 256 outputs/block)
-            blackwell::kernels::gemv_fp4(d_Q, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs,
                 lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_K, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs,
                 lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, 0);
-            blackwell::kernels::gemv_fp4(d_V, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs,
                 lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, 0);
             blackwell::kernels::update_kv_cache(
                 d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq,
                 num_kv_heads, head_dim, max_seq, 0);
-            blackwell::kernels::attention_decode(
+            blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc + kv_base, d_vc + kv_base,
-                seq, num_q_heads, head_dim, max_seq, 0);
+                seq, num_q_heads, num_kv_heads, head_dim, max_seq, 0);
             // Save residual (x before attention)
             // For simplicity in warmup, skip residual (just overwrite x)
             blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_attn_fp4, d_attn_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
                 lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
 
             // MLP
-            blackwell::kernels::gemv_fp4(d_gate, d_x_fp4, d_xs,
-                lw[l].Wgate.data, lw[l].Wgate.scales, hidden, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_up, d_x_fp4, d_xs,
-                lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, 0);
+            blackwell::kernels::fused_gate_up_gemv(
+                d_gate, d_up,
+                d_x_fp4, d_xs,
+                lw[l].Wgate.data, lw[l].Wgate.scales,
+                lw[l].Wup.data, lw[l].Wup.scales,
+                hidden, intermediate, 0);
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
             blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_mlp_fp4, d_mlp_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
                 lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
         }
@@ -236,31 +261,33 @@ int main(int argc, char** argv) {
             int kv_base = l * num_kv_heads * max_seq * head_dim;
             // Attention
             // Separate GEMVs (fused_qkv limited to 256 outputs/block)
-            blackwell::kernels::gemv_fp4(d_Q, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs,
                 lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_K, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs,
                 lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, 0);
-            blackwell::kernels::gemv_fp4(d_V, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs,
                 lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, 0);
             blackwell::kernels::update_kv_cache(
                 d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq_pos,
                 num_kv_heads, head_dim, max_seq, 0);
-            blackwell::kernels::attention_decode(
+            blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc + kv_base, d_vc + kv_base,
-                seq_pos, num_q_heads, head_dim, max_seq, 0);
+                seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, 0);
             blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_attn_fp4, d_attn_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
                 lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
 
             // MLP
-            blackwell::kernels::gemv_fp4(d_gate, d_x_fp4, d_xs,
-                lw[l].Wgate.data, lw[l].Wgate.scales, hidden, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_up, d_x_fp4, d_xs,
-                lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, 0);
+            blackwell::kernels::fused_gate_up_gemv(
+                d_gate, d_up,
+                d_x_fp4, d_xs,
+                lw[l].Wgate.data, lw[l].Wgate.scales,
+                lw[l].Wup.data, lw[l].Wup.scales,
+                hidden, intermediate, 0);
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
             blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_mlp_fp4, d_mlp_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
                 lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
         }
@@ -276,31 +303,33 @@ int main(int argc, char** argv) {
             int kv_base = l * num_kv_heads * max_seq * head_dim;
             // Attention
             // Separate GEMVs (fused_qkv limited to 256 outputs/block)
-            blackwell::kernels::gemv_fp4(d_Q, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs,
                 lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_K, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs,
                 lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, 0);
-            blackwell::kernels::gemv_fp4(d_V, d_x_fp4, d_xs,
+            blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs,
                 lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, 0);
             blackwell::kernels::update_kv_cache(
                 d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq_pos,
                 num_kv_heads, head_dim, max_seq, 0);
-            blackwell::kernels::attention_decode(
+            blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc + kv_base, d_vc + kv_base,
-                seq_pos, num_q_heads, head_dim, max_seq, 0);
+                seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, 0);
             blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_attn_fp4, d_attn_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
                 lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
 
             // MLP
-            blackwell::kernels::gemv_fp4(d_gate, d_x_fp4, d_xs,
-                lw[l].Wgate.data, lw[l].Wgate.scales, hidden, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_up, d_x_fp4, d_xs,
-                lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, 0);
+            blackwell::kernels::fused_gate_up_gemv(
+                d_gate, d_up,
+                d_x_fp4, d_xs,
+                lw[l].Wgate.data, lw[l].Wgate.scales,
+                lw[l].Wup.data, lw[l].Wup.scales,
+                hidden, intermediate, 0);
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
             blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4(d_proj, d_mlp_fp4, d_mlp_s,
+            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
                 lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
         }
