@@ -65,12 +65,20 @@ struct DeviceBuffers {
 };
 
 int main(int argc, char** argv) {
+    int kNumLayers = 4;
+    if (argc > 1) {
+        kNumLayers = atoi(argv[1]);
+        if (kNumLayers < 1) kNumLayers = 1;
+        if (kNumLayers > 28) kNumLayers = 28;
+    }
+    constexpr int kAllocLayers = 4;  // Always allocate for 4 layers
+
     cudaDeviceProp p;
     cudaGetDeviceProperties(&p, 0);
     printf("# Decode Benchmark (End-to-End)\n");
     printf("Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
-    printf("Config: hidden=%d, Qheads=%d, KVheads=%d, head_dim=%d, layers=%d, max_seq=%d\n\n",
-           kHiddenDim, kNumQHeads, kNumKVHeads, kHeadDim, kNumLayers, kMaxSeqLen);
+    printf("Config: hidden=%d, Qheads=%d, KVheads=%d, head_dim=%d, layers=%d (alloc=%d), max_seq=%d\n\n",
+           kHiddenDim, kNumQHeads, kNumKVHeads, kHeadDim, kNumLayers, kAllocLayers, kMaxSeqLen);
 
     int warmup = 3, bench = 20;
 
@@ -92,10 +100,10 @@ int main(int argc, char** argv) {
     cudaMalloc(&b.attn_out, q_dim * 4);
     cudaMalloc(&b.proj_out, kHiddenDim * 4);
 
-    cudaMalloc(&b.k_cache, kNumLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
-    cudaMalloc(&b.v_cache, kNumLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
-    cudaMemset(b.k_cache, 0, kNumLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
-    cudaMemset(b.v_cache, 0, kNumLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
+    cudaMalloc(&b.k_cache, kAllocLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
+    cudaMalloc(&b.v_cache, kAllocLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
+    cudaMemset(b.k_cache, 0, kAllocLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
+    cudaMemset(b.v_cache, 0, kAllocLayers * kNumKVHeads * kMaxSeqLen * kHeadDim * 4);
 
     // Initialize x to uniform 1.0
     std::vector<float> x_init(kHiddenDim, 1.0f);
@@ -103,10 +111,10 @@ int main(int argc, char** argv) {
     std::vector<float> x_scales(kHiddenDim / kFP4BlockSize, kScaleOneThird);
     cudaMemcpy(b.x_scale, x_scales.data(), (kHiddenDim / kFP4BlockSize) * 4, cudaMemcpyHostToDevice);
 
-    // Allocate per-layer weight arrays
-    std::vector<void*> W_q_fp4(kNumLayers), W_k_fp4(kNumLayers), W_v_fp4(kNumLayers), W_o_fp4(kNumLayers);
-    std::vector<float*> W_q_scale(kNumLayers), W_k_scale(kNumLayers), W_v_scale(kNumLayers), W_o_scale(kNumLayers);
-    std::vector<float*> rmsnorm_w(kNumLayers);
+    // Allocate per-layer weight arrays (always alloc 4 layers)
+    std::vector<void*> W_q_fp4(kAllocLayers), W_k_fp4(kAllocLayers), W_v_fp4(kAllocLayers), W_o_fp4(kAllocLayers);
+    std::vector<float*> W_q_scale(kAllocLayers), W_k_scale(kAllocLayers), W_v_scale(kAllocLayers), W_o_scale(kAllocLayers);
+    std::vector<float*> rmsnorm_w(kAllocLayers);
 
     std::vector<float> all_scales(num_w_blks_q, kScaleOneThird);
     std::vector<float> all_one(kHiddenDim, 1.0f);

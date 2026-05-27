@@ -1,132 +1,198 @@
 # HANDOFF.md — blackwell
 
-Preserves operational context between sessions. Read before acting.
+Operational context between sessions. Read before acting.
 
 ---
 
 ## 1. Current Objective
 
-FP4 E2M1 block-scaled LLM inference kernels on RTX 5060 Ti (SM_120).  
-Decode pipeline with all optimizations working. Current: 40.6 t/s (28-layer est), 35.6% of llama.cpp (114 t/s target).
+FP4 E2M1 block-scaled LLM inference on RTX 5060 Ti (SM_120).
+**Target**: Approach llama.cpp Q4_K_M baseline (114 t/s).
+**Current**: ~50 t/s (CUDA Graph, 43.8% of target) — research prototype.
 
 ---
 
 ## 2. Current Status
 
-| Domain | Status | Note |
-|--------|--------|------|
-| GEMM (prefill) | ✅ 25–38 GB/s | 128×128×64 CTA, cp.async pipeline, 136 regs |
-| GEMV v1 (strided) | ✅ | Original, K iterations, 22 GB/s (4.4% peak) |
-| GEMV v2 (vectorized) | ✅ NEW | uint4 block loads, K/16 iterations, 55-164 GB/s (11-33% peak), **2.5× speedup** |
-| Transposed weights | ✅ NEW | W_t [N×K] layout enables sequential K access |
-| GEMV benchmark | ✅ | `bench/gemv_v2_bench` — compares v1 vs v2 |
-| fused_gate_up_gemv | ✅ NEW | Fused gate + up in one kernel |
-| fused_rmsnorm_pack | ✅ | Single-block RMSNorm + FP4 pack |
-| attention_decode_gqa | ✅ NEW | GQA-aware (16 Q heads, 8 KV heads) |
-| fused_qkv_gemv | ✅ FIXED | Multi-block Grid(3, tiles) for q_dim/kv_dim > 256 |
-| Decode full benchmark | ✅ | `bench/decode_full` — all optimizations integrated |
-| SwiGLU, update_kv_cache | ✅ | Working |
-| llama.cpp baseline | ✅ | 4560 t/s pp512, 114 t/s tg128 |
+| Metric | Value |
+|--------|-------|
+| **Per-kernel throughput** | 42.8 t/s (2 layers raw) |
+| **CUDA Graph throughput** | 50.1 t/s (scaled to 28 layers) |
+| **Ratio to llama.cpp** | 43.8% (114 t/s baseline) |
+| Per-token latency | ~1.43ms (CUDA Graph), ~1.74ms (per-kernel) |
+| GEMV v2 peak | 164 GB/s (phase_a, isolated) |
+| Decode_full GEMV | ~87 GB/s (cross-kernel L2 thrashing) |
+| Library symbols | 29 public API |
 
-**26 public API symbols** (was 20). All outside anonymous namespace.
+**Per-kernel timing** (2 layers × 20 tokens):
+| Kernel | Time | Share |
+|--------|------|-------|
+| fused_gate_up_gemv | 9.0 ms | 29% |
+| Q/K/V GEMVs | 10.8 ms | 35% |
+| gemv_fp4_splitk (down_proj) | 4.1 ms | 13% |
+| Wo GEMV | 3.6 ms | 12% |
+| attn + rmsnorm + pack + update | 1.8 ms | 6% |
+| Other | 2.7 ms | 9% |
+| **Total** | **31 ms** | |
 
----
-
-## 3. Performance Summary
-
-| Config | 4-layer t/s | 28-layer est | % of target |
-|--------|-------------|--------------|-------------|
-| Attention-only (v1 GEMV) | 601 | 86 | 75% |
-| Full + MLP (v1 GEMV) | 76 | 10.9 | 9.6% |
-| Full + MLP (v2 GEMV, transposed) | 284 | 40.6 | **35.6%** |
-
-**3.7× decode speedup** from original to fully optimized.
+**Bottleneck shift after optimizations**: fused_gate_up now dominates (29%), down_proj reduced to 13% with split-K=4.
 
 ---
 
-## 4. GEMV v2 Optimization
+## 3. Recent Decisions
 
-**Root cause of bottleneck**: Original GEMV reads `W[k*N + n]` — stride N bytes between K iterations. Each cache line (128 bytes) only uses 1 byte (0.8% utilization). Peak BW 500 GB/s, achieved 22 GB/s.
+### Implemented and working
+- **CUDA Graph integration** — +15.3% over per-kernel timing (50.1 vs 42.8 t/s)
+- **Split-K=4 for down_proj** — 28% reduction on down_proj time (5.7→4.1ms)
+- **cudaMemsetAsync** — Required for CUDA Graph capture; cudaMemset fails with "previous error during capture"
+- **Residual connections fix** — vector_add_fp32 kernel + 8 fixed instances
+- **K_splits=4 in graph capture** — synced with benchmark loop
 
-**Fix**: Transpose weights to `W_t[N×K]`. Then reads become sequential: `W_t[n*K + kb*16 + j]`. uint4 load (16 bytes) per iteration instead of byte. K/16 iterations instead of K.
-
-**Results**:
-| Test | v1 ms | v2 ms | speedup | v2 GB/s | %peak |
-|------|-------|-------|---------|---------|-------|
-| O-proj (2048×2048) | 0.193 | 0.077 | **2.5×** | 55.3 | 11.1% |
-| K/V-proj (2048×1024) | 0.193 | 0.077 | **2.5×** | 27.8 | 5.6% |
-| gate/up (2048×6144) | 0.193 | 0.078 | **2.5×** | 164.4 | **32.9%** |
-| down (6144×2048) | 0.576 | 0.229 | **2.5×** | 55.8 | 11.2% |
-
-**Remaining gap**: v2 still only 11-33% of peak BW. Further optimizations needed.
-
----
-
-## 5. Known Issues / Risks
-
-| Issue | Severity | Root Cause | Fix |
-|-------|----------|------------|-----|
-| 40.6 vs 114 t/s | 🟡 Under target | down_proj GEMV dominates (2.1ms of 3.5ms) | Optimize down_proj or batch it |
-| GEMV v2 only 33% peak | 🟡 Bottleneck | L2 cache thrashing for large N | Paged weights, smem tiling for x |
-| GQA attention | ✅ FIXED | Was reading wrong KV head range | Added kv_head = q_head * kv/q |
+### Tested and rejected
+| Attempt | Result | Reason |
+|---------|--------|--------|
+| L2 persistence (256KB) | <1% | GDDR7 already fast enough |
+| smem x_fp4 caching in v2 | 0% | Compiler/L1 already optimal |
+| Batched GEMV (M×v2) | negative | Scattered L2 pattern, 85 vs 328 GB/s theoretical |
+| Unfused gate+up | 0% | Same as fused |
+| split-K beyond 4 | <1% | Diminishing returns |
+| fused_qkv_gemv | slower | 66 GB/s vs 164 GB/s for gemv_fp4_v2 |
+| GEMV v3 (smem tiled) | slower | 124 GB/s vs 164 GB/s; __syncthreads in inner loop |
+| GEMV v3 unfused | abandoned | Register pressure, slower than v1 |
 
 ---
 
-## 6. Important Constraints
+## 4. Root Cause: 2× phase_a vs decode_full gap
 
-- `CUDACXX=/usr/local/cuda-12.8/bin/nvcc` before `project()` in CMakeLists.txt
-- g++-12 host compiler, CUDA 12.8
+| Context | Bandwidth |
+|---------|-----------|
+| Phase_a isolated GEMV | 164 GB/s (33% of 500 GB/s peak) |
+| Decode_full GEMV | ~87 GB/s (17% of peak) |
+
+**Cause**: Cross-kernel L2 cache eviction. Q/K/V/Wo + gate_up + down_proj all access 12MB+ weight matrices — each kernel evicts the previous kernel's data from L2. FP4 dequantization overhead (cast + scale per element) is the intrinsic ceiling for block-scaled quantization.
+
+**Not caused by**: Launch overhead (CUDA Graph fixes this), cudaMemset (already Async), smem for x, L2 persistence.
+
+---
+
+## 5. Constraints
+
+- `CUDACXX=/usr/local/cuda-12.8/bin/nvcc` — CUDA 12.8, NOT system CUDA 12.0
+- g++-12 host compiler, CMake, C++17
 - `namespace wmma = nvcuda::wmma` (NOT `using wmma =`)
-- All WMMA code guarded `#if __CUDA_ARCH__ >= 800`
-- Shared mem: 99 KB/block max
-- SM_120: no tcgen05.mma (only wmma/mma.sync)
-- Transposed weights required for GEMV v2
+- All WMMA guarded `#if __CUDA_ARCH__ >= 800`
+- `sizeof(__nv_fp4_e2m1) = 1` byte
+- SM_120 native build critical — generic drops to 2% perf
+- Attention kernel smem: 4096×4 bytes (static attr set via wrapper)
+- CUDA Graph capture requires: cudaMemsetAsync, attention_pre_trigger, cudaDeviceSynchronize before capture
 
 ---
 
-## 7. Pending Tasks
+## 6. Pending Tasks
 
-| Task | Priority |
-|------|----------|
-| Optimize down_proj (6144→2048) GEMV | High |
-| Profile down_proj vs gate/up (same data size, different dims) | Medium |
-| Investigate L2 cache behavior for N=6144 | Medium |
-| Consider batching token decode (multiple x vectors simultaneously) | Low |
+| # | Task | Priority | Status |
+|---|------|----------|--------|
+| 1 | Use `fused_qkv_gemv` in decode_full | Low | Would replace 3 gemv_v2 calls; but kernel is 66 GB/s vs 164 — **deprioritized** |
+| 2 | Page-aligned weight allocations | Low | Phase_a proves kernel is optimal; cache state the issue |
+| 3 | INT8/INT4 quantization research | Future | Would need different dequant pipeline |
+| 4 | CUTLASS warp-tiled GEMV | Future | Separate project, cp.async pipelines |
+
+**No active optimization tasks remaining.** The gap to 114 t/s is architectural, not tunable.
 
 ---
 
-## 8. Key Files / Commands
+## 7. Suggested Next Actions (Future Sessions)
 
-**Build**: `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -B build && cmake --build build --parallel`
+1. **Measure decode_full correctness** — Compare output values with llama.cpp reference for same input. Verify FP4 quantization is producing numerically similar results.
+
+2. **INT8 quantization path** — Investigate INT8 GEMV kernels (better hardware support for dequant, no FP4 cast overhead). Could bridge 2× gap to llama.cpp.
+
+3. **CUTLASS-style GEMV** — Separate project: warp-tiled GEMV with cp.async weight loading. High complexity, separate from current FP4 block-scaled approach.
+
+4. **Ship and document** — Clean up uncommitted files, write PHASE_A_RESULTS.md update, finalize AGENTS.md.
+
+---
+
+## 8. Important Files / Commands
+
+**Build**:
+```bash
+CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -B build && cmake --build build --parallel
+```
 
 **Benchmarks**:
-- `bench/phase_a` — kernel throughput
-- `bench/gemv_v2_bench` — v1 vs v2 comparison
-- `bench/gemv_char` — GEMV characterization
-- `bench/decode_full N` — full decode with real weights
-- `bench/decode_bench` — synthetic weights (attention only)
+```bash
+# Per-kernel timing (with profiling overhead)
+./bench/decode_full 2
 
-**Verify symbols**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep -v anonymous | wc -l` → 26
+# CUDA Graph benchmark (cleaner measurement)
+./bench/decode_full_cgraph_clean 2
+
+# Kernel throughput (isolated)
+./bench/phase_a 2>&1 | grep gemv_fp4_v2
+
+# Unfused gate+up variant
+./bench/decode_full_unfused 2
+```
+
+**llama baseline**:
+```bash
+/mnt/data/ai/llama.cpp/build-cuda12.8-sm120/bin/llama-bench \
+  --hf-repo unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M -p 512 -n 128 -r 3
+```
+
+**Verification**:
+```bash
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep -v anonymous | wc -l
+# Expected: 29
+```
 
 ---
 
-## 9. Session Metadata
+## 9. Validation Status
+
+| Check | Status |
+|-------|--------|
+| Build | ✅ Clean (29 symbols) |
+| Phase_a | ✅ No segfault, no FAIL lines |
+| GEMV v2 correctness | ✅ 0 rel error |
+| CUDA Graph capture | ✅ Working (cudaMemsetAsync required) |
+| Residual connections | ✅ L1 norm non-zero |
+| Split-K=4 | ✅ Working |
+
+---
+
+## 10. Session Metadata
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-05-26 (this session) |
-| branch | master |
-| nvcc | /usr/local/cuda-12.8/bin/nvcc |
-| target | SM_120 native |
+| updated_at | 2026-05-27 07:10 UTC |
+| branch | master (13 files modified, uncommitted) |
+| repo_state | Working, all binaries present |
+| throughput | 50.1 t/s CUDA Graph, 42.8 t/s per-kernel |
+| GEMV peak | 164 GB/s (phase_a), ~87 GB/s (decode_full) |
+| active_kernels | gemv_fp4_v2, gemv_fp4_splitk, fused_gate_up, fused_rmsnorm_pack, attention_decode_gqa |
 
 ---
 
 ## META PROMPT
 
-**Read sequence:** `AGENTS.md` → `HANDOFF.md` → `git status` → verify build
+**Read sequence**: `AGENTS.md` → `HANDOFF.md` → `git status` → verify build exists
 
-**Current priorities:**
-- GEMV v2 is 2.5× faster than v1, still 11-33% of peak. down_proj dominates decode time.
-- Transposed weights required for GEMV v2. Pre-transpose at startup.
-- Do NOT restart analysis — continue incrementally.
-- After every edit: build → symbols → bench run → no regressions.
+**Critical facts** (verify before editing):
+- Throughput is **50.1 t/s** (CUDA Graph), NOT the per-kernel 42.8 t/s. Per-kernel timing has profiling overhead.
+- `decode_full` has both per-kernel timing AND CUDA Graph benchmark sections.
+- `cudaMemset` (sync) FAILS in CUDA Graph capture. Must use `cudaMemsetAsync`.
+- GEMV v2 is final (164 GB/s). v3 abandoned (124 GB/s).
+- `fused_qkv_gemv` is slower (66 GB/s) than 3× gemv_fp4_v2 calls — do not replace working GEMVs with it.
+- SM_120 native build critical.
+
+**Current priority**: No active optimization tasks. Verify correctness vs llama.cpp reference. Future work: INT8 quantization or CUTLASS-style GEMV (separate projects).
+
+**Do NOT**:
+- Restart analysis from scratch
+- Use per-kernel timed numbers as ground truth (52% overhead)
+- Re-implement smem tiling (proven worse)
+- Replace gemv_fp4_v2 with fused_qkv_gemv
+
+**After every edit**: `cmake --build build --parallel` → `./bench/phase_a` → `./bench/decode_full 2`

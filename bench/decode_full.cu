@@ -38,6 +38,16 @@ struct GpuTimer {
                   float ms=0; cudaEventElapsedTime(&ms, start, stop); return ms; }
 };
 
+struct KernelTimer {
+    const char* name;
+    double total_ms = 0;
+    int count = 0;
+    KernelTimer(const char* n) : name(n) {}
+    void add(float ms) { total_ms += ms; ++count; }
+    double avg() const { return count > 0 ? total_ms / count : 0; }
+    void print() const { printf("  %-30s  %7.3f ms (%d calls)\n", name, total_ms, count); }
+};
+
 static bool check(cudaError_t e, const char* msg) {
     if (e != cudaSuccess) { printf("FAIL: %s: %s\n", msg, cudaGetErrorString(e)); return false; }
     return true;
@@ -78,6 +88,9 @@ DevWeight upload_weight(const WeightFile& w) {
     size_t n = (size_t)w.dim1 * w.dim0;
     cudaMalloc(&d.data, n);
     cudaMemcpy(d.data, w.data.data(), n, cudaMemcpyHostToDevice);
+    // L2 persistence hint: keep weight data resident in L2 cache
+    cudaMemAdvise(d.data, n, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise(d.data, n, cudaMemAdviseSetAccessedBy, 0);
     size_t nscales = (size_t)w.num_K_blocks * w.num_N_blocks;
     cudaMalloc(&d.scales, nscales * 4);
     cudaMemcpy(d.scales, w.scales.data(), nscales * 4, cudaMemcpyHostToDevice);
@@ -104,6 +117,13 @@ DevWeightT upload_transposed_weight(const WeightFile& w) {
         w.dim1, w.dim0, 0);
     cudaFree(orig.data);
     cudaFree(orig.scales);
+
+    // L2 persistence hint: keep transposed weight data resident
+    cudaMemAdvise(d.data, n, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise(d.data, n, cudaMemAdviseSetAccessedBy, 0);
+    cudaMemAdvise(d.scales, nscales * 4, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise(d.scales, nscales * 4, cudaMemAdviseSetAccessedBy, 0);
+
     return d;
 }
 
@@ -117,6 +137,15 @@ int main(int argc, char** argv) {
     printf("# Full Decode Benchmark — Attention + MLP\n");
     printf("Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
     printf("Layers: %d\n\n", num_layers);
+
+    // L2 persistence: reserve 256KB for persisting weight matrix access.
+    // Weight matrices (1.5-4MB each) reused across split-K blocks stay cached.
+    cudaError_t l2e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 256 * 1024);
+    if (l2e != cudaSuccess) {
+        printf("  Note: L2 persisting = %s\n", cudaGetErrorString(l2e));
+    } else {
+        printf("  L2 persisting: 256KB reserved\n");
+    }
 
     // Qwen3-1.7B params
     const int hidden = 2048;
@@ -156,7 +185,9 @@ int main(int argc, char** argv) {
     }
 
     // Allocate buffers
-    float *d_x32, *d_xs, *d_Q, *d_K, *d_V, *d_attn, *d_proj, *d_gate, *d_up, *d_mlp;
+    float *d_x32, *d_xs, *d_Q, *d_K, *d_V, *d_attn, *d_proj;
+    float *d_gate, *d_up, *d_mlp;          // MLP intermediates
+    float *d_mlp_out;                      // MLP FP32 output (+residual)
     void *d_x_fp4, *d_attn_fp4, *d_mlp_fp4;
     float *d_attn_s, *d_mlp_s;
     cudaMalloc(&d_x32, hidden * 4);
@@ -170,6 +201,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_gate, intermediate * 4);
     cudaMalloc(&d_up, intermediate * 4);
     cudaMalloc(&d_mlp, intermediate * 4);
+    cudaMalloc(&d_mlp_out, intermediate * 4);  // MLP FP32 + residual
     cudaMalloc(&d_attn_fp4, q_dim);
     cudaMalloc(&d_attn_s, (q_dim/16) * 4);
     cudaMalloc(&d_mlp_fp4, intermediate);
@@ -201,11 +233,11 @@ int main(int argc, char** argv) {
     cudaMemset(d_kc, 0, num_layers * num_kv_heads * max_seq * head_dim * 4);
     cudaMemset(d_vc, 0, num_layers * num_kv_heads * max_seq * head_dim * 4);
 
-    // Residual buffer (for attention + MLP residual connections)
-    void *d_x_residual_fp4;
-    float *d_x_residual_s;
-    cudaMalloc(&d_x_residual_fp4, hidden);
-    cudaMalloc(&d_x_residual_s, (hidden/16) * 4);
+    // Residual buffer: reuse d_mlp_out for MLP +resid
+    // (attention residual uses d_x32 saved before layer)
+    // Attention residual buffer: d_mlp_out also serves this
+    // d_mlp_out reused across layers
+
 
     // Fill KV cache to seq=128
     printf("Filling KV cache to seq_pos=128...\n");
@@ -226,12 +258,17 @@ int main(int argc, char** argv) {
             blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc + kv_base, d_vc + kv_base,
                 seq, num_q_heads, num_kv_heads, head_dim, max_seq, 0);
-            // Save residual (x before attention)
-            // For simplicity in warmup, skip residual (just overwrite x)
+            // Save x_fp32 residual before attention modifies it
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
             blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
                 lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
+            // Resid: proj += x_residual via FP32 intermediates
+            // Resid: proj += x_residual (add FP32 values, then rmsnorm+pack)
+            blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            // Save attention output as residual for MLP
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
 
             // MLP
             blackwell::kernels::fused_gate_up_gemv(
@@ -242,8 +279,13 @@ int main(int argc, char** argv) {
                 hidden, intermediate, 0);
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
             blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
-                lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
+            // Zero output, then split-K for down_proj
+            cudaMemsetAsync(d_proj, 0, hidden * 4, 0);
+            blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s,
+                lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 2, 0);
+            // Resid: down_proj_out += attn_residual via FP32 intermediates
+            // Resid: down_proj_out += attn_residual (both [hidden=2048])
+            blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
         }
     }
@@ -260,6 +302,8 @@ int main(int argc, char** argv) {
         for (int l = 0; l < num_layers; ++l) {
             int kv_base = l * num_kv_heads * max_seq * head_dim;
             // Attention
+            // Save x_fp32 residual before attention modifies it (inter-layer)
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // Separate GEMVs (fused_qkv limited to 256 outputs/block)
             blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs,
                 lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0);
@@ -276,8 +320,12 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
             blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
                 lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
+            // Resid: proj += x_residual via FP32 intermediates
+            // Resid: proj += x_residual (add FP32 values, then rmsnorm+pack)
+            blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
-
+            // Save attention output as residual for MLP phase
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // MLP
             blackwell::kernels::fused_gate_up_gemv(
                 d_gate, d_up,
@@ -287,12 +335,24 @@ int main(int argc, char** argv) {
                 hidden, intermediate, 0);
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
             blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
-                lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
+            cudaMemsetAsync(d_proj, 0, hidden * 4, 0);
+            blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s,
+                lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 2, 0);
+            blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
         }
     }
     cudaDeviceSynchronize();
+
+    KernelTimer timers[] = {
+        {"gemv_fp4_v2 (Q)"}, {"gemv_fp4_v2 (K)"}, {"gemv_fp4_v2 (V)"},
+        {"update_kv_cache"}, {"attention_decode_gqa"},
+        {"pack_fp4 (attn)"}, {"gemv_fp4_v2 (Wo)"}, {"fused_rmsnorm_pack (attn)"},
+        {"fused_gate_up_gemv"}, {"apply_swiglu"},
+        {"pack_fp4 (mlp)"}, {"gemv_fp4_splitk (down_proj)"}, {"fused_rmsnorm_pack (mlp)"}
+    };
+    GpuTimer kt[14];
+#define TIME_KERNEL(idx, call) do { kt[idx].begin(); call; timers[idx].add(kt[idx].end()); } while(0)
 
     // Benchmark
     printf("Benchmarking %d tokens (seq_pos=%d)...\n", bench_iter, seq_pos);
@@ -301,37 +361,40 @@ int main(int argc, char** argv) {
     for (int iter = 0; iter < bench_iter; ++iter) {
         for (int l = 0; l < num_layers; ++l) {
             int kv_base = l * num_kv_heads * max_seq * head_dim;
+            // Save x_fp32 residual before attention modifies it
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // Attention
-            // Separate GEMVs (fused_qkv limited to 256 outputs/block)
-            blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs,
-                lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0);
-            blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs,
-                lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, 0);
-            blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs,
-                lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, 0);
-            blackwell::kernels::update_kv_cache(
-                d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq_pos,
-                num_kv_heads, head_dim, max_seq, 0);
-            blackwell::kernels::attention_decode_gqa(
-                d_attn, d_Q, d_kc + kv_base, d_vc + kv_base,
-                seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, 0);
-            blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0);
-            blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s,
-                lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
-
+            TIME_KERNEL(0, blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs, lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, 0));
+            TIME_KERNEL(1, blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs, lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, 0));
+            TIME_KERNEL(2, blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs, lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, 0));
+            TIME_KERNEL(3, blackwell::kernels::update_kv_cache(d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq_pos, num_kv_heads, head_dim, max_seq, 0));
+            TIME_KERNEL(4, blackwell::kernels::attention_decode_gqa(d_attn, d_Q, d_kc + kv_base, d_vc + kv_base, seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, 0));
+            TIME_KERNEL(5, blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0));
+            TIME_KERNEL(6, blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s, lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0));
+            // Resid: proj += x_residual
+            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_mlp_out, hidden, 0);
+            TIME_KERNEL(7, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-5f, 0));
+            // Save attn output as MLP residual
+            blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // MLP
-            blackwell::kernels::fused_gate_up_gemv(
-                d_gate, d_up,
-                d_x_fp4, d_xs,
-                lw[l].Wgate.data, lw[l].Wgate.scales,
-                lw[l].Wup.data, lw[l].Wup.scales,
-                hidden, intermediate, 0);
+#ifdef USE_UNFUSED_GATE_UP
+            TIME_KERNEL(8, blackwell::kernels::gemv_fp4_v2(d_gate, d_x_fp4, d_xs, lw[l].Wgate.data, lw[l].Wgate.scales, hidden, intermediate, 0));
+            TIME_KERNEL(9, blackwell::kernels::gemv_fp4_v2(d_up, d_x_fp4, d_xs, lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, 0));
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0);
-            blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0);
-            blackwell::kernels::gemv_fp4_v2(d_proj, d_mlp_fp4, d_mlp_s,
-                lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+#else
+            TIME_KERNEL(8, blackwell::kernels::fused_gate_up_gemv(d_gate, d_up, d_x_fp4, d_xs, lw[l].Wgate.data, lw[l].Wgate.scales, lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, 0));
+            TIME_KERNEL(9, blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0));
+#endif
+            TIME_KERNEL(9, blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, 0));
+            TIME_KERNEL(10, blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, 0));
+            // Zero output for atomic split-K partial sums
+            cudaMemsetAsync(d_proj, 0, hidden * 4, 0);
+            TIME_KERNEL(11, blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s, lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 4, 0));
+            // Resid: down_proj_out += attn_residual
+            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::vector_add_fp32(d_mlp_out, d_proj, d_mlp_out, intermediate, 0);
+            TIME_KERNEL(12, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-5f, 0));
         }
     }
     float total_ms = t.end();
@@ -349,24 +412,98 @@ int main(int argc, char** argv) {
     printf("  Target (llama):    114 t/s\n");
     printf("  Ratio:             %.1f%%\n", (scaled_28 / 114.0f) * 100.0f);
 
+    printf("\n=== Per-Kernel Timing (%d layers × %d tokens) ===\n", num_layers, bench_iter);
+    double kernel_total = 0;
+    for (int i = 0; i < 13; ++i) { timers[i].print(); kernel_total += timers[i].total_ms; }
+    printf("  %-30s  %7.3f ms (total)\n", "TOTAL KERNEL", kernel_total);
     printf("\n  Per-layer breakdown estimate:\n");
-    printf("    Attention: fused_qkv + update_kv + attn + pack + gemv_o + rmsnorm_pack = 6 ops\n");
-    printf("    MLP:       2×gemv(gate/up) + swiglu + pack + gemv(down) + rmsnorm_pack = 6 ops\n");
-    printf("    Total:     12 ops/layer × %d layers = %d ops/token\n", num_layers, num_layers * 12);
+    printf("    Attention: gemv(Q,K,V) + update_kv + attn + pack + gemv(Wo) + rmsnorm_pack = 8 ops\n");
+    printf("    MLP:       gate_up + swiglu + pack + gemv(down) + rmsnorm_pack = 5 ops\n");
+    printf("    Total:     13 ops/layer × %d layers = %d ops/token\n", num_layers, num_layers * 13);
+
+    // =========================================================================
+    // CUDA Graph benchmark — capture full decode loop, benchmark via graphLaunch
+    // =========================================================================
+    cudaDeviceSynchronize();  // CRITICAL: clear stream=0 error state
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    cudaStream_t graph_stream;
+    cudaStreamCreate(&graph_stream);
+
+    // Pre-trigger attention_decode_gqa on graph_stream (sets smem attr)
+    blackwell::kernels::attention_decode_gqa(
+        d_attn, d_Q, d_kc + 0, d_vc + 0,
+        seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, graph_stream);
+    cudaStreamSynchronize(graph_stream);
+
+    printf("\n=== CUDA Graph Benchmark ===\n");
+    printf("  Capturing full decode (%d layers)... ", num_layers);
+    fflush(stdout);
+    cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal);
+    for (int l = 0; l < num_layers; ++l) {
+        int kv_base = l * num_kv_heads * max_seq * head_dim;
+        blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, graph_stream);
+        blackwell::kernels::gemv_fp4_v2(d_Q, d_x_fp4, d_xs, lw[l].Wq.data, lw[l].Wq.scales, hidden, q_dim, graph_stream);
+        blackwell::kernels::gemv_fp4_v2(d_K, d_x_fp4, d_xs, lw[l].Wk.data, lw[l].Wk.scales, hidden, kv_dim, graph_stream);
+        blackwell::kernels::gemv_fp4_v2(d_V, d_x_fp4, d_xs, lw[l].Wv.data, lw[l].Wv.scales, hidden, kv_dim, graph_stream);
+        blackwell::kernels::update_kv_cache(d_kc + kv_base, d_vc + kv_base, d_K, d_V, 0, seq_pos, num_kv_heads, head_dim, max_seq, graph_stream);
+        blackwell::kernels::attention_decode_gqa(d_attn, d_Q, d_kc + kv_base, d_vc + kv_base, seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, graph_stream);
+        blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, graph_stream);
+        blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s, lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, graph_stream);
+        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_mlp_out, hidden, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, graph_stream);
+        blackwell::kernels::fused_gate_up_gemv(d_gate, d_up, d_x_fp4, d_xs, lw[l].Wgate.data, lw[l].Wgate.scales, lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, graph_stream);
+        blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, graph_stream);
+        blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, graph_stream);
+        cudaMemsetAsync(d_proj, 0, hidden * 4, graph_stream);
+        blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s, lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 4, graph_stream);
+        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::vector_add_fp32(d_mlp_out, d_proj, d_mlp_out, intermediate, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-5f, graph_stream);
+    }
+    cudaError_t cap_err = cudaStreamEndCapture(graph_stream, &graph);
+    if (cap_err != cudaSuccess) {
+        printf("FAIL: %s\n", cudaGetErrorString(cap_err));
+        cudaStreamDestroy(graph_stream);
+    } else {
+        cap_err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+        if (cap_err != cudaSuccess) {
+            printf("FAIL: cudaGraphInstantiate: %s\n", cudaGetErrorString(cap_err));
+            cudaStreamDestroy(graph_stream);
+        } else {
+            printf("done\n");
+            GpuTimer tg;
+            tg.begin();
+            for (int i = 0; i < bench_iter; ++i) cudaGraphLaunch(graph_exec, graph_stream);
+            cudaStreamSynchronize(graph_stream);
+            float graph_ms = tg.end();
+            float graph_per_token = graph_ms / bench_iter;
+            float graph_tps = 1000.0f / graph_per_token;
+            printf("  Graph per-token:      %.3f ms\n", graph_per_token);
+            printf("  Graph throughput:     %.1f t/s\n", graph_tps);
+            printf("  Graph scaled 28:     %.1f t/s\n", 1000.0f / (graph_per_token * 28.0f / num_layers));
+            printf("  vs per-kernel:       %.1f%%\n", (graph_tps / tps) * 100.0f);
+            cudaGraphExecDestroy(graph_exec);
+            cudaGraphDestroy(graph);
+            cudaStreamDestroy(graph_stream);
+        }
+    }
 
     // Print output values
-    printf("\n  First 8 x values: ");
-    std::vector<float> out(hidden);
-    cudaMemcpy(out.data(), d_x32, hidden * 4, cudaMemcpyDeviceToHost);
-    blackwell::kernels::unpack_fp4(out.data(), d_x_fp4, d_xs, hidden, 0);
-    cudaMemcpy(out.data(), d_x_fp4, 1, cudaMemcpyDeviceToHost); // dummy
-    // Actually need to unpack properly
     float* d_tmp;
     cudaMalloc(&d_tmp, hidden * 4);
     blackwell::kernels::unpack_fp4(d_tmp, d_x_fp4, d_xs, hidden, 0);
+    std::vector<float> out(hidden);
     cudaMemcpy(out.data(), d_tmp, hidden * 4, cudaMemcpyDeviceToHost);
+    printf("\n  First 8 x values: ");
     for (int i = 0; i < 8; ++i) printf("%.4f ", out[i]);
     printf("\n");
+    // Verify outputs show residual connection effect (not all same)
+    float sum_abs = 0;
+    for (int i = 0; i < hidden; ++i) sum_abs += fabsf(out[i]);
+    printf("  L1 norm: %.2f  (non-zero = residual working)\n", sum_abs / hidden);
     cudaFree(d_tmp);
 
     // Cleanup
@@ -381,12 +518,12 @@ int main(int argc, char** argv) {
     }
     cudaFree(d_x32); cudaFree(d_x_fp4); cudaFree(d_xs);
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_attn); cudaFree(d_proj); cudaFree(d_gate); cudaFree(d_up); cudaFree(d_mlp);
+    cudaFree(d_attn); cudaFree(d_proj); cudaFree(d_gate); cudaFree(d_up);
+    cudaFree(d_mlp); cudaFree(d_mlp_out);
     cudaFree(d_attn_fp4); cudaFree(d_attn_s);
     cudaFree(d_mlp_fp4); cudaFree(d_mlp_s);
     cudaFree(d_rn_weight);
     cudaFree(d_kc); cudaFree(d_vc);
-    cudaFree(d_x_residual_fp4); cudaFree(d_x_residual_s);
 
     return 0;
 }

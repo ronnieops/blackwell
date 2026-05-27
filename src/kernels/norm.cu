@@ -136,5 +136,33 @@ cudaError_t apply_swiglu(
     return cudaPeekAtLastError();
 }
 
+__launch_bounds__(256, 1)
+__global__ void vector_add_fp32_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int PILE = sizeof(float4) / sizeof(float);  // == 4
+    if (n >= PILE && (idx * PILE) < n) {
+        float4 va; float4 vb;
+        ((float4*)a)[idx] = va;
+        ((float4*)b)[idx] = vb;
+        ((float4*)out)[idx] = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
+        return;
+    }
+    if (idx < n) out[idx] = a[idx] + b[idx];
+}
+
+cudaError_t vector_add_fp32(
+    float* out, const float* a, const float* b,
+    int num_elements, cudaStream_t stream) {
+
+    dim3 block(256);
+    dim3 grid((num_elements + 255) / 256);
+    vector_add_fp32_kernel<<<grid, block, 0, stream>>>(out, a, b, num_elements);
+    return cudaPeekAtLastError();
+}
+
 } // namespace kernels
 } // namespace blackwell

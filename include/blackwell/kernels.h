@@ -87,6 +87,15 @@ cudaError_t apply_swiglu(
     int             num_elements,
     cudaStream_t    stream = 0);
 
+// Elementwise FP32 vector add: out[i] = a[i] + b[i]
+// Used for residual connections in transformer decode.
+cudaError_t vector_add_fp32(
+    float*          out,
+    const float*    a,
+    const float*    b,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Decode attention (single token × KV cache)
 // ---------------------------------------------------------------------------
@@ -236,7 +245,6 @@ cudaError_t fused_o_norm_pack(
 // Optimized GEMV v2 (vectorized FP4 block loads, transposed weights)
 // ---------------------------------------------------------------------------
 // Requires transposed weight layout: W_t [N×K] row-major.
-// Use transpose_fp4_weights() to convert existing [K×N] weights.
 cudaError_t gemv_fp4_v2(
     float*          y_out,
     const void*     x_fp4,
@@ -245,6 +253,49 @@ cudaError_t gemv_fp4_v2(
     const float*    W_t_scale,    // TRANSPOSED: [N/16 × K/16]
     int             K,
     int             N,
+    cudaStream_t    stream = 0);
+
+// GEMV Split-K: K split into K_splits atomic partial sums.
+// y_out MUST be initialized to 0 by caller.
+// Grid: (N/256, K_splits). Useful for N=6144 where 24 blocks < 36 SMs.
+cudaError_t gemv_fp4_splitk(
+    float*          y_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_t_fp4,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    int             K_splits,
+    cudaStream_t    stream = 0);
+
+// GEMV v3: Shared memory tiled kernel for large N (e.g., down_proj 6144).
+// Uses smem to load weight tiles and broadcast across threads.
+// K must be multiple of 128. N must be multiple of 256.
+cudaError_t gemv_fp4_v3(
+    float*          y_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_t_fp4,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// GEMV Batched (M×v2): Process M input vectors simultaneously.
+// Loads weight matrix once, amortizes across M outputs.
+// y_out [M][N], x_fp4 [M][K], x_scale [M][K/16], W [N][K]
+// Grid: (ceil(N/256), M). Each block computes 256 outputs for 1 token.
+// Best for decode with batch size M (2-4 tokens at once).
+cudaError_t gemv_fp4_batched(
+    float*          y_out,     // [M * N] output (row-major per token)
+    const void*     x_fp4,      // [M * K] FP4 input (row-major per token)
+    const float*    x_scale,   // [M * K/16] scales (row-major per token)
+    const void*     W_t_fp4,    // [N * K] transposed weights
+    const float*    W_t_scale, // [N/16 * K/16] transposed scales
+    int             K,
+    int             N,
+    int             M,         // batch size (number of simultaneous tokens)
     cudaStream_t    stream = 0);
 
 cudaError_t transpose_fp4_weights(
@@ -271,6 +322,20 @@ cudaError_t fused_gate_up_gemv(
     const float*    W_up_t_scale,   // TRANSPOSED
     int             K,
     int             N,               // output dim
+    cudaStream_t    stream = 0);
+
+// v1: original Grid(2, N/256) implementation for comparison
+cudaError_t fused_gate_up_gemv_v1(
+    float*          gate_out,
+    float*          up_out,
+    const void*     x_fp4,
+    const float*    x_scale,
+    const void*     W_gate_t_fp4,
+    const float*    W_gate_t_scale,
+    const void*     W_up_t_fp4,
+    const float*    W_up_t_scale,
+    int             K,
+    int             N,
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------

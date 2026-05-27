@@ -1,159 +1,107 @@
-# Research: FP4 Block-Scaled GEMM Optimization for Blackwell SM_120 (RTX 5060 Ti)
+# Research: Blackwell SM_120 (RTX 5060 Ti) FP4 GEMV Optimization
 
 ## Summary
 
-Current blackwell FP4 GEMM achieves only 3.6–5.3 GB/s (1% of 500 GB/s peak). Root causes: 16×16 CTA tile with 4 warps insufficient, no pipelined shared memory, no vectorized FP4→FP16 dequant, and no async copy (cp.async). Fix requires: 128×128 CTA tile with 8 warps, 2-stage cp.async pipeline for global→shared FP4 loads, vectorized uint4 loads with block-scale dequant in registers, and K-tiling with hidden_dim=2048→32×64-tile iterations. SM_120 lacks TMA/tcgen05, so warp-level `mma.sync` (16×16×64 fragments) + manual smem management is the only path.
+FP4 GEMV on Blackwell is fundamentally memory-bound: 4× smaller weight reads dominate over compute. For down_proj (N=6144, K=2048), L2 cache residency and memory coalescing are critical. Current `gemv_fp4` with K=64 hardcoded achieves ~3–5 GB/s vs 448 GB/s peak—the gap is software, not hardware.
 
 ---
 
 ## Findings
 
-### 1. Tile Size Recommendations for WMMA on SM_120
+### 1. GEMV Best Practices (Small M, Large N) Without TMA
 
-SM_120 (RTX 5060 Ti) does **not** support tcgen05 (UMMA) or TMA — those require sm_120a / sm_100a. Only warp-level `nvcuda::wmma::mma_sync` is available, using `16×16×64` fragments with `__nv_fp4_e2m1`. Each warp computes one 16×16 output tile from 16×64 of A (FP4 dequant→FP16) × 64×16 of B (FP16). Multiple fragments per warp and multiple warps per CTA scale up.
+- **Memory bandwidth dominates.** FP4 GEMV for LLM inference is memory-bound everywhere—the 4× reduction in weight reads is the win. [1](https://forums.developer.nvidia.com/t/custom-fp4-cuda-kernel-129-tflops-on-dgx-spark-with-pre-quantized-weight-cache/361600), [2](https://www.spheron.network/blog/fp4-quantization-blackwell-gpu-cost/)
+- **GEMV ≠ GEMM.** GEMV patterns require different tiling: N-dimension (columns) is large and must tile for cache; M-dimension is small (batch=1 or few). Block-level GEMM tiling (16×16 WMMA tiles) is wrong for GEMV. [3](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/)
+- **Row-wise quantization is key.** Per-row scale factors must be loaded and applied. For down_proj (N=6144, K=2048), each row has K elements sharing one scale. Cache row-wise scales in registers. [3](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/)
+- **Register pressure vs ILP.** Amandeep's twelve-attempt journey found that aggressive register usage for K-dimension tiling failed; ILP with simpler loads worked better. [3](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/)
+- **Async loads critical for hiding latency.** cp.async (non-blocking) keeps memory pipeline full. Without it, loads stall compute. [4](https://sandyresearch.github.io/chipmunk-part-III/)
 
-**Recommended CTA tile**: `128×128×64`. Decomposed as: 8 warps × 2 fragments/warp (M-dim) × 4 fragments/warp (N-dim) = 8×16=128 M, 4×16×2=128 N. Each warp: `mma_sync(aligned, 16, 16, 64)` called in loop. CUTLASS SM120 block-scaled GEMM collective uses `(128,128,64)` or `(128,256,64)` tiles with warp specialization [Source](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp) [Source](https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm/79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu).
+### 2. L2 Cache Optimization for N=6144 Down_proj
 
-**Do not use 32×32 or 64×64 single-fragment tiles** — those waste tensor core utilization on SM_120. The WMMA API only supports `16×16×64` as the largest fragment. Scale CTAs to 128+ on M/N dims for good occupancy [Source](https://nvidia-cutlass-22.mintlify.app/architectures/blackwell).
+- **L2 persistence API available on Blackwell.** `cudaMallocAsync` + `cudaMemAdviseSetPreferredLocation` + `cudaMemAdviseSetAccessedBy` control L2 residency similar to Ampere. [5](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html)
+- **N=6144 exceeds L2 working set.** RTX 5060 Ti L2 cache size not publicly confirmed; B200 has 126 MB partitioned L2. With K=2048 and FP4 weights (2 bytes per 2 values = 1 byte), one 6144×2048 matrix = ~12 MB. Multiple layers exceed L2. [6](https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut)
+- **L1/Shared Memory split matters.** Blackwell has unified L1/shared. For GEMV, favor shared memory for weight tiling. Use `cudaFuncSetAttribute` with `cudaFuncAttributePreferredSharedMemoryCarveout`. [5](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html)
+- **Prefetch weights into L2.** Load weight matrix once; reuse across batch. For inference with repeated token generation, weight L2 residency = huge speedup.
+- **Reduced L1/shared memory concern on Blackwell.** Some reports indicate smaller effective L1; test different carveout values. [7](https://www.emergentmind.com/topics/nvidia-blackwell-gpus)
 
-### 2. Shared Memory Tiling with Async Copy (cp.async)
+### 3. Published FP4 GEMV vs GEMM Benchmarks on Consumer Blackwell
 
-SM_120 has ~228 KB shared memory per SM. With `128×128×64` CTA tile and FP16 operands for WMMA:
+- **DGX Spark (B200):** 129 TFLOPS achieved with pre-quantized weight cache—memory-bound regime. [1](https://forums.developer.nvidia.com/t/custom-fp4-cuda-kernel-129-tflops-on-dgx-spark-with-pre-quantized-weight-cache/361600)
+- **RTX 5060 Ti 16 GB:** 448 GB/s GDDR7 memory bandwidth, 189.63 AI TOPS (INT8 dense). [8](https://gpupoet.com/gpu/learn/card/nvidia-geforce-rtx-5060-ti)
+- **Memory-bound = compute inefficiency is fine.** When memory-bound, actual TFLOPS are irrelevant; bytes/second is the metric. FP4 wins because 4 elements fit in 1 byte vs 16 bytes for FP32.
+- **GEMM severely underperforms GEMV in current impl.** Current `gemm_fp4_block_scaled` uses 16×16 WMMA tiles—wrong for prefill where M=seq_len. GEMV path exists but K=64 hardcoded. [AGENTS.md]
+- **cuTe DSL now supports NVFP4 GEMV.** CUTLASS 4.4+ exposes NVFP4 grouped GEMM and GEMV via CuTe abstractions. [9](https://docs.nvidia.com/cutlass/4.4.2/overview.html)
 
-- A smem (FP16): `128×64×2B = 16 KB`
-- B smem (FP16): `64×128×2B = 16 KB`
-- Total smem per tile: 32 KB (before pipelining)
-- With 2-stage pipeline: `2 × 32 KB = 64 KB`
-- With 3-stage: `96 KB` (possible but tight with registers)
+### 4. cp.async vs Regular Loads for Memory-Bound Kernels
 
-**No TMA on SM_120**. Use `cp.async` (PTX `cp.async.ca.shared.global.L4B` or `L8B`) for global→smem copies. Pipeline pattern: prefetch next A/B tiles into smem pipeline stage while computing current stage. Use `cp.async.commit_group` + `cp.async.wait_group` for synchronization [Source](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html) [Source](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/collective/sm100_mma_cpasync_warpspecialized.hpp).
+- **cp.async bypasses register file.** Direct GMEM→SMEM path, non-blocking. Critical for hiding memory latency. [10](https://research.meekolab.com/messing-around-with-gpus-again)
+- **Retains 85–90% performance in sparse kernels.** Even with sparse patterns, async copy maintains high efficiency. [4](https://sandyresearch.github.io/chipmunk-part-III/)
+- **Four-byte alignment required.** `cp.async.cg.shared.global` needs 4-byte aligned pointers. For FP4 (1 byte), must pack into 4-byte loads.
+- **Latency hiding is the win.** While single load latency similar, async copy allows full pipeline utilization across loop iterations. For GEMV with K=2048, this is the difference between 3 GB/s and 300+ GB/s.
+- **No TMA needed.** TMA (Hopper+) is more efficient but requires specific hardware. cp.async works on all modern NVIDIA GPUs including SM_120.
 
-**Critical**: Use XOR swizzle (swizzle mode `\pkg` / `Swizzle<3,4,3>` in CUTLASS) on shared memory layout to avoid bank conflicts during WMMA loads. Without swizzle, 16×64 tile loads from smem have 16-way bank conflicts, halving effective bandwidth [Source](https://www.wingedge777.com/en/article/ba9e9d9171004edc).
+### 5. Warp-Level vs Block-Level GEMV Patterns
 
-### 3. Vectorized FP4→FP16 Dequant Loads
+- **Blackwell MMA = tcgen05.mma, single-thread instruction.** Replaces Hopper warp-synchronous MMA. Each thread independently issues MMA ops. [11](https://arxiv.org/html/2512.02189v3)
+- **WGMMA (Hopper) ≠ Blackwell MMA.** Blackwell dropped WGMMA warpgroup abstraction. Thread-level MMA is now the primitive. [11](https://arxiv.org/html/2512.02189v3)
+- **For GEMV: warp-level reduction over N.** Each warp handles portion of N dimension. Warp-shuffle reductions for final accumulation. Register-based accumulation preferred over shared memory.
+- **Block-level for large N tiling.** N=6144 exceeds warp capacity. Block-level tiling splits N into chunks; each block processes one output element. Shared memory for weight tiles.
+- **Current impl uses wmma::mma_sync (Ampere-era).** `namespace wmma = nvcuda::wmma` with `fill_fragment`/`load_fragment`/`mma_sync`—works but not optimal for SM_120. WMMA supports FP16 accumulation only; FP4 requires FP16 accumulation + dequantization. [AGENTS.md]
+- **Register tiling beats shared memory for small K.** For GEMV, K dimension (hidden_dim) is small enough to tile in registers. Shared memory bank conflicts + latency hurt more than help.
 
-NVFP4 E2M1 has 16 values (4 bits each), packed 2 per byte. Block scaling: 1 scale per group of 16 FP4 values along K-dim.
+---
 
-**Load pattern** — global memory:
+## Contradictions with Current Implementation
 
-1. Load 16-byte chunk from `A_fp4` global array → `uint4` vector (32 FP4 values or 2 groups of 16)
-2. Load corresponding scale values from `A_scale` (2 × float)
+| Current Impl | Research Finding | Impact |
+|---|---|---|
+| `gemv_fp4` with K=64 hardcoded | Real layers need K-tiling over 2048 | Broken for production models |
+| 16×16 WMMA tiles for GEMM | Wrong for prefill (large M) | GEMM severely underperforms |
+| No cp.async in GEMV | cp.async critical for memory-bound | Memory pipeline not hidden |
+| No L2 cache hints | L2 persistence = huge speedup | Weight reloaded each token |
+| wmma::mma_sync (Ampere) | Blackwell has tcgen05.mma | Not using native SM_120 MMA |
+| FP4 E2M1 with scale=absmax/3 | Standard NVFP4 uses MX format | May not match CUDA toolkit support |
+| Single block for GEMV | Block-level N tiling needed for 6144 | Underutilizes GPU |
 
-**Dequant in registers** — not in shared memory:
+---
 
-```cu
-// NVFP4 LUT: 16 possible values
-__device__ constexpr float fp4_lut[16] = {
-    0.25f, 0.5f, 1.0f, 2.0f,      // positive: 0b00xx
-    -0.25f, -0.5f, -1.0f, -2.0f,  // negative: 0b01xx
-    4.0f, -4.0f, 6.0f, -6.0f,     // extended: 0b10xx
-    0.0f, 0.0f, 0.0f, 0.0f        // NaN/zero: 0b11xx
-};
+## Recommended Optimization Approaches
 
-// Load 2 FP4 values per byte, unpack LUT indices
-uint4 data = *reinterpret_cast<const uint4*>(&A_fp4[idx]);
-// For each byte: low nibble = element[j], high nibble = element[j+1]
-// Lookup fp4_lut[scale * nibble], store as half2
-```
-
-Write dequantized `half` values to smem for WMMA consumption [Source](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/gemm/fp4_gemm_template_sm120.h) [Source](https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm/79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu).
-
-**Key insight**: Dequantize in registers, write FP16 to shared memory. Do NOT store FP4 in smem and dequant on each WMMA read — that burns ALU on every fragment load. Dequant once per global load [Source](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/).
-
-**Vec4 bound**: Use `uint4` (16 bytes = 128 bits) vector loads for coalesced global reads. This gives 32 FP4 values per load instruction, maximizing L2→register bandwidth.
-
-### 4. K-loop Tiling for GEMV with hidden_dim=2048
-
-Current GEMV is hardcoded to K=64. Hidden_dim=2048 → need 32× K-accumulations per output element.
-
-**Approach for batched GEMV** (multiple tokens or output rows):
-
-1. CTA tile M-dim: 1 or 4 (batch tokens). CTA processes `(M_out, N_out)` tile for each K-tile.
-2. For each K-tile (64 K-elements): load `A[0:4, k:k+64]` FP4, dequant→FP16 in regs. Load `B[k:k+64, 0:N]` FP16 from shared.
-3. Accumulate in `float` registers: `C[m][n] += dot(A_tile[m][:], B_tile[:][n])`.
-4. After all 32 K-tiles: write `C[4][N]` output.
-
-**Registers**: 4 output rows × 128 N = 512 float accumulators. Too many. Instead: tile N-dim too. Load B tile per iteration into smem, reuse for all M rows. Process N in 16-element chunks (one warp's output). [Source](https://veitner.bearblog.dev/nvfp4-gemv-improved/).
-
-**Key optimization for GEMV**: Prefetch next K-tile via cp.async while computing current tile. Overlap global load latency with dequant+dot product. Two-stage pipeline: smem buf0 holds current B tile (FP16), cp.async loads next into buf1 [Source](https://github.com/gpu-mode/reference-kernels/blob/main/problems/nvidia/nvfp4_gemv/template_cute.py).
-
-**Register budget**: 64 registers × 4 warps × 8 warps/CTA = plenty. Each thread holds ~4 partial dot products. Use `__syncwarp()` for warp-level reduction per output element.
-
-### 5. Blackwell SM_120 Specific Optimizations (CUDA 12.8)
-
-**Architecture constraints**:
-
-- 36 SMs, ~500 GB/s GDDR7 bandwidth (RTX 5060 Ti)
-- 228 KB shared memory per SM (unified L1/smem)
-- 4 warp schedulers per SM, 128 CUDA cores per SM
-- Max threads per SM: 2048 (same as Ada/Hopper)
-- Max thread blocks per SM: limited by 64 registers/thread budget
-
-**What's available**:
-
-- `nvcuda::wmma::mma_sync` with `__nv_fp4_e2m1`: native FP4→FP16 tensor core path. Hardware does FP4×FP16→FP32 accumulation [Source](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf).
-- `cp.async`: available. `cp.async.bulk`: likely missing on RTX 5060 Ti (GB206 die may skip TMA hardware). Verify with `cuobjdump` on compiled binary.
-- `__nv_fp4_e2m1`: sizeof=1 byte, 2 values per byte
-- CUDA 12.8 provides `__nv_fp4_e2m1` type and `nvcuda::wmma` support for sm_120 (confirmed working) [Source](https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm/79a_blackwell_geforce_nvfp4_bf16_gemm.cu).
-
-**What's NOT available on SM_120 vs SM_100/SM_120a**:
-
-- No `tcgen05.mma` (UMMA) — only warp-level `mma.sync`
-- No TMA (Tensor Memory Accelerator) — no `cp.async.bulk.tensor`, no `tcgen05.ld/st`
-- No thread block clusters (or limited) — likely no cluster launch control [Source](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html).
-- No `stmatrix` for epilogue stores — use normal `stg` with vectorized stores
-
-**Occupancy targets**:
-
-- Current kernel: 1 CTA/SM, 4 warps (128 threads), ~5% occupancy
-- Target: 2–4 CTAs/SM, 8 warps/CTA (256 threads), 64+ regs/thread, 64–96 KB smem/CTA
-- Expected occupancy: 50–75% (16–24 of 32 warps/SM active)
-
-**Warp specialization** (CUTLASS pattern): Separate producer warps (load + dequant) from consumer warps (WMMA + accumulate). On SM_120 with no TMA, warp specialization reduces PCIe/minimum-issue overheads [Source](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm100_gemm_cpasync_warpspecialized.hpp).
+1. **GEMV: K-tiling over 2048.** Current K=64 → extend to 2048 with loop tiling. Each thread processes K/WARP_SIZE elements.
+2. **cp.async pipeline.** Load next tile while computing current tile. Hide GMEM latency completely.
+3. **L2 persistence for weights.** Use `cudaMallocAsync` + `cudaMemAdviseSetPreferredLocation` for weight matrix. Avoid reloading.
+4. **Row-wise scale caching.** Scales are small (1 per K elements). Cache in registers; re-use across M dimension.
+5. **Warp-level reduction.** After K-tiling, warp-shuffle reduction over N chunk. Avoid shared memory sync.
+6. **SM_120 native MMA.** Replace `wmma::mma_sync` with inline PTX `mma.sync` targeting FP16 accumulation with FP4 A/B operands if available, or stick with WMMA FP16 for correctness.
+7. **Shared memory carveout.** Set `cudaFuncAttributePreferredSharedMemoryCarveout` to maximum for weight caching.
 
 ---
 
 ## Sources
 
-### Kept
-
-- **NVIDIA CUTLASS examples/79_blackwell_geforce_gemm/79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu** — Official NVFP4×NVFP4 reference on SM_120. Shows tile structure, block-scaling API, cp.async pipeline. [Source](https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm/79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu)
-- **CUTLASS sm120_blockscaled_mma_tma.hpp** — Collective-level TMA+block-scaled MMA for SM_120. Tile sizes (128×128), pipeline stages, swizzle layout. [Source](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp)
-- **FlashInfer fp4_gemm_template_sm120.h** — Production FP4 GEMM template for SM_120. Group scaling layout, dequant pattern, K=64 block scaling. [Source](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/gemm/fp4_gemm_template_sm120.h)
-- **"Twelve Attempts at an FP4 Kernel" (Amandeep Singh)** — Detailed walkthrough of GEMV/GEMM optimization tries. Covers smem dequant, scaling, cp.async, K-tiling, warp specialization. [Source](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/)
-- **NVIDIA Blackwell Tuning Guide** — SM occupancy, shared memory sizes (228 KB), GDDR7 tuning, cp.async guidance. [Source](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html)
-- **NVIDIA RTX Blackwell GPU Architecture PDF** — Official FP4 tensor core support, SM block diagram, 5th-gen tensor core specs. [Source](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
-- **CUTLASS sm100_mma_cpasync_warpspecialized.hpp** — Producer/consumer warp specialization pattern usable on SM_120. [Source](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm100_gemm_cpasync_warpspecialized.hpp)
-- **"NVFP4 GEMV improved" (Simon Veitner)** — Batched GEMV with K-split, parallel reduction over K-dim, prefetching. [Source](https://veitner.bearblog.dev/nvfp4-gemv-improved/)
-- **CUTLASS CuTeDSL dense_blockscaled_gemm_persistent.py** — Persistent kernel pattern for small-M (GEMV-like) block-scaled GEMM on SM_120. [Source](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py)
-
-### Dropped
-
-- CUTLASS SM100-only examples (sm_100a TMA/UMMA patterns) — TMA not available on SM_120 RTX 5060 Ti
-- Generic Hopper WGMMA references — WGMMA is sm_90, not applicable to sm_120
-- CICC reverse engineering refs — Interesting but secondary to official NVIDIA sources
-- PrimitiveContext/blackwell — No source code, configuration-only
+- Kept: [NVIDIA Forums - 129 TFLOPS DGX Spark FP4](https://forums.developer.nvidia.com/t/custom-fp4-cuda-kernel-129-tflops-on-dgx-spark-with-pre-quantized-weight-cache/361600) — memory-bound regime evidence
+- Kept: [Amandeep Singh - Twelve Attempts at FP4 GEMV](https://amandeepsp.github.io/blog/nvfp4-blackwell-gemv/) — detailed GEMV optimization journey
+- Kept: [NVIDIA Blackwell Tuning Guide](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html) — L2 persistence, shared memory split
+- Kept: [ArXiv Microbenchmarking Blackwell](https://arxiv.org/html/2512.02189v3) — tcgen05.mma vs WGMMA, architecture details
+- Kept: [ChipAndCheese - Blackwell Analysis](https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut) — L2 partition details
+- Kept: [Modular - Matrix Multiplication Blackwell](https://www.modular.com/blog/matrix-multiplication-on-nvidias-blackwell-part-1-introduction) — GEMM patterns
+- Kept: [TechPowerUp - RTX 5060 Ti Specs](https://www.techpowerup.com/gpu-specs/geforce-rtx-5060-ti-16-gb.c4292) — 448 GB/s bandwidth confirmation
+- Dropped: YouTube reviews — no technical kernel details
+- Dropped: Reddit benchmarks — anecdotal, no methodology
 
 ---
 
 ## Gaps
 
-1. **TMA support on GB206 (RTX 5060 Ti)**: Not confirmed whether GB206 die includes TMA unit. RTX 5090 (GB202) has TMA. RTX 5060 Ti may not. Verify with `deviceQuery` / `cuobjdump -ptx` on compiled kernel. If TMA available, switch to `cp.async.bulk.tensor` for ~20% better global→smem throughput.
+- RTX 5060 Ti specific L2 cache size not publicly documented (B200 = 126 MB, consumer may differ)
+- SM_120 FP4 tensor core instruction set not fully documented in public PTX
+- Current FP4 E2M1 implementation may not match NVIDIA's NVFP4 MX format specification
+- No published RTX 5060 Ti FP4 GEMV benchmarks found
 
-2. **WMMA→UMMA fallback**: SM_120 may support a subset of tcgen05 beyond warp-level mma.sync. Not documented in CUDA 12.8 headers. Check `cuda_fp4.h` for `__umma` instructions. If available, 64×64 tiles become possible, doubling arithmetic intensity.
+## Suggested Next Steps
 
-3. **Best register/shared memory split**: 228 KB unified. Optimal split between dequant-LUT-smem, pipeline smem, and register file not profiled. Use occupancy API (`cudaOccupancyMaxPotentialBlockSize`) to find sweet spot.
-
-4. **Warp count×tile size Pareto frontier**: RTX 5060 Ti has 36 SMs. At 8 warps/CTA with 128×128 tile, only 4 CTAs fit per SM → 144 total tiles in flight. For M=512, only 4× parallelism hiding latency poorly. Tile down or use persistent kernel for better occupancy.
-
-5. **Batched GEMV synergy**: Qwen3-1.7B has hidden_dim=2048. Decode phase is GEMV-bound. If batch size > 1, this becomes batched GEMV (small M GEMM). Optimization immediately shifts toward memory-bound→compute-bound transition analysis at M=4,16,32.
-
----
-
-## Next Steps
-
-1. **Rewrite GEMM kernel with 128×128×64 CTA, 8 warps, cp.async 2-stage pipeline, vectorized uint4 FP4 loads, register dequant→FP16 smem store**
-2. **Rewrite GEMV with K=64 tiling loop, hidden_dim=2048 (32 iterations), prefetch next K-tile via cp.async while accumulating**
-3. **Benchmark each change incrementally — measure GB/s after each step**
-4. **If TMA verified on RTX 5060 Ti, adopt `cp.async.bulk` for smem loads → ~15-25% bandwidth improvement**
-5. **Consider CUTLASS integration: replace hand-rolled GEMM with CUTLASS 3.8 sm120_blockscaled kernel template (less code, more tested)**
+1. Read `src/gemv_fp4.cu` and `src/gemm_fp4_block_scaled.cu` for current implementation details
+2. Benchmark current `gemv_fp4` with K=2048 (real hidden_dim) vs K=64
+3. Add cp.async pipeline to GEMV kernel
+4. Test L2 persistence with `cudaMallocAsync` for weight matrix
+5. Compare `wmma::mma_sync` vs raw PTX `mma.sync` on SM_120

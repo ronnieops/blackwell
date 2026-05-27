@@ -22,13 +22,21 @@ Primary goal: benchmark FP4 forward pass throughput vs llama.cpp (Q4_K_M) baseli
 **Working kernels**:
 
 - `pack_fp4` / `unpack_fp4` — FP4 E2M1 quant/dequant (verified)
-- `gemv_fp4` — decode path, K=64 hardcoded (TODO #2: dynamic K)
-- `gemm_fp4_block_scaled` — prefill path, 16×16×64 WMMA tiles
+- `gemv_fp4` — decode path, v1 (strided), 22 GB/s
+- `gemv_fp4_v2` — decode path, vectorized uint4, transposed weights, 55–164 GB/s, **2.5×** faster than v1
+- `transpose_fp4_weights` — W (K×N) → W_t (N×K) + scales
+- `gemv_fp4` — K dynamic (any multiple of 16), no hardcoded limit
+- `gemm_fp4_block_scaled` — prefill path, 128×128×64 WMMA tiles, 2-stage cp.async
+- `fused_gate_up_gemv` — fused gate+up projection in one kernel launch
+- `fused_rmsnorm_pack` — RMSNorm + FP4 pack in one kernel
 - `fused_rmsnorm` — single-block warp-reduced RMSNorm
 - `apply_swiglu` — silu(gate) × up, elementwise
 - `fused_rope` — in-place rotation, smem cos/sin cache
+- `attention_decode_gqa` — 16 Q heads, 8 KV heads, smem scores
+- `fused_qkv_gemv` — multi-block Grid(3, tiles), works for dim > 256
+- `update_kv_cache` — KV cache write (batch_idx=0 only)
 - `dispatch_matmul` — routes GEMM vs GEMV by `KernelMode`
-- `attention_fp4`, `update_kv_cache`, `load_kv_cache_qkgv` — stubs (return `cudaErrorNotReady`)
+- `attention_fp4`, `load_kv_cache_qkgv` — stubs (return `cudaErrorNotReady`)
 
 **Build**:
 
@@ -54,8 +62,10 @@ Output: `build/libblackwell_kernels.a`
 **Key risks**:
 
 - SM_120 native is **critical**. Generic builds drop to 2% perf (47× slower confirmed).
-- GEMM severely underperforming (3–5 GB/s vs 500 GB/s peak). Tile size too small (16×16), no async copy, no vectorized FP4 loads.
-- GEMV K=64 hardcoded. Real LLM layers need K-tiling over hidden_dim=2048.
+- GEMM severely underperforming (13–19 GB/s vs 500 GB/s peak). ~3.5% of peak bandwidth.
+- **down_proj (N=6144) dominates decode time** — 29.5% of kernel time, only 24 thread blocks (36 SMs available)
+- GEMV v2 at 33% peak for N=6144. L2 thrashing at large output dims.
+- GEMV v2 correctness verified in phase_a. No NaN/Inf on GEMM reference.
 
 ---
 
