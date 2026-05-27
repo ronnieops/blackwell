@@ -6,8 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# RTX 5060 Ti = compute_120, sm_120
-set(CMAKE_CUDA_ARCHITECTURES 120)
+# RTX 5060 Ti = compute_120a, sm_120a (120a enables FP4 block-scaled MMA)
+set(CMAKE_CUDA_ARCHITECTURES 120a)
 
 # ---------------------------------------------------------------------------
 # CUDA 12.8 for Blackwell (SM_120) support
@@ -75,8 +75,8 @@ set(KERNEL_SOURCES
 add_library(blackwell_config INTERFACE)
 target_include_directories(blackwell_config INTERFACE include)
 target_compile_options(blackwell_config INTERFACE
-    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=sm_120>
-    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=compute_120>
+    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>
+    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=compute_120a>
 )
 
 # ---------------------------------------------------------------------------
@@ -89,8 +89,8 @@ target_link_libraries(blackwell_kernels PRIVATE
 )
 target_compile_options(blackwell_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=sm_120>
-    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=compute_120>
+    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>
+    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=compute_120a>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v,-O3>
 )
@@ -114,8 +114,8 @@ if(GTest_FOUND)
     )
     target_compile_options(blackwell_tests PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=sm_120>
-        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=compute_120>
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=compute_120a>
     )
     target_include_directories(blackwell_tests PRIVATE include)
 else()

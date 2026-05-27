@@ -101,18 +101,20 @@ int main(int argc, char** argv) {
     float *d_res;          // FP32 residual (reused for attn and MLP)
     void *d_x_fp4;         // FP4 input to kernels
     float *d_attn_s, *d_mlp_s;
-    void *d_attn_fp4, *d_mlp_fp4;
     int8_t *d_x_int8;      // INT8 input to gemv_int8
     float *d_x_int8_s;
+    int8_t *d_attn_i8, *d_mlp_i8;  // INT8 intermediate buffers
+    float *d_attn_i8s, *d_mlp_i8s;
 
     cudaMalloc(&d_x32, H*4); cudaMalloc(&d_x_fp4, H);  cudaMalloc(&d_xs, (H/16)*4);
     cudaMalloc(&d_Q, Q*4); cudaMalloc(&d_K, KV*4); cudaMalloc(&d_V, KV*4);
     cudaMalloc(&d_attn, Q*4); cudaMalloc(&d_proj, H*4);
     cudaMalloc(&d_gate, I*4); cudaMalloc(&d_up, I*4); cudaMalloc(&d_mlp, I*4);
     cudaMalloc(&d_res, I*4); // sized for max(H,I) = max(2048,6144)
-    cudaMalloc(&d_attn_fp4, Q); cudaMalloc(&d_attn_s, (Q/16)*4);
-    cudaMalloc(&d_mlp_fp4, I); cudaMalloc(&d_mlp_s, (I/16)*4);
+    cudaMalloc(&d_attn_s, (Q/16)*4); cudaMalloc(&d_mlp_s, (I/16)*4);
     cudaMalloc(&d_x_int8, H); cudaMalloc(&d_x_int8_s, (H/16)*4);
+    cudaMalloc(&d_attn_i8, Q); cudaMalloc(&d_attn_i8s, (Q/16)*4);
+    cudaMalloc(&d_mlp_i8, I); cudaMalloc(&d_mlp_i8s, (I/16)*4);
 
     float *d_rn; cudaMalloc(&d_rn, H*4);
     std::vector<float> rn_h(H,1.f); cudaMemcpy(d_rn,rn_h.data(),H*4,cudaMemcpyHostToDevice);
@@ -159,31 +161,10 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc+kb, d_vc+kb,
                 sq, nqh, nkv, hd, ms, 0), "attn");
-            chk(blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, Q, 0), "pack_attn");
-
-            // Wo: attn_fp4 → FP32 → INT8 for gemv_int8
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_attn_fp4, d_attn_s, Q, 0), "unpack_attn");
-            // Use d_mlp as temp INT8 buffer (reuse — not used yet)
-            // Actually need separate INT8 buffer for attn → Wo
-            // Reuse d_mlp_fp4 as INT8 buffer (different size but Wo output is H=2048)
-            // Better: create a small INT8 buffer
-            // For now: quantize attn output to INT8 using temp buffer
-            // d_res is not needed yet — reuse as FP32 attn output
-            // d_res already has attn FP32 from unpack. Pack to INT8 in-place:
-            // Use d_gate as temp INT8 (H=2048)
-            int8_t* d_attn_int8 = reinterpret_cast<int8_t*>(d_mlp_fp4); // Q=2048 bytes
-            float* d_attn_int8_s = d_mlp_s; // Q/16 floats
-            std::vector<float> ai8s(Q/16, ixv);
-            cudaMemcpy(d_attn_int8_s, ai8s.data(), (Q/16)*4, cudaMemcpyHostToDevice);
-            chk(blackwell::kernels::pack_int8(d_attn_int8, d_proj, d_attn_int8_s, Q, 0), "pack_attn_i8");
-
-            chk(blackwell::kernels::gemv_int8(d_proj, d_attn_int8, d_attn_int8_s,
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_attn_i8, d_attn, d_attn_i8s, Q, 0), "pack_attn_i8");
+            chk(blackwell::kernels::gemv_int8(d_proj, d_attn_i8, d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
-            // Resid: proj += x_residual (saved in d_res — keep original x_residual)
-            // d_res holds x FP32 from earlier unpack. We need to keep it.
-            // Actually we overwrote d_res with unpack_fp4... but that's x.
-            // The residual is the unpacked x. Use it.
-            // After Wo: d_proj += d_res (x residual from before attention)
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
 
@@ -196,33 +177,16 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int8(d_up, d_x_int8, d_x_int8_s,
                 lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
             chk(blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, I, 0), "swiglu");
-            chk(blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, I, 0), "pack_mlp");
-
-            // Down: mlp_fp4 → FP32 → INT8
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_mlp_fp4, d_mlp_s, I, 0), "unpack_mlp");
-            // INT8 buffer for MLP: reuse d_gate (I=6144 bytes, enough)
-            int8_t* d_mlp_int8 = reinterpret_cast<int8_t*>(d_gate);
-            float* d_mlp_int8_s = d_gate + I; // wrong — d_gate is float*
-            // Actually just use separate allocation
-            int8_t *d_mlp_i8_tmp;
-            float *d_mlp_i8s_tmp;
-            if (sq == 0 && l == 0) {
-                // Lazy allocate once
-                cudaMalloc(&d_mlp_i8_tmp, I);
-                cudaMalloc(&d_mlp_i8s_tmp, (I/16)*4);
-                std::vector<float> mi8s(I/16, ixv);
-                cudaMemcpy(d_mlp_i8s_tmp, mi8s.data(), (I/16)*4, cudaMemcpyHostToDevice);
-            }
-            // Actually for quick fill, just use separate buffers
-            // Already allocated at top
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_mlp_i8, d_mlp, d_mlp_i8s, I, 0), "pack_mlp_i8");
+            chk(blackwell::kernels::gemv_int8(d_proj, d_mlp_i8, d_mlp_i8s,
+                lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
+            blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
         }
     }
 
-    // ── Proper allocation ───────────────────────────────────────────────────
-    int8_t *d_attn_i8, *d_mlp_i8;
-    float *d_attn_i8s, *d_mlp_i8s;
-    cudaMalloc(&d_attn_i8, Q); cudaMalloc(&d_attn_i8s, (Q/16)*4);
-    cudaMalloc(&d_mlp_i8, I); cudaMalloc(&d_mlp_i8s, (I/16)*4);
+    // Init INT8 scale buffers
     std::vector<float> ai8s(Q/16, ixv), mi8s(I/16, ixv);
     cudaMemcpy(d_attn_i8s, ai8s.data(), (Q/16)*4, cudaMemcpyHostToDevice);
     cudaMemcpy(d_mlp_i8s, mi8s.data(), (I/16)*4, cudaMemcpyHostToDevice);
@@ -247,9 +211,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc+kb, d_vc+kb,
                 sq, nqh, nkv, hd, ms, 0), "attn");
-            chk(blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, Q, 0), "pack_a");
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_attn_fp4, d_attn_s, Q, 0), "unpack_a");
-            chk(blackwell::kernels::pack_int8(d_attn_i8, d_proj, d_attn_i8s, Q, 0), "pack_ai8");
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_attn_i8, d_attn, d_attn_i8s, Q, 0), "pack_attn_i8");
             chk(blackwell::kernels::gemv_int8(d_proj, d_attn_i8, d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
@@ -262,9 +225,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int8(d_up, d_x_int8, d_x_int8_s,
                 lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
             chk(blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, I, 0), "swiglu");
-            chk(blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, I, 0), "pack_m");
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_mlp_fp4, d_mlp_s, I, 0), "unpack_m");
-            chk(blackwell::kernels::pack_int8(d_mlp_i8, d_proj, d_mlp_i8s, I, 0), "pack_mi8");
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_mlp_i8, d_mlp, d_mlp_i8s, I, 0), "pack_mlp_i8");
             chk(blackwell::kernels::gemv_int8(d_proj, d_mlp_i8, d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
@@ -292,9 +254,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::attention_decode_gqa(
                 d_attn, d_Q, d_kc+kb, d_vc+kb,
                 sq, nqh, nkv, hd, ms, 0), "attn");
-            chk(blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, Q, 0), "pack_a");
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_attn_fp4, d_attn_s, Q, 0), "unpack_a");
-            chk(blackwell::kernels::pack_int8(d_attn_i8, d_proj, d_attn_i8s, Q, 0), "pack_ai8");
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_attn_i8, d_attn, d_attn_i8s, Q, 0), "pack_attn_i8");
             chk(blackwell::kernels::gemv_int8(d_proj, d_attn_i8, d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
@@ -307,9 +268,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int8(d_up, d_x_int8, d_x_int8_s,
                 lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
             chk(blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, I, 0), "swiglu");
-            chk(blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, I, 0), "pack_m");
-            chk(blackwell::kernels::unpack_fp4(d_proj, d_mlp_fp4, d_mlp_s, I, 0), "unpack_m");
-            chk(blackwell::kernels::pack_int8(d_mlp_i8, d_proj, d_mlp_i8s, I, 0), "pack_mi8");
+            // INT8 direct (no FP4 round-trip)
+            chk(blackwell::kernels::pack_int8(d_mlp_i8, d_mlp, d_mlp_i8s, I, 0), "pack_mlp_i8");
             chk(blackwell::kernels::gemv_int8(d_proj, d_mlp_i8, d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
@@ -320,11 +280,11 @@ int main(int argc, char** argv) {
 
     // ── Benchmark ───────────────────────────────────────────────────────────
     KernelTimer timers[] = {
-        {"pack_int8(x) + gemv Q"}, {"gemv K"}, {"gemv V"},
+        {"gemv Q"}, {"gemv K"}, {"gemv V"},
         {"update_kv_cache"}, {"attention_decode_gqa"},
-        {"pack_fp4(attn) + i8_convert + gemv Wo"}, {"fused_rmsnorm_pack(attn)"},
+        {"pack_int8(attn) + gemv Wo"}, {"rmsnorm_i8(attn)"},
         {"gemv gate"}, {"gemv up"}, {"apply_swiglu"},
-        {"pack_fp4(mlp) + i8_convert + gemv down"}, {"fused_rmsnorm_pack(mlp)"}
+        {"pack_int8(mlp) + gemv down"}, {"rmsnorm_i8(mlp)"}
     };
     GpuTimer kt[12];
 
@@ -333,9 +293,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < bench; ++i) {
         for (int l = 0; l < num_layers; ++l) {
             GpuTimer loop_t;
-            // Save x residual
+            // x is already INT8 in d_x_int8 from previous fused_rmsnorm_quant_int8
+            // Keep residual in d_x_fp4 for vector_add
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
-            blackwell::kernels::pack_int8(d_x_int8, d_res, d_x_int8_s, H, 0);
 
             int kb = l * nkv * ms * hd;
             loop_t.start();
@@ -361,22 +321,18 @@ int main(int argc, char** argv) {
                 sq, nqh, nkv, hd, ms, 0);
             timers[4].add(loop_t.stop());
 
-            // Attn_out → Wo
-            blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, Q, 0);
-            blackwell::kernels::unpack_fp4(d_proj, d_attn_fp4, d_attn_s, Q, 0);
-            blackwell::kernels::pack_int8(d_attn_i8, d_proj, d_attn_i8s, Q, 0);
+            // Attn_out → Wo (INT8 direct, no FP4 round-trip)
             loop_t.start();
+            blackwell::kernels::pack_int8(d_attn_i8, d_attn, d_attn_i8s, Q, 0);
             blackwell::kernels::gemv_int8(d_proj, d_attn_i8, d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0);
             timers[5].add(loop_t.stop());
 
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_quant_int8(d_x_int8, d_x_int8_s,
+                d_proj, d_rn, H, 1e-5f, 0);
 
-            // MLP
-            blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
-            blackwell::kernels::pack_int8(d_x_int8, d_res, d_x_int8_s, H, 0);
-
+            // MLP: residual from x (same unpack_fp4 from top of block still valid)
             loop_t.start();
             blackwell::kernels::gemv_int8(d_gate, d_x_int8, d_x_int8_s,
                 lw[l].g.d, lw[l].g.sc, H, I, 0);
@@ -390,16 +346,17 @@ int main(int argc, char** argv) {
             blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, I, 0);
             timers[9].add(loop_t.stop());
 
-            blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, I, 0);
-            blackwell::kernels::unpack_fp4(d_proj, d_mlp_fp4, d_mlp_s, I, 0);
-            blackwell::kernels::pack_int8(d_mlp_i8, d_proj, d_mlp_i8s, I, 0);
+            // INT8 direct (no FP4 round-trip)
             loop_t.start();
+            blackwell::kernels::pack_int8(d_mlp_i8, d_mlp, d_mlp_i8s, I, 0);
             blackwell::kernels::gemv_int8(d_proj, d_mlp_i8, d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0);
             timers[10].add(loop_t.stop());
 
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            // NOTE: d_x_fp4 maintained for unpack_fp4 residual next iteration
+            blackwell::kernels::fused_rmsnorm_quant_int8(d_x_int8, d_x_int8_s,
+                d_proj, d_rn, H, 1e-5f, 0);
         }
     }
     float total_ms = t.stop();
@@ -435,8 +392,7 @@ int main(int argc, char** argv) {
     cudaFree(d_attn); cudaFree(d_proj);
     cudaFree(d_gate); cudaFree(d_up); cudaFree(d_mlp);
     cudaFree(d_res); cudaFree(d_rn);
-    cudaFree(d_attn_fp4); cudaFree(d_attn_s);
-    cudaFree(d_mlp_fp4); cudaFree(d_mlp_s);
+    cudaFree(d_attn_s); cudaFree(d_mlp_s);
     cudaFree(d_x_int8); cudaFree(d_x_int8_s);
     cudaFree(d_attn_i8); cudaFree(d_attn_i8s);
     cudaFree(d_mlp_i8); cudaFree(d_mlp_i8s);

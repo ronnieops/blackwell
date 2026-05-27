@@ -20,6 +20,9 @@ namespace blackwell {
 // Hardware limits — CC 12.0 RTX 5060 Ti
 // ---------------------------------------------------------------------------
 constexpr int kSMArchitecture      = 120;   // sm_120 / compute_120
+// NOTE: Blackwell FP4 block-scaled MMA requires '120a' arch suffix:
+//   -gencode=arch=compute_120a,code=sm_120a
+// Plain sm_120 rejects mma.sync.aligned.kind::mxf4.block_scale PTX.
 constexpr int kMaxWarpsPerSM        = 48;
 constexpr int kMaxRegistersPerSM   = 65536;
 constexpr int kMaxRegistersPerThread = 255;
@@ -67,6 +70,16 @@ constexpr int kFragsPerWarpN = kGEMMTileN / kWMMAFragN / kGEMMWarpsN; // 4
 constexpr int kGEMVTileM = 8;
 constexpr int kGEMVTileN = 64;
 constexpr int kGEMVTileK = 64;
+
+// ---------------------------------------------------------------------------
+// Decode batched GEMV (multiple tokens, weight reuse)
+// ---------------------------------------------------------------------------
+// llama.cpp MMVQ processes up to 8 tokens simultaneously.
+// ncols_dst = number of tokens to batch (2-8 for sweet spot)
+constexpr int kMaxBatchSize  = 8;  // MMVQ_MAX_BATCH_SIZE from llama.cpp
+constexpr int kINT8BlockSize = 16; // INT8 block-scaled block (matching B=16)
+constexpr int kWarpCount     = 4;  // warps per block for ncols_dst=1-4
+constexpr int kRowsPerBlock  = 1;  // output rows per CTA (1 for single-token)
 
 // ---------------------------------------------------------------------------
 // CUDA kernel launch grid helpers

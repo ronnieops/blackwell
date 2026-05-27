@@ -221,6 +221,21 @@ cudaError_t fused_rmsnorm_pack(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
+// Fused RMSNorm + INT8 quant (single kernel)
+// ---------------------------------------------------------------------------
+// Input: FP32 projection output, RMSNorm weight
+// Output: INT8 packed + per-block scales
+// Replaces: fused_rmsnorm → pack_int8 (2 kernels → 1 kernel)
+cudaError_t fused_rmsnorm_quant_int8(
+    int8_t*         x_out_i8,
+    float*          x_out_scale,
+    const float*    proj,
+    const float*    weight,
+    int             N,
+    float           eps,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
 // Fused O-projection + RMSNorm + FP4 pack (convenience: 2 kernels)
 // ---------------------------------------------------------------------------
 cudaError_t gemv_int8_from_fp4(
@@ -314,6 +329,48 @@ cudaError_t pack_int8(
     const float*    in_fp32,
     const float*    scale_out,
     int             num_elements,
+    cudaStream_t    stream = 0);
+
+// INT8 block-scaled GEMV Persistent (grid-stride, exactly 36 blocks)
+// Launches 36 blocks (one per SM). Each block atomically grabs next N-tile.
+// Eliminates wave quantization for any N.
+cudaError_t gemv_int8_persistent(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// INT8 block-scaled GEMV Split-K (K split into K_splits, AtomicAdd reduction)
+// Caller MUST zero y_out before launch. Grid: (N/256, K_splits).
+// Targets large N with wave quantization (e.g., N=6144: 24 blocks < 36 SMs).
+cudaError_t gemv_int8_splitk(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    int             K_splits,
+    cudaStream_t    stream = 0);
+
+// INT8 Batched GEMV: process M tokens simultaneously, reuse weights across them.
+// Grid: (ceil(N/256), M). Block: 256 threads.
+// y_out [M * N], x_int8 [M * K], x_scale [M * K/16], W_t [N * K], W_t_scale [N/16 * K/16]
+// Best M: 2-8 tokens (matching llama.cpp MMVQ_MAX_BATCH_SIZE).
+cudaError_t gemv_int8_batched(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    int             M,          // batch size (1-8)
     cudaStream_t    stream = 0);
 
 // INT8 block-scaled GEMV (warp-level dot products, transposed weights)

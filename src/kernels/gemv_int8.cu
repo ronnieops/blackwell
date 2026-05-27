@@ -43,22 +43,26 @@ __global__ void gemv_int8_kernel(
     float acc = 0.0f;
 
     for (int kb = 0; kb < num_K_blks; ++kb) {
-        // Load 16 INT8 weight values via vectorized uint4 load
+        // Load 16 INT8 weight + activation values via vectorized uint4 loads
         const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
         alignas(16) int8_t w_buf[B];
+        alignas(16) int8_t x_buf[B];
         *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+        *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
 
         float w_sc = W_t_scale[n_blk * num_K_blks + kb];
         float x_sc = x_scale[kb];
+        float prod_scale = w_sc * x_sc;
 
-        // Load x values for this K-block
-        const int8_t* x_ptr = x_int8 + kb * B;
-
-        #pragma unroll
-        for (int j = 0; j < B; ++j) {
-            acc += static_cast<float>(x_ptr[j]) * x_sc * 
-                   static_cast<float>(w_buf[j]) * w_sc;
-        }
+        // __dp4a: 4-way int8 SIMD dot product per iteration (4 × 4 = 16 total)
+        const int* w32 = reinterpret_cast<const int*>(w_buf);
+        const int* x32 = reinterpret_cast<const int*>(x_buf);
+        int sumi = 0;
+        sumi = __dp4a(w32[0], x32[0], sumi);
+        sumi = __dp4a(w32[1], x32[1], sumi);
+        sumi = __dp4a(w32[2], x32[2], sumi);
+        sumi = __dp4a(w32[3], x32[3], sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
     }
 
     y_out[n_out] = acc;
@@ -273,6 +277,300 @@ cudaError_t transpose_int8_weights(
     transpose_scales_int8_kernel<<<blocks, threads, 0, stream>>>(
         dst_scale, src_scale, num_K_blks, num_N_blks);
 
+    return cudaPeekAtLastError();
+}
+
+
+// ---------------------------------------------------------------------------
+// INT8 GEMV Split-K kernel: K split into K_splits, AtomicAdd reduction.
+// Grid: (N/256, K_splits). Each block computes partial dot product over
+// K/K_splits columns. AtomicAdd to reduce to same output row.
+// Caller MUST zero y_out before launch (cudaMemset).
+//
+// Targets N=6144 down_proj where N/256 = 24 blocks < 36 SMs.
+// K_splits=2 → 48 blocks, K_splits=3 → 72 blocks > 36 SMs.
+// ---------------------------------------------------------------------------
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_int8_splitk_kernel(
+    float* __restrict__ y_out,
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N, int K_splits)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    if (n_out >= N) return;
+
+    int split_id = blockIdx.y;
+    int num_K_blks = K / B;
+    int n_blk = n_out / B;
+
+    // Each split handles K/K_splits columns
+    int split_blks = num_K_blks / K_splits;
+    int kb_start = split_id * split_blks;
+    int kb_end = (split_id == K_splits - 1) ? num_K_blks : (kb_start + split_blks);
+
+    float acc = 0.0f;
+
+    for (int kb = kb_start; kb < kb_end; ++kb) {
+        // Load 16 INT8 weight + activation values via vectorized uint4 loads
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        alignas(16) int8_t w_buf[B];
+        alignas(16) int8_t x_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+        *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
+
+        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float x_sc = x_scale[kb];
+        float prod_scale = w_sc * x_sc;
+
+        // __dp4a: 4-way int8 SIMD dot product per iteration (4 × 4 = 16 total)
+        const int* w32 = reinterpret_cast<const int*>(w_buf);
+        const int* x32 = reinterpret_cast<const int*>(x_buf);
+        int sumi = 0;
+        sumi = __dp4a(w32[0], x32[0], sumi);
+        sumi = __dp4a(w32[1], x32[1], sumi);
+        sumi = __dp4a(w32[2], x32[2], sumi);
+        sumi = __dp4a(w32[3], x32[3], sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
+    }
+
+    // AtomicAdd reduction on shared output row
+    atomicAdd(&y_out[n_out], acc);
+}
+
+cudaError_t gemv_int8_splitk(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    int             K_splits,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0 || K % K_splits != 0)
+        return cudaErrorInvalidValue;
+
+    dim3 grid((N + kINT8Block - 1) / kINT8Block, K_splits);
+    gemv_int8_splitk_kernel<<<grid, kINT8Block, 0, stream>>>(
+        y_out,
+        static_cast<const int8_t*>(x_int8), x_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N, K_splits);
+    return cudaPeekAtLastError();
+}
+
+// ---------------------------------------------------------------------------
+// INT8 GEMV Persistent kernel: grid-stride loop over N tiles.
+// Launches exactly 36 blocks (one per SM). Each block uses atomic work
+// scheduling to grab the next available N-tile, processing until all
+// N/256 tiles are consumed.
+// ---------------------------------------------------------------------------
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_int8_persistent_kernel(
+    float* __restrict__ y_out,
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N, int total_tiles)
+{
+    constexpr int B = 16;
+    __shared__ int tile_counter;
+    __shared__ int cur_tile;
+
+    if (threadIdx.x == 0)
+        tile_counter = 0;
+    __syncthreads();
+
+    while (true) {
+        if (threadIdx.x == 0)
+            cur_tile = atomicAdd(&tile_counter, 1);
+        __syncthreads();
+
+        int tile = cur_tile;
+        if (tile >= total_tiles) break;
+
+        int n_start = tile * kINT8Block;
+        int n_out = n_start + threadIdx.x;
+
+        float acc = 0.0f;
+        if (n_out < N) {
+            int num_K_blks = K / B;
+            int n_blk = n_out / B;
+
+            for (int kb = 0; kb < num_K_blks; ++kb) {
+                const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+                alignas(16) int8_t w_buf[B];
+                alignas(16) int8_t x_buf[B];
+                *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+                *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
+
+                float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+                float x_sc = x_scale[kb];
+                float prod_scale = w_sc * x_sc;
+
+                const int* w32 = reinterpret_cast<const int*>(w_buf);
+                const int* x32 = reinterpret_cast<const int*>(x_buf);
+                int sumi = 0;
+                sumi = __dp4a(w32[0], x32[0], sumi);
+                sumi = __dp4a(w32[1], x32[1], sumi);
+                sumi = __dp4a(w32[2], x32[2], sumi);
+                sumi = __dp4a(w32[3], x32[3], sumi);
+                acc += static_cast<float>(sumi) * prod_scale;
+            }
+            y_out[n_out] = acc;
+        }
+        __syncthreads();
+    }
+}
+
+cudaError_t gemv_int8_persistent(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int total_tiles = (N + kINT8Block - 1) / kINT8Block;
+    constexpr int kNumSMs = 36;
+    gemv_int8_persistent_kernel<<<kNumSMs, kINT8Block, sizeof(int), stream>>>(
+        y_out,
+        static_cast<const int8_t*>(x_int8), x_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N, total_tiles);
+    return cudaPeekAtLastError();
+}
+
+// ---------------------------------------------------------------------------
+// INT8 Batched GEMV: process M tokens simultaneously, reuse weights across them.
+// Grid: (ceil(N/256), M). Block: 256 threads.
+// Weights loaded once per K-block, activations loaded per-token.
+// Eliminates M-1 weight loads vs launching M separate gemv_int8 kernels.
+// Best batch sizes: 2-8 tokens (matching llama.cpp MMVQ_MAX_BATCH_SIZE).
+// ---------------------------------------------------------------------------
+template<int M>
+__global__ void gemv_int8_batched_kernel(
+    float* __restrict__ y_out,
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    int m = blockIdx.y;
+    if (n_out >= N) return;
+
+    int num_K_blks = K / B;
+    int n_blk = n_out / B;
+
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        // Load 16 weight values once (shared across M tokens via template unrolling)
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        alignas(16) int8_t w_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+
+        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+
+        // Load this token's activation
+        const int8_t* x_ptr = &x_int8[m * K + kb * B];
+        alignas(16) int8_t x_buf[B];
+        *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_ptr);
+
+        float x_sc = x_scale[m * num_K_blks + kb];
+        float prod_scale = w_sc * x_sc;
+
+        const int* w32 = reinterpret_cast<const int*>(w_buf);
+        const int* x32 = reinterpret_cast<const int*>(x_buf);
+        int sumi = 0;
+        sumi = __dp4a(w32[0], x32[0], sumi);
+        sumi = __dp4a(w32[1], x32[1], sumi);
+        sumi = __dp4a(w32[2], x32[2], sumi);
+        sumi = __dp4a(w32[3], x32[3], sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
+    }
+
+    y_out[m * N + n_out] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Batched GEMV dispatch: routes to templated kernel based on M.
+// ---------------------------------------------------------------------------
+cudaError_t gemv_int8_batched(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 8)
+        return cudaErrorInvalidValue;
+
+    int nb = (N + kINT8Block - 1) / kINT8Block;
+    dim3 grid(nb, M);
+
+    switch (M) {
+        case 1:
+            gemv_int8_batched_kernel<1><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 2:
+            gemv_int8_batched_kernel<2><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 3:
+            gemv_int8_batched_kernel<3><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 4:
+            gemv_int8_batched_kernel<4><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 5:
+            gemv_int8_batched_kernel<5><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 6:
+            gemv_int8_batched_kernel<6><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 7:
+            gemv_int8_batched_kernel<7><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+        case 8:
+            gemv_int8_batched_kernel<8><<<grid, kINT8Block, 0, stream>>>(
+                y_out, static_cast<const int8_t*>(x_int8), x_scale,
+                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
+            break;
+    }
     return cudaPeekAtLastError();
 }
 

@@ -1,15 +1,15 @@
-// src/kernels/fused_o_norm.cu — Fused O-projection + RMSNorm + FP4 pack
+// src/kernels/fused_o_norm.cu — Fused O-projection + RMSNorm + FP4/INT8 pack
 //
 // Replaces 3 separate kernels per decode layer:
 //   gemv_fp4(W_o) → fused_rmsnorm → pack_fp4(x)
 //
 // Two-kernel approach:
 //   Kernel 1: gemv_fp4 writes FP32 output (same as existing gemv)
-//   Kernel 2: rmsnorm + pack (reads FP32, writes FP4)
+//   Kernel 2: rmsnorm + pack (reads FP32, writes FP4 or INT8)
 //
 // This eliminates 1 kernel launch AND the intermediate pack step.
 // The 2nd kernel is a simple single-block kernel (hidden_dim <= 2048)
-// that does RMSNorm reduction + FP4 quantization in one pass.
+// that does RMSNorm reduction + quantization in one pass.
 //
 // API: fused_rmsnorm_pack() — the 2nd kernel. Caller still does gemv_fp4
 // separately, then calls this instead of fused_rmsnorm + pack_fp4.
@@ -128,6 +128,93 @@ __global__ void rmsnorm_pack_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single-block kernel: RMSNorm + INT8 quant
+// Input: FP32 projection output (from gemv)
+// Output: INT8 x + per-block scales
+// ---------------------------------------------------------------------------
+__launch_bounds__(kNormPackThreads, 1)
+__global__ void rmsnorm_quant_int8_kernel(
+    int8_t* __restrict__ x_out_i8,
+    float* __restrict__ x_out_scale,
+    const float* __restrict__ proj,
+    const float* __restrict__ weight,
+    int N, float eps)
+{
+    constexpr int B = 16;
+    constexpr int NE = kElemsPerThread;
+    int tid = threadIdx.x;
+
+    // Phase 1: load proj values, compute sum_sq
+    float vals[NE];
+    float sum_sq = 0.0f;
+
+    #pragma unroll
+    for (int e = 0; e < NE; ++e) {
+        int idx = tid + e * kNormPackThreads;
+        if (idx < N) {
+            vals[e] = proj[idx];
+            sum_sq += vals[e] * vals[e];
+        } else {
+            vals[e] = 0.0f;
+        }
+    }
+
+    // Warp reduce sum_sq
+    sum_sq = warp_reduce_sum_f(sum_sq);
+
+    // Cross-warp reduce (256/32 = 8 warps)
+    __shared__ float warp_sums[8];
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = sum_sq;
+    __syncthreads();
+
+    float block_sum = (tid < 8) ? warp_sums[tid] : 0.0f;
+    block_sum = warp_reduce_sum_f(block_sum);
+
+    __shared__ float s_rstd;
+    if (tid == 0) {
+        s_rstd = rsqrtf(block_sum / static_cast<float>(N) + eps);
+    }
+    __syncthreads();
+    float rstd = s_rstd;
+
+    // Phase 2: normalize, find absmax per block of 16, compute scale, quantize
+    #pragma unroll
+    for (int e = 0; e < NE; ++e) {
+        int idx = tid + e * kNormPackThreads;
+        if (idx < N) {
+            float normed = vals[e] * weight[idx] * rstd;
+
+            // Find absmax across 16-element block for INT8 scale
+            float abs_val = fabsf(normed);
+            int lane_in_blk = tid % B;
+
+            // Half-warp max reduction
+            float d;
+            d = __shfl_down_sync(0xffffffff, abs_val, 8);
+            if (lane_in_blk < 8) abs_val = fmaxf(abs_val, d);
+            d = __shfl_down_sync(0xffffffff, abs_val, 4);
+            if (lane_in_blk < 4) abs_val = fmaxf(abs_val, d);
+            d = __shfl_down_sync(0xffffffff, abs_val, 2);
+            if (lane_in_blk < 2) abs_val = fmaxf(abs_val, d);
+            d = __shfl_down_sync(0xffffffff, abs_val, 1);
+            if (lane_in_blk == 0) abs_val = fmaxf(abs_val, d);
+
+            if (lane_in_blk == 0) {
+                float scale = fmaxf(abs_val / 127.0f, 1e-9f);
+                x_out_scale[idx / B] = scale;
+            }
+            __syncwarp();
+
+            // Quantize to INT8
+            float sc = x_out_scale[idx / B];
+            float v = fdividef(normed, sc);
+            v = fminf(127.0f, fmaxf(-127.0f, roundf(v)));
+            x_out_i8[idx] = static_cast<int8_t>(static_cast<int>(v));
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -150,6 +237,24 @@ cudaError_t fused_rmsnorm_pack(
     rmsnorm_pack_kernel<<<dim3(1), dim3(kNormPackThreads), 0, stream>>>(
         static_cast<Fp4*>(x_out_fp4), x_out_scale,
         proj, weight, N, eps);
+
+    return cudaPeekAtLastError();
+}
+
+cudaError_t fused_rmsnorm_quant_int8(
+    int8_t*         x_out_i8,
+    float*          x_out_scale,
+    const float*    proj,
+    const float*    weight,
+    int             N,
+    float           eps,
+    cudaStream_t    stream)
+{
+    if (N % 16 != 0) return cudaErrorInvalidValue;
+    if (N > kNormPackThreads * kElemsPerThread) return cudaErrorInvalidValue;
+
+    rmsnorm_quant_int8_kernel<<<dim3(1), dim3(kNormPackThreads), 0, stream>>>(
+        x_out_i8, x_out_scale, proj, weight, N, eps);
 
     return cudaPeekAtLastError();
 }
