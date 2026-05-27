@@ -205,7 +205,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell::kernels" | grep 
 - **INT8 GEMV (gemv_int8)**: 348 GB/s isolated, **2.1× FP4 v2**. Kernel verified correct (GPU=CPU INT8 ref, 0.02%). NOT yet integrated into decode pipeline. Requires host-side weight quantization (no pack_int8 kernel yet).
 - INT8 GEMV uses **symmetric INT8 quantization** (per-block absmax/127).
 
-**Current priority**: INT8→decode_full integration. Build: INT8 transpose kernel, pack_int8 kernel, then replace FP4 v2 calls in decode_full.
+**Current priority**: INT8→decode_full integration. `gemv_int8`, `pack_int8`, `transpose_int8_weights` all complete and verified (GPU pipeline working, 346 GB/s). Next: load FP4 weights → convert to INT8 → replace gemv_fp4_v2 calls in decode_full with gemv_int8. Requires weight format converter for model loading path.
 
 **Do NOT**:
 - Restart analysis from scratch
