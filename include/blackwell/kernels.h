@@ -13,10 +13,24 @@ namespace kernels {
 // ---------------------------------------------------------------------------
 // Computes C = (A @ B) * scale  where A is (M×K) FP4 with per-K-block scales,
 // and B is (K×N) FP4 or FP16.  Result accumulated in FP32.
+// Large CTA: 128×128×64, requires M%128==0, N%128==0, K%64==0.
 cudaError_t gemm_fp4_block_scaled(
     float*          C,
     const void*     A_fp4,
-    const float*    A_scale,   // [M / kBlockRow × K / kBlockCol] scales
+    const float*    A_scale,
+    const void*     B_fp4,
+    const float*    B_scale,
+    int            M,
+    int            N,
+    int            K,
+    cudaStream_t   stream = 0);
+
+// Small CTA: 64×64×64, 4 warps, 40 KB smem. For M<128 prefill.
+// Requires M%64==0, N%64==0, K%64==0.
+cudaError_t gemm_fp4_block_scaled_small(
+    float*          C,
+    const void*     A_fp4,
+    const float*    A_scale,
     const void*     B_fp4,
     const float*    B_scale,
     int            M,
@@ -138,6 +152,20 @@ cudaError_t attention_fp4(
     int             seq_len,
     int             num_heads,
     int             head_dim,
+    float           scale,
+    cudaStream_t    stream = 0);
+
+// FP32 prefill attention (flash-style, after GEMM outputs FP32 Q/K/V)
+cudaError_t attention_prefill(
+    float*          output,
+    const float*    Q,
+    const float*    K,
+    const float*    V,
+    int             M,
+    int             head_dim,
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             num_q_per_group,
     float           scale,
     cudaStream_t    stream = 0);
 
@@ -373,7 +401,54 @@ cudaError_t gemv_int8_batched(
     int             M,          // batch size (1-8)
     cudaStream_t    stream = 0);
 
+// FP32×INT8 block-scaled GEMV — FP32 activations × INT8 weights
+// Eliminates activation quantization. Weight format: W_t [N×K] INT8 transposed.
+cudaError_t gemv_fp32_int8(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// BF16 GEMV — FP32 activations × BF16 weights, FP32 accumulate.
+// No quantization error. Weight layout: W_t [N × K] BF16 row-major.
+cudaError_t gemv_bf16(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_bf16,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// FP32×INT8 per-row GEMV — FP32 activations × INT8 per-row weights.
+// Scale layout: W_t_scale [N × K/16]. Higher quality than INT8 activations.
+cudaError_t gemv_fp32_int8_per_row(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// INT8 per-row GEMV — each output row has independent block-16 scales.
+// Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
+// Fixes quality: per-row scales prevent 16-row quantization error accumulation.
+cudaError_t gemv_int8_per_row(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // INT8 block-scaled GEMV (warp-level dot products, transposed weights)
+// DEPRECATED: uses 2D block scales [N/16 × K/16] — garbles 28-layer output.
+// Use gemv_int8_per_row instead.
 cudaError_t gemv_int8(
     float*          y_out,
     const void*     x_int8,
@@ -452,6 +527,17 @@ cudaError_t launch_decode_graph(
 cudaError_t destroy_decode_graph(
     void*           graph_exec,
     void*           graph);
+
+// ---------------------------------------------------------------------------
+// Dynamic seq_pos for CUDA Graph autoregressive decode
+// ---------------------------------------------------------------------------
+// Updates the device-side seq_pos used by attention_decode_gqa and
+// update_kv_cache. Call BEFORE each cudaGraphLaunch in an autoregressive
+// loop. Writes to pinned host memory (visible to captured graph memcpy nodes)
+// and issues cudaMemcpyAsync to device.
+cudaError_t update_decode_seq_pos(
+    int             seq_pos,
+    cudaStream_t    stream = 0);
 
 } // namespace kernels
 } // namespace blackwell

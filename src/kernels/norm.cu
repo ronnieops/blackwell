@@ -145,9 +145,8 @@ __global__ void vector_add_fp32_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int PILE = sizeof(float4) / sizeof(float);  // == 4
     if (n >= PILE && (idx * PILE) < n) {
-        float4 va; float4 vb;
-        ((float4*)a)[idx] = va;
-        ((float4*)b)[idx] = vb;
+        float4 va = ((float4*)a)[idx];
+        float4 vb = ((float4*)b)[idx];
         ((float4*)out)[idx] = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
         return;
     }

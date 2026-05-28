@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
             // Resid: proj += x_residual via FP32 intermediates
             // Resid: proj += x_residual (add FP32 values, then rmsnorm+pack)
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-6f, 0);
             // Save attention output as residual for MLP
             blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
 
@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
             // Resid: down_proj_out += attn_residual via FP32 intermediates
             // Resid: down_proj_out += attn_residual (both [hidden=2048])
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-6f, 0);
         }
     }
     printf("  done.\n");
@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
             // Resid: proj += x_residual via FP32 intermediates
             // Resid: proj += x_residual (add FP32 values, then rmsnorm+pack)
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-6f, 0);
             // Save attention output as residual for MLP phase
             blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // MLP
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
             blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s,
                 lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 2, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_mlp_out, hidden, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn_weight, hidden, 1e-6f, 0);
         }
     }
     cudaDeviceSynchronize();
@@ -372,9 +372,9 @@ int main(int argc, char** argv) {
             TIME_KERNEL(5, blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, 0));
             TIME_KERNEL(6, blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s, lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, 0));
             // Resid: proj += x_residual
-            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-6f, 0);
             blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_mlp_out, hidden, 0);
-            TIME_KERNEL(7, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-5f, 0));
+            TIME_KERNEL(7, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-6f, 0));
             // Save attn output as MLP residual
             blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, 0);
             // MLP
@@ -392,9 +392,9 @@ int main(int argc, char** argv) {
             cudaMemsetAsync(d_proj, 0, hidden * 4, 0);
             TIME_KERNEL(11, blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s, lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 4, 0));
             // Resid: down_proj_out += attn_residual
-            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-6f, 0);
             blackwell::kernels::vector_add_fp32(d_mlp_out, d_proj, d_mlp_out, intermediate, 0);
-            TIME_KERNEL(12, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-5f, 0));
+            TIME_KERNEL(12, blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-6f, 0));
         }
     }
     float total_ms = t.end();
@@ -450,18 +450,18 @@ int main(int argc, char** argv) {
         blackwell::kernels::attention_decode_gqa(d_attn, d_Q, d_kc + kv_base, d_vc + kv_base, seq_pos, num_q_heads, num_kv_heads, head_dim, max_seq, graph_stream);
         blackwell::kernels::pack_fp4(d_attn_fp4, d_attn, d_attn_s, q_dim, graph_stream);
         blackwell::kernels::gemv_fp4_v2(d_proj, d_attn_fp4, d_attn_s, lw[l].Wo.data, lw[l].Wo.scales, q_dim, hidden, graph_stream);
-        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-6f, graph_stream);
         blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_mlp_out, hidden, graph_stream);
-        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_x32, d_rn_weight, hidden, 1e-6f, graph_stream);
         blackwell::kernels::unpack_fp4(d_mlp_out, d_x_fp4, d_xs, hidden, graph_stream);
         blackwell::kernels::fused_gate_up_gemv(d_gate, d_up, d_x_fp4, d_xs, lw[l].Wgate.data, lw[l].Wgate.scales, lw[l].Wup.data, lw[l].Wup.scales, hidden, intermediate, graph_stream);
         blackwell::kernels::apply_swiglu(d_mlp, d_gate, d_up, intermediate, graph_stream);
         blackwell::kernels::pack_fp4(d_mlp_fp4, d_mlp, d_mlp_s, intermediate, graph_stream);
         cudaMemsetAsync(d_proj, 0, hidden * 4, graph_stream);
         blackwell::kernels::gemv_fp4_splitk(d_proj, d_mlp_fp4, d_mlp_s, lw[l].Wdown.data, lw[l].Wdown.scales, intermediate, hidden, 4, graph_stream);
-        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::fused_rmsnorm(d_proj, d_proj, d_rn_weight, hidden, 1e-6f, graph_stream);
         blackwell::kernels::vector_add_fp32(d_mlp_out, d_proj, d_mlp_out, intermediate, graph_stream);
-        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-5f, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_mlp_out, d_rn_weight, hidden, 1e-6f, graph_stream);
     }
     cudaError_t cap_err = cudaStreamEndCapture(graph_stream, &graph);
     if (cap_err != cudaSuccess) {

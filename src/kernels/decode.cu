@@ -29,11 +29,12 @@ __global__ void update_kv_kernel(
     float* __restrict__ v_cache,
     const float* __restrict__ k_new,
     const float* __restrict__ v_new,
-    int seq_pos,
+    const int* seq_pos_ptr,
     int num_heads,
     int head_dim,
     int max_seq_len)
 {
+    int seq_pos = *seq_pos_ptr;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * head_dim;
     if (idx >= total) return;
@@ -68,13 +69,14 @@ __global__ void attention_decode_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K_cache,
     const float* __restrict__ V_cache,
-    int seq_pos,
+    const int* seq_pos_ptr,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     int max_seq_len,
     float scale)
 {
+    int seq_pos = *seq_pos_ptr;
     int head = blockIdx.x;
     if (head >= num_q_heads) return;
 
@@ -160,22 +162,49 @@ __global__ void attention_decode_kernel(
     }
     float inv_sum = 1.0f / (sumexp + 1e-9f);
 
-    // Step 3: Weighted sum over V — each thread handles one d
+    // Step 3: Weighted sum over V — each thread handles one d (strided)
     // All scores in smem, V is global — sequential over t is fine.
-    // head_dim=128, 4× iteration per thread (128/32).
-    if (lane_id < head_dim) {
+    // head_dim=128, strided over 32 lanes → each thread does 4 elements.
+    for (int d = lane_id; d < head_dim; d += 32) {
         float out_val = 0.0f;
         for (int t = 0; t < npos; ++t) {
             float w = scores[t] * inv_sum;
-            out_val += w * V_cache[h_base + t * head_dim + lane_id];
+            out_val += w * V_cache[h_base + t * head_dim + d];
         }
-        output[lane_id] = out_val;
+        output[d] = out_val;
     }
 }
 
 // ===========================================================================
 // Single-token decode attention
 } // anonymous namespace
+
+// ===========================================================================
+// Module-level seq_pos infrastructure (shared across all decode wrappers)
+//
+// Design for CUDA Graph compatibility:
+//   h_seq_pos_pinned — pinned host memory, address stable across graph lifetime
+//   d_seq_pos_global — device copy, kernel reads via pointer
+//
+// Graph captures cudaMemcpyAsync H2D node. Pinned memory guarantee:
+// - Address is stable (not stack-allocated)
+// - Contents can be updated between graph launches
+// - Graph replays read latest pinned value
+// ===========================================================================
+namespace {
+    static int* d_seq_pos_global = nullptr;
+    static int* h_seq_pos_pinned = nullptr;
+    static cudaError_t alloc_seq_pos() {
+        if (d_seq_pos_global) return cudaSuccess;
+        cudaError_t e = cudaMalloc(&d_seq_pos_global, sizeof(int));
+        if (e != cudaSuccess) return e;
+        return cudaHostAlloc(&h_seq_pos_pinned, sizeof(int), cudaHostAllocDefault);
+    }
+    // Write seq_pos to pinned memory for graph-safe read by cudaMemcpyAsync
+    static void write_seq_pos(int seq_pos) {
+        if (h_seq_pos_pinned) *h_seq_pos_pinned = seq_pos;
+    }
+}
 
 // ===========================================================================
 // Public API
@@ -187,10 +216,18 @@ cudaError_t attention_decode(
     int seq_pos, int num_heads, int head_dim,
     int max_seq_len, cudaStream_t stream) {
 
+    cudaError_t e;
+    e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    write_seq_pos(seq_pos);
+    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) return e;
+
     static bool attr_set = false;
     constexpr int smem_bytes = 4096 * 4;  // 16 KB for scores (4096 positions)
     if (!attr_set) {
-        cudaError_t e = cudaFuncSetAttribute(
+        e = cudaFuncSetAttribute(
             attention_decode_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_bytes);
@@ -202,7 +239,7 @@ cudaError_t attention_decode(
     attention_decode_kernel<<<
         dim3(num_heads), dim3(256), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
-        seq_pos, num_heads, num_heads /* kv_heads = q_heads for non-GQA */,
+        d_seq_pos_global, num_heads, num_heads /* kv_heads = q_heads for non-GQA */,
         head_dim, max_seq_len, scale);
 
     return cudaPeekAtLastError();
@@ -214,10 +251,18 @@ cudaError_t attention_decode_gqa(
     int seq_pos, int num_q_heads, int num_kv_heads,
     int head_dim, int max_seq_len, cudaStream_t stream) {
 
+    cudaError_t e;
+    e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    write_seq_pos(seq_pos);
+    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) return e;
+
     static bool attr_set = false;
     constexpr int smem_bytes = 4096 * 4;
     if (!attr_set) {
-        cudaError_t e = cudaFuncSetAttribute(
+        e = cudaFuncSetAttribute(
             attention_decode_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_bytes);
@@ -229,7 +274,7 @@ cudaError_t attention_decode_gqa(
     attention_decode_kernel<<<
         dim3(num_q_heads), dim3(256), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
-        seq_pos, num_q_heads, num_kv_heads,
+        d_seq_pos_global, num_q_heads, num_kv_heads,
         head_dim, max_seq_len, scale);
 
     return cudaPeekAtLastError();
@@ -240,6 +285,14 @@ cudaError_t update_kv_cache(
     const float* k_new, const float* v_new,
     int batch_idx, int seq_pos, int num_heads,
     int head_dim, int max_seq_len, cudaStream_t stream) {
+
+    cudaError_t e;
+    e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    write_seq_pos(seq_pos);
+    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) return e;
 
     (void)batch_idx;
     // Only support batch_idx=0 for now
@@ -252,8 +305,18 @@ cudaError_t update_kv_cache(
     update_kv_kernel<<<blocks, threads, 0, stream>>>(
         k_cache, v_cache,
         k_new, v_new,
-        seq_pos, num_heads, head_dim, max_seq_len);
+        d_seq_pos_global, num_heads, head_dim, max_seq_len);
 
+    return cudaPeekAtLastError();
+}
+
+cudaError_t update_decode_seq_pos(int seq_pos, cudaStream_t stream) {
+    cudaError_t e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    write_seq_pos(seq_pos);
+    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) return e;
     return cudaPeekAtLastError();
 }
 

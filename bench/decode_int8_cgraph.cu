@@ -156,9 +156,9 @@ int main(int argc, char** argv) {
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
             // Maintain d_x_fp4 for residual next iter
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
 
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
@@ -172,8 +172,8 @@ int main(int argc, char** argv) {
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     printf("done\n");
@@ -214,8 +214,8 @@ int main(int argc, char** argv) {
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
             // MLP
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
@@ -229,8 +229,8 @@ int main(int argc, char** argv) {
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     cudaDeviceSynchronize();
@@ -260,8 +260,8 @@ int main(int argc, char** argv) {
                 lw[l].o.d, lw[l].o.sc, Q, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
             // MLP
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
@@ -275,8 +275,8 @@ int main(int argc, char** argv) {
                 lw[l].d.d, lw[l].d.sc, I, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
             blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-5f, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, 0);
+                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     float baseline_ms = t0.stop();
@@ -345,8 +345,8 @@ int main(int argc, char** argv) {
 
         blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, graph_stream);
         blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-            b.d_proj, d_rn, H, 1e-5f, graph_stream);
-        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, graph_stream);
+            b.d_proj, d_rn, H, 1e-6f, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
 
         // MLP block
         blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, graph_stream);
@@ -364,8 +364,8 @@ int main(int argc, char** argv) {
 
         blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, graph_stream);
         blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-            b.d_proj, d_rn, H, 1e-5f, graph_stream);
-        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-5f, graph_stream);
+            b.d_proj, d_rn, H, 1e-6f, graph_stream);
+        blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
     }
 
     cudaGraph_t graph;

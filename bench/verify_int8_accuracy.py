@@ -73,8 +73,9 @@ np.random.seed(42)
 for tname, wname, K, N in tensors:
     # Read BF16 original
     w_bf16 = read_safetensor_bf16(MODEL, tname)
-    # safetensors shape is [out_features, in_features] = [N, K]
-    if w_bf16.shape == (K, N):
+    # safetensors stores [out_features, in_features] = [N, K]
+    # Verify: shape[0] should be N (output dim). If not, transpose.
+    if w_bf16.shape[0] != N:
         w_bf16 = w_bf16.T  # make [N, K]
     
     # Load INT8 (already transposed N×K)

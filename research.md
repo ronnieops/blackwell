@@ -1,81 +1,83 @@
-# Research: INT8 GEMV Optimization Techniques for Blackwell SM_120a
+# Research: INT8 Quality / HF Comparison Feasibility
 
 ## Summary
 
-SM120 consumer Blackwell GPUs (RTX 50xx) **lack tcgen05.mma** (Tensor Memory + 5th-gen tensor core instructions). Only `mma.sync.aligned.m16n8k16` (Ampere-vintage) and `__dp4a` are available for INT8. Multi-token batching (M=2-8) remains the single most effective optimization for decode GEMV, amortizing weight loads across tokens. L2 persistence and weight prefetching provide marginal gains since weight matrices exceed L2 on RTX 5060 Ti (32 MB L2 vs 36 MB for 3 layers of INT8 weights).
+Full Python reference that reproduces the CUDA INT8 28-layer pipeline is straightforward — 1-layer pipeline already exists and is verified exact. Extending to 28 layers is mechanical repetition. Parallel HF BF16 baseline via `transformers` is also straightforward for measuring quantization noise. Main obstacle: Python must replicate BPE tokenizer logic exactly (or reuse the same token IDs from C++), and the 28-layer run will reproduce the same garbled output the CUDA pipeline already shows — that's expected quantization noise, not a bug.
 
 ## Findings
 
-### 1. SM120 vs SM100 Tensor Core Differences — Critical Constraint
+1. **1-layer Python reference exists and verified** — `bench/validate_pipeline.py` implements exact match to CUDA INT8 pipeline: block_quant (16-element absmax → scale = max(absmax/127, 1e-9), clip(round), saturate to [-127,127]), RMSNorm (mean(x²) → rsqrt), INT8 GEMV (DP4A block dot with dual-scale product), GQA attention (single-token = copy V per group). Validated: max diff=4.7e-7, cosine sim=1.00000002. [Source](file:///mnt/data/dev/projects/blackwell/bench/validate_pipeline.py)
 
-1. **SM120 does NOT expose tcgen05.mma or Tensor Memory (TMEM).** These are exclusive to datacenter SM100 (B200). On SM120, the only tensor-core dispatch path is `mma.sync.aligned.m16n8k16` — the same Ampere-vintage instruction available since SM80. [Source](https://github.com/ShlokVEX/Mini-Attention/blob/main/notes/sm120_vs_sm100.md)
-2. **tcgen06.alloc (TMEM allocation) not supported on SM120a.** Confirmed: `tcgen06.alloc` only works on sm100a/101a, not sm120a (RTX 5080, 5070, 5060 Ti). [Source](https://forums.developer.nvidia.com/t/how-to-load-fp8-using-ldmatrix-on-sm120-sm120a/330254)
-3. **SM120's FP4 path uses `mxf4` instructions**, not tcgen05. CUTLASS has separate SM120 kernel paths (e.g., `gemm_grouped_sm120_M128_BS_group1`) using CuTe MMA atoms. [Source](https://forums.developer.nvidia.com/t/fp4-on-dgx-spark-why-it-doesnt-scale-like-youd-expect/360142)
-4. **CUTLASS 3.8+ supports SM120 blockwise dense GEMM** but only via CuTe MMA atoms for mma.sync, not tcgen05. Block-scaled kernels (FP4) are optimized; INT8 paths use standard mma.sync. [Source](https://raw.githubusercontent.com/NVIDIA/cutlass/main/CHANGELOG.md)
+2. **INT8 quantization error measurement exists** — `bench/verify_int8_accuracy.py` reads BF16 weights from `model.safetensors`, loads INT8 weights, dequantizes, computes per-weight and per-GEMV relative error. Covers all 7 weight matrices for layer 0. [Source](file:///mnt/data/dev/projects/blackwell/bench/verify_int8_accuracy.py)
 
-### 2. INT8 dp4a and IMMA Options on SM120
+3. **HF model ready for reference** — `/mnt/data/ai/hf/qwen3-1.7b-base/` has full `model.safetensors` (BF16), `config.json`, `tokenizer.json`. Config: Qwen3ForCausalLM, H=2048, ID=6144, 28 layers, nqh=16, nkv=8, hd=128, vocab=151936, tie_word_embeddings=True, rope_theta=1000000, rms_norm_eps=1e-6. `transformers` can load and run directly (BF16). [Source](file:///mnt/data/ai/hf/qwen3-1.7b-base/config.json)
 
-5. **`__dp4a` remains the optimal scalar INT8 instruction on SM120 for GEMV.** No new dp4a variant or IMMA instruction was introduced for SM120. The mma.sync `m16n8k16` path supports INT8 (S8/S8/F32 accumulate) but requires warp-level coordination and shared-memory staging — overhead that doesn't pay off for M=1 decode. [Source](https://docs.nvidia.com/cuda/parallel-thread-execution/)
-6. **mma.sync INT8 m16n8k16 may help for M≥4 batched decode.** The m16n8k16 shape processes 16 rows × 8 cols × 16 K-per-step. For M=1 this is wasteful (15/16 of MMA capacity unused). For M=4-8, the 16-row dimension starts filling. However, the weight format must be in shared-memory tiled layout (via ldmatrix), not the row-major format our __dp4a kernel uses. [Source](https://gau-nernst.github.io/nvrtc-matmul/)
-7. **No QMMA or new INT8-specific tensor core instruction on SM120.** The Blackwell QMMA (quantized MMA) mentioned in microbenchmarks targets SM100 datacenter tensor cores. SM120 consumer chips use the same Ampere-era tensor core pipeline. [Source](https://arxiv.org/html/2512.02189v3)
+4. **28-layer extension is mechanical** — Each layer uses identical operations. Weight files are per-layer: `{layer}_self_attn.q_proj.int8_t`, `{layer}_input_layernorm.f32`, etc. The CUDA code at `bench/text_generate.cu` loops `for(int l=0;l<NL;l++)` doing the same 10 steps per layer. Python just needs to iterate layers with per-layer file paths. Same embed tokens reused (tied). [Source](file:///mnt/data/dev/projects/blackwell/bench/text_generate.cu)
 
-### 3. Multi-Token Batching Strategies for LLM Decode
+5. **Tokenization mismatch risk** — CUDA uses custom `BpeTokenizer` loaded from `tokenizer_data.bin` (prepared by `scripts/prepare_tokenizer.py`). Python via `transformers` would use HuggingFace tokenizer from `tokenizer.json`. If tokenization diverges (byte-level BPE quirks, added token handling), input IDs won't match and outputs can't be compared token-by-token. Solution: dump token IDs from C++ to a file, feed same IDs to Python. [Source](file:///mnt/data/dev/projects/blackwell/scripts/prepare_tokenizer.py)
 
-8. **llama.cpp MMVQ batches up to 8 tokens simultaneously** (`MMVQ_MAX_BATCH_SIZE=8`). Grid = `(nrows/rows_per_block, nchannels, ncols_dst)`, block = `(warp_size, nwarps)` where nwarps=4 for 1-4 cols, nwarps=2 for 5-8 cols. No split-K, no persistent threads — simple batched approach. [Source](https://github.com/ggml-org/llama.cpp)
-9. **EVA (2026) proposes multi-batch weight tile reuse.** Multiple decode requests share the same weight tiles loaded into shared memory, reducing global memory bandwidth. For GEMV, loading weight row once and computing dot products for all batch tokens is the key optimization. [Source](https://arxiv.org/html/2605.24144v1)
-10. **Batched GEMV sweet spot is M=3-4** for our kernel (confirmed in AGENTS.md: `gemv_int8_batched` template-batched M=1..8, sweet spot M=3-4 with 1.4× speedup). This matches llama.cpp's design of 4 nwarps for 1-4 cols.
-11. **Speculative decoding creates natural batching.** Multiple draft tokens verified against the model simultaneously — generates M=2-8 sequential tokens that can share weight loads. This is how production systems achieve higher throughput on memory-bound decode. [Source](https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/)
+6. **KV cache for multi-step generation** — Current `validate_pipeline.py` does single-token, seq_pos=0 only (GQA attention just copies V). Full autoregressive requires multi-position KV cache with `update_kv_cache` → `attention_decode_gqa` per step. Python must track K/V per layer per position per head, rebuild on each step. ~0.5 MB per layer (8 heads × 128 × 4096 × 4 bytes = 16 MB total). [Source](file:///mnt/data/dev/projects/blackwell/bench/text_generate.cu)
 
-### 4. Weight Prefetching and L2 Cache Management
+7. **Processing steps per layer (Python must replicate all)**:
+   - Embedding: INT8 row lookup → dequant host-side (same as CUDA does with `emb.d[tid*H + d] * emb.sc[scale_idx]`)
+   - RMSNorm + INT8 quant (fused: 1 operation in CUDA, 2 in Python)
+   - 3× GEMV QKV (K=2048, N_proj depending on head count)
+   - Q/K head norms (per-head RMSNorm — separate step, not fused)
+   - RoPE on Q and K (cos/sin multiplication per pair)
+   - KV cache write + GQA attention decode
+   - Quantize attn output → Wo GEMV → residual
+   - Post-attention RMSNorm + quant → gate+up GEMV ×2 → SwiGLU → quant → down GEMV → residual
+   - Final RMSNorm + quant → lm_head GEMV (tied embed weights) → argmax
 
-12. **PRESERVE framework (2025) prefetches weights to L2 during inter-layer gaps.** Overlaps HBM→L2 prefetch with compute from the previous layer. Designed for distributed inference but the principle applies: issue `cudaMemcpyAsync` or `cp.async.bulk` for next layer's weights while current layer computes. Gains 10-20% for sequential layer execution. [Source](https://arxiv.org/html/2501.08192v2)
-13. **CUDA L2 persistence (`cudaAccessPolicyWindow`) can reserve L2 set-aside for weights.** API: `cudaCtxSetLimit(cudaLimitPersistingL2CacheSize, bytes)`. However, on RTX 5060 Ti the L2 is ~32 MB, and a single 6144×2048 INT8 weight matrix is 12 MB. With 3 layers' weights = 36 MB, L2 is saturated regardless of persistence policy. Persistence helps when working set < L2. [Source](https://leimao.github.io/blog/CUDA-L2-Persistent-Cache/)
-14. **cp.async pipeline for weight streaming can overlap load+compute within a single GEMV.** Double-buffer: while warp computes dot product on current K-tile, issue `cp.async` for next K-tile into shared memory. Our existing gemm_fp4 uses 2-stage cp.async. For INT8 __dp4a GEMV, the compute is so fast (~775 GB/s, near bandwidth ceiling) that cp.async pipelining adds overhead without measurable gain — the kernel is already saturating HBM bandwidth. [Source](https://salykova.github.io/sgemm-gpu)
-15. **GDDR7 on RTX 5060 Ti delivers ~500 GB/s peak.** Our INT8 GEMV at 775 GB/s is already 155% of peak — likely measured as effective throughput accounting for the 4× multiplier of dp4a (4 byte products per instruction). Actual memory bandwidth utilization is near-saturated at ~500 GB/s. No software prefetching trick will exceed this physical limit. [Source](https://www.nvidia.com/en-us/on-demand/session/gtc26-s81463/)
-
-### 5. CUTLASS/cuBLASLt Best Practices for Consumer Blackwell
-
-16. **cuBLASLt INT8 GEMV on SM120 falls back to mma.sync or scalar dp4a internally.** No SM120-specific INT8 GEMV path exists in cuBLASLt — the same Ampere-era kernels run. For M=1, cuBLASLt is typically slower than hand-tuned __dp4a due to launch overhead and generality. [Source](https://zenn.dev/toki_mwc/articles/rtx5090-blackwell-cuda-toolkit-trap-llama-cpp?locale=en)
-17. **CUTLASS SM120 GEMM kernels target FP4 block-scaled, not INT8 GEMV.** The SM120-specific CUTLASS paths optimize for `mxf4` and `nvf4mxf4` narrow-precision types. INT8 on SM120 uses generic SM80+ mma.sync paths from CUTLASS 2.x/3.x, which are GEMM-focused (large M,N,K) and not optimized for GEMV (M=1). [Source](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html)
+8. **Expected output: quantization noise, not bug** — AGENTS.md states "28-layer output still garbled = INT8 quantization noise accumulation, not bugs." Python reference will reproduce same garbled output. The value is: (a) confirming CUDA correctness end-to-end, (b) measuring per-layer noise accumulation vs BF16 reference, (c) identifying which layer or operation introduces most noise. [Source](file:///mnt/data/dev/projects/blackwell/AGENTS.md)
 
 ## Sources
 
-### Kept (Primary Technical Sources)
-- ShlokVFX/Mini-Attention sm120_vs_sm100.md — Definitive summary of SM120 vs SM100 tensor core differences. Consumer lacks tcgen05/TMEM.
-- NVIDIA CUTLASS Blackwell Functionality Docs — Official docs on SM100 tcgen05.mma and SM120 mma.sync paths.
-- gau-nernst/tcgen05-for-dummies — Detailed tcgen05 explanation, explicitly notes SM100-only, not consumer.
-- arxiv 2512.02189 (Blackwell Microbenchmarks) — Microarchitectural analysis of Blackwell tensor cores.
-- arxiv 2501.08192 (PRESERVE) — Weight prefetching framework for LLM inference.
-- arxiv 2605.24144 (EVA) — Multi-batch weight tile reuse for LLM decode acceleration.
-- CUDA L2 Persistent Cache (Lei Mao) — Practical guide to L2 persistence API.
-- gau-nernst/nvrtc-matmul — MMA instruction variant benchmarks including SM120 (RTX 5090).
-- NVIDIA Dev Forums: tcgen06.alloc on sm120a — Confirmed TMEM not available on consumer Blackwell.
-- llama.cpp source (mmvq kernels) — Production batched GEMV implementation reference.
-- Salykova SGEMM optimization — cp.async pipeline and shared-memory tiling techniques.
-
-### Dropped
-- RTX 5090/5080 reviews (Tom's Hardware, Puget Systems, etc.) — Consumer product reviews, no kernel-level technical content.
-- YouTube speculation videos — No technical substance.
-- Generic CUDA optimization tutorials — Not specific to SM120 or INT8 GEMV.
-- IST-DASLab/gemm-int8 — PyTorch extension targeting datacenter GPUs, not consumer SM120.
+- Kept: `bench/validate_pipeline.py` — exact 1-layer INT8 Python reference, verified against CUDA
+- Kept: `bench/verify_int8_accuracy.py` — measures per-weight INT8 quantization error vs BF16
+- Kept: `bench/text_generate.cu` — full 28-layer decode pipeline, weight loading, tokenizer, sampling
+- Kept: `/mnt/data/ai/hf/qwen3-1.7b-base/config.json` — model architecture params
+- Kept: `scripts/prepare_tokenizer.py` — tokenizer data dump format for BPE
+- Kept: `scripts/extract_norms.py` — extracts per-layer RMSNorm weights to `.f32` files
+- Kept: `include/blackwell/kernels.h` — INT8 kernel API (gemv_int8, fused_rmsnorm_quant_int8, pack_int8, etc.)
+- Dropped: None — all sources directly relevant
 
 ## Gaps
 
-1. **No SM120-specific INT8 tensor core optimization published.** All Blackwell INT8 research targets SM100 with tcgen05. Consumer SM120 tensor core throughput for INT8 mma.sync m16n8k16 is not independently benchmarked in published literature.
-2. **L2 cache size on RTX 5060 Ti not definitively confirmed.** Assumed ~32 MB based on GB207 die, but NVIDIA doesn't publish consumer GPU L2 sizes. If L2 is larger, persistence policies could help more.
-3. **Weight format conversion cost not quantified.** Switching from row-major __dp4a to shared-memory tiled ldmatrix format for mma.sync has a one-time transpose cost. Whether the batched-GEMV speedup (M=4+) amortizes this cost is untested.
-4. **Inter-layer weight prefetching feasibility.** PRESERVE-style prefetching between layers requires async copy engines or DMA that may not exist on consumer GPUs in the same form as datacenter. Not validated on RTX 50xx.
+1. **Multi-position KV cache in Python not implemented** — Current validate_pipeline.py only handles seq_pos=0. Need per-layer, per-head, per-position K/V storage for multi-step generation. Straightforward but ~200 lines Python.
 
-## Practical Recommendations for Project
+2. **Token ID correspondence not verified** — Need to dump token IDs from C++ `text_generate` and feed same IDs to Python reference to ensure identical input. Tokenizer implementation mismatch is the #1 risk for meaningless comparison.
 
-Given the findings, the optimizations ranked by expected impact:
+3. **No BF16 baseline output file exists** — Need to run HF model through `transformers` and dump per-layer intermediates. Can do with ~50 lines Python using `AutoModelForCausalLM`.
 
-| Priority | Technique | Expected Gain | Effort |
-|----------|-----------|---------------|--------|
-| 1 | Multi-token batched GEMV (M=4) | 1.4× throughput | Low — already have `gemv_int8_batched` |
-| 2 | Speculative decoding integration | 2-3× effective throughput | High — needs draft model |
-| 3 | Inter-layer weight prefetch (PRESERVE-style) | 10-20% latency reduction | Medium |
-| 4 | mma.sync m16n8k16 INT8 for M≥4 batched | Unclear — needs testing | Medium — requires weight reformat |
-| 5 | L2 persistence for small models | 0% (weights > L2) | N/A |
+4. **Per-layer noise accumulation not measured** — verify_int8_accuracy.py only does layer 0. Need all 28 layers to see where noise compounds.
 
-**Bottom line: SM120 consumer Blackwell has no new INT8 tensor core instructions beyond Ampere-era mma.sync and dp4a. The 16.2 t/s gap to 114 t/s target cannot be closed with single-token kernel optimizations. Multi-token batching or speculative decoding are the only viable paths.**
+5. **lm_head weights not in INT8 directory** — embed_tokens used for both embedding and lm_head (tied). CUDA uses `d_emb_d` (INT8) for both. Need to verify lm_head path uses same weights correctly in Python.
+
+6. **RoPE parameters**: Qwen3 uses rope_theta=1000000 (not 10000). `text_generate.cu` hardcodes `powf(10000.0f, ...)` — this is WRONG for Qwen3. Needs investigation: does this degrade output quality further? [Source](file:///mnt/data/dev/projects/blackwell/bench/text_generate.cu#L74)
+
+## Approach
+
+**Phase 1: Token ID bridge** (1-2 hours)
+- Add `--dump-tokens` flag to `text_generate.cu` that writes input_ids and generated token IDs to file
+- Read token IDs in Python, feed same IDs to both INT8 reference and HF BF16 model
+- Verify tokenizer agreement on first 50 tokens
+
+**Phase 2: Extend validate_pipeline.py to 28 layers** (2-3 hours)
+- Load all INT8 weights per layer (loop 0..27)
+- Loop same 10-step pipeline per layer
+- Add multi-position KV cache (grows with each step)
+- Add final norm + lm_head + argmax
+- Compare CUDA output at each layer (dump CUDA intermediates via new kernel)
+- Already have per-layer RMSNorm weights (`{layer}_input_layernorm.f32`)
+
+**Phase 3: HF BF16 baseline** (1 hour)
+- Use `transformers` with `AutoModelForCausalLM.from_pretrained(..., torch_dtype=torch.bfloat16)`
+- Run same prompt, same token IDs
+- Dump per-layer outputs (hidden states)
+- Compute per-layer cosine similarity, max diff, SNR vs INT8 Python reference
+
+**Phase 4: Accuracy analysis** (1 hour)
+- Plot per-layer noise accumulation (layer 0 to 27)
+- Identify which operation causes most degradation (QKV GEMV? Down GEMV? Quantization step?)
+- Report SNR, perplexity impact estimate, qualitative output comparison

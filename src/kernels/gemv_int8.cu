@@ -189,6 +189,160 @@ __global__ void transpose_scales_int8_kernel(
 } // anonymous namespace
 
 // ===========================================================================
+// FP32×INT8 GEMV — FP32 activations × INT8 weights
+// ===========================================================================
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_fp32_int8_kernel(
+    float* __restrict__ y_out,
+    const float* __restrict__ x_fp32,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    if (n_out >= N) return;
+
+    int num_K_blks = K / B;
+    int n_blk = n_out / B;
+
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        // Load 16 FP32 activation values (4× float4 = 16 floats)
+        int x_off = kb * B;
+        float4 v0 = reinterpret_cast<const float4*>(&x_fp32[x_off])[0];
+        float4 v1 = reinterpret_cast<const float4*>(&x_fp32[x_off])[1];
+        float4 v2 = reinterpret_cast<const float4*>(&x_fp32[x_off])[2];
+        float4 v3 = reinterpret_cast<const float4*>(&x_fp32[x_off])[3];
+
+        // Load 16 INT8 weight values (4× int vectors)
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        int w0 = reinterpret_cast<const int*>(w_ptr)[0];
+        int w1 = reinterpret_cast<const int*>(w_ptr)[1];
+        int w2 = reinterpret_cast<const int*>(w_ptr)[2];
+        int w3 = reinterpret_cast<const int*>(w_ptr)[3];
+
+        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+
+        // Unpack int8 (sign-extend) → float and multiply-add (16-wide)
+        #define SE(i) (float)(int8_t)((i) & 0xFF)
+        float sum_b = 0.0f;
+        sum_b += SE(w0 >>  0) * v0.x;  sum_b += SE(w0 >>  8) * v0.y;
+        sum_b += SE(w0 >> 16) * v0.z;  sum_b += SE(w0 >> 24) * v0.w;
+        sum_b += SE(w1 >>  0) * v1.x;  sum_b += SE(w1 >>  8) * v1.y;
+        sum_b += SE(w1 >> 16) * v1.z;  sum_b += SE(w1 >> 24) * v1.w;
+        sum_b += SE(w2 >>  0) * v2.x;  sum_b += SE(w2 >>  8) * v2.y;
+        sum_b += SE(w2 >> 16) * v2.z;  sum_b += SE(w2 >> 24) * v2.w;
+        sum_b += SE(w3 >>  0) * v3.x;  sum_b += SE(w3 >>  8) * v3.y;
+        sum_b += SE(w3 >> 16) * v3.z;  sum_b += SE(w3 >> 24) * v3.w;
+        #undef SE
+        acc += sum_b * w_sc;
+    }
+
+    y_out[n_out] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Per-row INT8 GEMV kernel — each output row has independent scales.
+// Scale layout: W_t_scale [N × K/16] (vs old 2D [N/16 × K/16]).
+// ---------------------------------------------------------------------------
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_int8_per_row_kernel(
+    float* __restrict__ y_out,
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    if (n_out >= N) return;
+
+    int num_K_blks = K / B;
+
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        alignas(16) int8_t w_buf[B];
+        alignas(16) int8_t x_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+        *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
+
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];  // per-row scale
+        float x_sc = x_scale[kb];
+        float prod_scale = w_sc * x_sc;
+
+        const int* w32 = reinterpret_cast<const int*>(w_buf);
+        const int* x32 = reinterpret_cast<const int*>(x_buf);
+        int sumi = 0;
+        sumi = __dp4a(w32[0], x32[0], sumi);
+        sumi = __dp4a(w32[1], x32[1], sumi);
+        sumi = __dp4a(w32[2], x32[2], sumi);
+        sumi = __dp4a(w32[3], x32[3], sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
+    }
+
+    y_out[n_out] = acc;
+}
+
+// ===========================================================================
+// FP32×INT8 per-row GEMV — FP32 activations × INT8 weights with per-row scales
+// ===========================================================================
+__launch_bounds__(kINT8Block, 1)
+__global__ void gemv_fp32_int8_per_row_kernel(
+    float* __restrict__ y_out,
+    const float* __restrict__ x_fp32,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * kINT8Block + tid;
+    if (n_out >= N) return;
+
+    int num_K_blks = K / B;
+
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        int x_off = kb * B;
+        float4 v0 = reinterpret_cast<const float4*>(&x_fp32[x_off])[0];
+        float4 v1 = reinterpret_cast<const float4*>(&x_fp32[x_off])[1];
+        float4 v2 = reinterpret_cast<const float4*>(&x_fp32[x_off])[2];
+        float4 v3 = reinterpret_cast<const float4*>(&x_fp32[x_off])[3];
+
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        int w0 = reinterpret_cast<const int*>(w_ptr)[0];
+        int w1 = reinterpret_cast<const int*>(w_ptr)[1];
+        int w2 = reinterpret_cast<const int*>(w_ptr)[2];
+        int w3 = reinterpret_cast<const int*>(w_ptr)[3];
+
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];  // per-row scale
+
+        #define SE2(i) (float)(int8_t)((i) & 0xFF)
+        float sum_b = 0.0f;
+        sum_b += SE2(w0 >>  0) * v0.x;  sum_b += SE2(w0 >>  8) * v0.y;
+        sum_b += SE2(w0 >> 16) * v0.z;  sum_b += SE2(w0 >> 24) * v0.w;
+        sum_b += SE2(w1 >>  0) * v1.x;  sum_b += SE2(w1 >>  8) * v1.y;
+        sum_b += SE2(w1 >> 16) * v1.z;  sum_b += SE2(w1 >> 24) * v1.w;
+        sum_b += SE2(w2 >>  0) * v2.x;  sum_b += SE2(w2 >>  8) * v2.y;
+        sum_b += SE2(w2 >> 16) * v2.z;  sum_b += SE2(w2 >> 24) * v2.w;
+        sum_b += SE2(w3 >>  0) * v3.x;  sum_b += SE2(w3 >>  8) * v3.y;
+        sum_b += SE2(w3 >> 16) * v3.z;  sum_b += SE2(w3 >> 24) * v3.w;
+        #undef SE2
+        acc += sum_b * w_sc;
+    }
+
+    y_out[n_out] = acc;
+}
+
+// ===========================================================================
 // Public API
 // ===========================================================================
 
@@ -248,6 +402,68 @@ cudaError_t gemv_int8_from_fp4(
     gemv_int8_from_fp4_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
         y_out,
         static_cast<const __nv_fp4_e2m1*>(x_fp4), x_fp4_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t gemv_fp32_int8(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int nb = (N + kINT8Block - 1) / kINT8Block;
+    gemv_fp32_int8_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
+        y_out, x_fp32,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t gemv_fp32_int8_per_row(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int nb = (N + kINT8Block - 1) / kINT8Block;
+    gemv_fp32_int8_per_row_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
+        y_out, x_fp32,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t gemv_int8_per_row(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int nb = (N + kINT8Block - 1) / kINT8Block;
+    gemv_int8_per_row_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
+        y_out,
+        static_cast<const int8_t*>(x_int8), x_scale,
         static_cast<const int8_t*>(W_t_int8), W_t_scale,
         K, N);
     return cudaPeekAtLastError();
@@ -573,6 +789,5 @@ cudaError_t gemv_int8_batched(
     }
     return cudaPeekAtLastError();
 }
-
 } // namespace kernels
 } // namespace blackwell

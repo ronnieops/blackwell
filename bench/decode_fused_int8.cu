@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
             // Residual + norm
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
 
             // MLP: gate + up
             chk(blackwell::kernels::gemv_int8_from_fp4(d_gate, d_x_fp4, d_xs,
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
             // Residual + norm
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     printf("done\n");
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
                 ow[l].d, ow[l].sc, Q, H, 0), "Wo");
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
             // MLP
             chk(blackwell::kernels::gemv_int8_from_fp4(d_gate, d_x_fp4, d_xs,
                 gw[l].d, gw[l].sc, H, I, 0), "gate");
@@ -210,7 +210,7 @@ int main(int argc, char** argv) {
                 dw[l].d, dw[l].sc, I, H, 0), "down");
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     cudaDeviceSynchronize();
@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
             lt.start();
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
             timers[7].add(lt.stop());
 
             // MLP: gate + up (fused)
@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
             blackwell::kernels::unpack_fp4(d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::vector_add_fp32(d_proj, d_proj, d_res, H, 0);
             lt.start();
-            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-5f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, d_proj, d_rn, H, 1e-6f, 0);
             timers[13].add(lt.stop());
         }
     }

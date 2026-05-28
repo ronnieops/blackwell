@@ -152,8 +152,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_attn_i8_s, d_attn_s, d_attn_i8s_s, Q, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_attn_i8_s, d_attn_i8s_s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
                 // MLP
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::pack_int8(d_xi8_s, d_res_s, d_xi8s_s, H, 0);
@@ -163,8 +163,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_mlp_i8_s, d_mlp_s, d_mlp_i8s_s, I, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_mlp_i8_s, d_mlp_i8s_s, lw[l].d.d, lw[l].d.sc, I, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
             }
         }
     }
@@ -189,8 +189,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_attn_i8_s, d_attn_s, d_attn_i8s_s, Q, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_attn_i8_s, d_attn_i8s_s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::pack_int8(d_xi8_s, d_res_s, d_xi8s_s, H, 0);
                 blackwell::kernels::gemv_int8(d_gate_s, d_xi8_s, d_xi8s_s, lw[l].g.d, lw[l].g.sc, H, I, 0);
@@ -199,8 +199,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_mlp_i8_s, d_mlp_s, d_mlp_i8s_s, I, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_mlp_i8_s, d_mlp_i8s_s, lw[l].d.d, lw[l].d.sc, I, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
             }
         }
     }
@@ -224,8 +224,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_attn_i8_s, d_attn_s, d_attn_i8s_s, Q, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_attn_i8_s, d_attn_i8s_s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::pack_int8(d_xi8_s, d_res_s, d_xi8s_s, H, 0);
                 // Use batched GEMV for gate+up (2 biggest weights)
@@ -236,8 +236,8 @@ int main(int argc, char** argv) {
                 blackwell::kernels::pack_int8(d_mlp_i8_s, d_mlp_s, d_mlp_i8s_s, I, 0);
                 blackwell::kernels::gemv_int8(d_proj_s, d_mlp_i8_s, d_mlp_i8s_s, lw[l].d.d, lw[l].d.sc, I, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
             }
         }
     }
@@ -288,11 +288,11 @@ int main(int argc, char** argv) {
                 blackwell::kernels::gemv_int8(d_proj_s, d_attn_i8_s, d_attn_i8s_s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_s, d_proj_s, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_s, d_rn, H, 1e-6f, 0);
                 // Copy INT8 x back to batched buffer
                 cudaMemcpy(d_xi8_b + m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice);
                 cudaMemcpy(d_xi8s_b + m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_s, d_rn, H, 1e-6f, 0);
             }
 
             // MLP: BATCHED gate+up GEMV (weight reuse!)
@@ -312,8 +312,8 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b + m*H, d_proj_b + m*H, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b + m*H, d_rn, H, 1e-5f, 0);
-                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b + m*H, d_rn, H, 1e-5f, 0);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b + m*H, d_rn, H, 1e-6f, 0);
+                blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b + m*H, d_rn, H, 1e-6f, 0);
             }
         }
     }

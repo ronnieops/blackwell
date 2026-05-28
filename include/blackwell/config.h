@@ -47,15 +47,29 @@ constexpr int  kFP4ScaleBits   = 8;    // scale factor stored as FP8 or FP16
 // 64×64×2 = 8192 bytes  →  fine
 // GEMM (prefill): one 16×16 output per WMMA mma_sync, K=64 tiles.
 // Grid dimensions cover (M/16, N/16) in the public API.
-constexpr int kGEMMTileM = 128; // CTA tile size (8 × 16 WMMA fragments)
+// CTA tile sizes for WMMA GEMM
+// Large CTA (128×128×64): 8 warps, 80 KB smem, for M≥128
+constexpr int kGEMMTileM = 128;
 constexpr int kGEMMTileN = 128;
 constexpr int kGEMMTileK = 64;
 
-// GEMM warp configuration
+// Small CTA (64×64×64): 4 warps, 40 KB smem, for M<128 or N<256
+// 2 blocks/SM vs 1 block/SM → better SM util for prefill
+constexpr int kGEMMTileM_Small = 64;
+constexpr int kGEMMTileN_Small = 64;
+constexpr int kGEMMTileK_Small = 64;
+
+// GEMM warp configuration (large CTA)
 constexpr int kGEMMWarps     = 8;   // 8 warps per CTA
 constexpr int kGEMMThreads   = kGEMMWarps * kWarpSize; // 256
 constexpr int kGEMMWarpsM    = 4;   // warps along M dimension
 constexpr int kGEMMWarpsN    = 2;   // warps along N dimension
+
+// GEMM warp configuration (small CTA)
+constexpr int kGEMMSmallWarps   = 4;   // 4 warps per CTA
+constexpr int kGEMMSmallThreads = kGEMMSmallWarps * kWarpSize; // 128
+constexpr int kGEMMSmallWarpsM  = 2;   // warps along M
+constexpr int kGEMMSmallWarpsN  = 2;   // warps along N
 
 // WMMA fragment constants
 constexpr int kWMMAFragM = 16;
