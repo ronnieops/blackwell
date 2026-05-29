@@ -360,6 +360,59 @@ cudaError_t pack_int8(
     return cudaPeekAtLastError();
 }
 
+// ===========================================================================
+// Fused INT8 quantize: compute absmax scales + pack in one kernel
+// Grid = num_elements / 16 (one block per 16-element group)
+// Block = 32 threads (warp). Threads 0-15 load, all warp-reduce absmax.
+// ===========================================================================
+__launch_bounds__(32, 4)
+__global__ void quantize_int8_kernel(
+    int8_t* __restrict__ out,
+    float*  __restrict__ scales,
+    const float* __restrict__ in,
+    int n)
+{
+    int blk = blockIdx.x;
+    int tid = threadIdx.x;
+    int idx = blk * 16 + tid;
+
+    // Load (16 values across 32 threads; lanes 0-15 get data, 16-31 load 0)
+    float v = (tid < 16 && idx < n) ? in[idx] : 0.0f;
+
+    // Full-warp absmax reduce (32 lanes, but only 0-15 have meaningful data)
+    float av = fabsf(v);
+    av = fmaxf(av, __shfl_xor_sync(0xffffffff, av, 8));
+    av = fmaxf(av, __shfl_xor_sync(0xffffffff, av, 4));
+    av = fmaxf(av, __shfl_xor_sync(0xffffffff, av, 2));
+    av = fmaxf(av, __shfl_xor_sync(0xffffffff, av, 1));
+
+    float sc = av / 127.0f;
+    if (sc < 1e-10f) sc = 1.0f;
+    if (tid == 0) scales[blk] = sc;
+
+    // Quantize and store (only lanes 0-15)
+    float qf = roundf(v / sc);
+    qf = fminf(127.0f, fmaxf(-127.0f, qf));
+    if (tid < 16 && idx < n)
+        out[idx] = static_cast<int8_t>(static_cast<int>(qf));
+}
+
+cudaError_t quantize_int8(
+    void*           out_int8,
+    float*          out_scale,
+    const float*    in_fp32,
+    int             num_elements,
+    cudaStream_t    stream)
+{
+    if (num_elements <= 0 || num_elements % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int blocks = num_elements / 16;
+    quantize_int8_kernel<<<blocks, 32, 0, stream>>>(
+        static_cast<int8_t*>(out_int8), out_scale, in_fp32, num_elements);
+    return cudaPeekAtLastError();
+}
+
 cudaError_t gemv_int8(
     float*          y_out,
     const void*     x_int8,
@@ -798,6 +851,123 @@ cudaError_t gemm_int8(
               (M + THREADS * TILE - 1) / (THREADS * TILE));
     gemm_int8_kernel<<<grid, block, 0, stream>>>(
         C, A, static_cast<const int8_t*>(B_int8), B_scale, M, N, K);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
+// INT8×INT8 GEMM with __dp4a — pre-quantized activations
+// C[M×N] = A_i8[M×K] × B_i8[N×K]^T
+// Uses 4×4 register tiling (matching gemm_int8_kernel tile layout).
+// Each 16×16 thread block covers 64×64 output region.
+// Each thread computes acc[4][4] = 16 outputs.
+// Inner K-loop uses __dp4a SIMD dot product.
+// ===========================================================================
+__launch_bounds__(256, 1)
+__global__ void gemm_int8_dp4a_kernel(
+    float* __restrict__ C,
+    const int8_t* __restrict__ A_i8,
+    const float* __restrict__ A_sc,
+    const int8_t* __restrict__ B_i8,
+    const float* __restrict__ B_sc,
+    int M, int N, int K)
+{
+    constexpr int TILE_M = 4;
+    constexpr int TILE_N = 4;
+    constexpr int T_M = 16;  // threads along M
+    constexpr int T_N = 16;  // threads along N
+    constexpr int B = 16;
+
+    int bm = blockIdx.y * TILE_M * T_M;
+    int bn = blockIdx.x * TILE_N * T_N;
+    int tm = threadIdx.y;
+    int tn = threadIdx.x;
+    int m_base = bm + tm * TILE_M;
+    int n_base = bn + tn * TILE_N;
+
+    int num_K_blks = K / B;
+    float acc[TILE_M][TILE_N] = {};
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        // Load activation blocks for TILE_M rows
+        int8_t a_tile[TILE_M][B];
+        #pragma unroll
+        for (int i = 0; i < TILE_M; ++i) {
+            int mi = m_base + i;
+            if (mi < M) {
+                *reinterpret_cast<uint4*>(&a_tile[i][0]) =
+                    *reinterpret_cast<const uint4*>(&A_i8[mi * K + kb * B]);
+            }
+        }
+
+        // Load weight blocks for TILE_N columns
+        int8_t w_tile[TILE_N][B];
+        #pragma unroll
+        for (int j = 0; j < TILE_N; ++j) {
+            int nj = n_base + j;
+            if (nj < N) {
+                *reinterpret_cast<uint4*>(&w_tile[j][0]) =
+                    *reinterpret_cast<const uint4*>(&B_i8[nj * K + kb * B]);
+            }
+        }
+
+        // Compute dot products via __dp4a
+        #pragma unroll
+        for (int i = 0; i < TILE_M; ++i) {
+            int mi = m_base + i;
+            if (mi >= M) continue;
+            float a_sc = A_sc[mi * num_K_blks + kb];
+
+            #pragma unroll
+            for (int j = 0; j < TILE_N; ++j) {
+                int nj = n_base + j;
+                if (nj >= N) continue;
+                float w_sc = B_sc[nj * num_K_blks + kb];
+
+                // __dp4a: 4 × 4-way SIMD
+                const int* a32 = reinterpret_cast<const int*>(&a_tile[i][0]);
+                const int* w32 = reinterpret_cast<const int*>(&w_tile[j][0]);
+                int sumi = 0;
+                sumi = __dp4a(a32[0], w32[0], sumi);
+                sumi = __dp4a(a32[1], w32[1], sumi);
+                sumi = __dp4a(a32[2], w32[2], sumi);
+                sumi = __dp4a(a32[3], w32[3], sumi);
+
+                acc[i][j] += static_cast<float>(sumi) * a_sc * w_sc;
+            }
+        }
+    }
+
+    // Store results
+    #pragma unroll
+    for (int i = 0; i < TILE_M; ++i) {
+        int mi = m_base + i;
+        if (mi >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TILE_N; ++j) {
+            int nj = n_base + j;
+            if (nj >= N) continue;
+            C[mi * N + nj] = acc[i][j];
+        }
+    }
+}
+
+cudaError_t gemm_int8_dp4a(
+    float*          C,
+    const int8_t*   A_int8,
+    const float*    A_scale,
+    const int8_t*   B_int8,
+    const float*    B_scale,
+    int             M, int N, int K,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0) return cudaErrorInvalidValue;
+    constexpr int TILE = 4;
+    constexpr int THREADS = 16;
+    dim3 block(THREADS, THREADS);
+    dim3 grid((N + THREADS * TILE - 1) / (THREADS * TILE),
+              (M + THREADS * TILE - 1) / (THREADS * TILE));
+    gemm_int8_dp4a_kernel<<<grid, block, 0, stream>>>(
+        C, A_int8, A_scale, B_int8, B_scale, M, N, K);
     return cudaPeekAtLastError();
 }
 } // namespace kernels

@@ -398,6 +398,17 @@ cudaError_t pack_int8(
     int             num_elements,
     cudaStream_t    stream = 0);
 
+// Fused INT8 quantize: compute absmax scales + pack to INT8 in one kernel
+// out_int8: [num_elements] INT8, out_scale: [num_elements/16] FP32 scales
+// in_fp32:  [num_elements] FP32 input
+// num_elements must be multiple of 16.
+cudaError_t quantize_int8(
+    void*           out_int8,
+    float*          out_scale,
+    const float*    in_fp32,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
 // INT8 block-scaled GEMV Split-K (K split into K_splits, AtomicAdd reduction)
 // Caller MUST zero y_out before launch. Grid: (N/256, K_splits).
 // Targets large N with wave quantization (e.g., N=6144: 24 blocks < 36 SMs).
@@ -483,6 +494,21 @@ cudaError_t gemv_int8(
     const float*    W_t_scale,
     int             K,
     int             N,
+    cudaStream_t    stream = 0);
+
+// INT8×INT8 GEMM with __dp4a — pre-quantized activations
+// C[M×N] = A_i8[M×K] × B_i8[N×K]^T
+// Activations must be pre-quantized via pack_int8 or fused_rmsnorm_quant_int8.
+// A_i8: INT8 [M×K], A_scale: [M × K/16] FP32 block scales
+// B_i8: INT8 [N×K], B_scale: [N × K/16] FP32 block scales
+// K must be multiple of 16. Uses __dp4a SIMD dot product.
+cudaError_t gemm_int8_dp4a(
+    float*          C,              // [M×N] output
+    const int8_t*   A_int8,         // [M×K] INT8 pre-quantized activations
+    const float*    A_scale,        // [M × K/16] activation scales
+    const int8_t*   B_int8,         // [N×K] INT8 transposed weights
+    const float*    B_scale,        // [N × K/16] weight scales
+    int             M, int N, int K,
     cudaStream_t    stream = 0);
 
 // INT8 GEMM: C[M×N] = A[M×K] × B^T[N×K]

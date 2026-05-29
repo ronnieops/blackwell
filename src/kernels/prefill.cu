@@ -1,7 +1,7 @@
 // src/kernels/prefill.cu — Prefill layer orchestration
 //
 // Orchestrates GEMM + attention for full-sequence prefill.
-// Uses INT8 GEMM for projections and FP32 attention.
+// Pre-quantizes activations to INT8, then uses __dp4a GEMM for projections.
 
 #include <cuda_runtime.h>
 #include "blackwell/kernels.h"
@@ -34,8 +34,8 @@ cudaError_t run_prefill_layer(
 
     // Allocate temporary buffers
     float *d_Q, *d_K, *d_V, *d_attn, *d_proj;
-    int8_t *d_q_i8, *d_k_i8, *d_v_i8;
-    float *d_q_sc, *d_k_sc, *d_v_sc, *d_attn_sc;
+    int8_t *d_a_i8, *d_o_i8;
+    float *d_a_sc, *d_o_sc;
     size_t q_size = M * Q_dim * sizeof(float);
     size_t kv_size = M * KV_dim * sizeof(float);
     size_t proj_size = M * hidden_dim * sizeof(float);
@@ -47,12 +47,22 @@ cudaError_t run_prefill_layer(
     e = cudaMalloc(&d_attn, q_size); if (e != cudaSuccess) return e;
     e = cudaMalloc(&d_proj, proj_size); if (e != cudaSuccess) return e;
 
-    // QKV GEMM: [M, hidden_dim] × [Q_dim, hidden_dim]^T → [M, Q_dim]
-    e = gemm_int8(d_Q, hidden_states, W_q, W_q_sc, M, Q_dim, hidden_dim, stream);
+    // Pre-quantized activation buffers
+    int a_elems = M * hidden_dim;
+    int a_nblks = a_elems / 16;
+    e = cudaMalloc(&d_a_i8, a_elems); if (e != cudaSuccess) { cudaFree(d_proj); cudaFree(d_attn); cudaFree(d_V); cudaFree(d_K); cudaFree(d_Q); return e; }
+    e = cudaMalloc(&d_a_sc, a_nblks * sizeof(float)); if (e != cudaSuccess) { cudaFree(d_a_i8); cudaFree(d_proj); cudaFree(d_attn); cudaFree(d_V); cudaFree(d_K); cudaFree(d_Q); return e; }
+
+    // Pre-quantize hidden_states to INT8 once (reused for Q, K, V)
+    e = quantize_int8(d_a_i8, d_a_sc, hidden_states, a_elems, stream);
+    if (e != cudaSuccess) { cudaFree(d_a_sc); cudaFree(d_a_i8); cudaFree(d_proj); cudaFree(d_attn); cudaFree(d_V); cudaFree(d_K); cudaFree(d_Q); return e; }
+
+    // QKV projections via __dp4a (pre-quantized INT8 × INT8)
+    e = gemm_int8_dp4a(d_Q, d_a_i8, d_a_sc, W_q, W_q_sc, M, Q_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
-    e = gemm_int8(d_K, hidden_states, W_k, W_k_sc, M, KV_dim, hidden_dim, stream);
+    e = gemm_int8_dp4a(d_K, d_a_i8, d_a_sc, W_k, W_k_sc, M, KV_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
-    e = gemm_int8(d_V, hidden_states, W_v, W_v_sc, M, KV_dim, hidden_dim, stream);
+    e = gemm_int8_dp4a(d_V, d_a_i8, d_a_sc, W_v, W_v_sc, M, KV_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
 
     // Update KV cache: write K/V for all seq positions
@@ -79,17 +89,17 @@ cudaError_t run_prefill_layer(
     }
 
     // Output projection: [M, Q_dim] × [hidden_dim, Q_dim]^T → [M, hidden_dim]
-    // Need to pack attention output to INT8 first
+    // Pre-quantize attention output to INT8, then __dp4a GEMM
     {
-        int attn_elements = M * Q_dim;
-        e = cudaMalloc(&d_q_i8, attn_elements); if (e != cudaSuccess) goto cleanup;
-        e = cudaMalloc(&d_q_sc, (attn_elements / 16) * sizeof(float)); if (e != cudaSuccess) goto cleanup;
-        e = pack_int8(d_q_i8, d_attn, d_q_sc, attn_elements, stream);
-        if (e != cudaSuccess) goto free_q;
-        e = gemv_int8(d_proj, d_q_i8, d_q_sc, W_o, W_o_sc, Q_dim, hidden_dim, stream);
-free_q:
-        cudaFree(d_q_i8);
-        cudaFree(d_q_sc);
+        int o_elems = M * Q_dim;
+        int o_nblks = o_elems / 16;
+        e = cudaMalloc(&d_o_i8, o_elems); if (e != cudaSuccess) goto cleanup;
+        e = cudaMalloc(&d_o_sc, o_nblks * sizeof(float)); if (e != cudaSuccess) { cudaFree(d_o_i8); goto cleanup; }
+        e = quantize_int8(d_o_i8, d_o_sc, d_attn, o_elems, stream);
+        if (e != cudaSuccess) { cudaFree(d_o_sc); cudaFree(d_o_i8); goto cleanup; }
+        e = gemm_int8_dp4a(d_proj, d_o_i8, d_o_sc, W_o, W_o_sc, M, hidden_dim, Q_dim, stream);
+        cudaFree(d_o_sc);
+        cudaFree(d_o_i8);
     }
     if (e != cudaSuccess) goto cleanup;
 
@@ -97,6 +107,8 @@ free_q:
     e = vector_add_fp32(hidden_states, d_proj, hidden_states, M * hidden_dim, stream);
 
 cleanup:
+    cudaFree(d_a_sc);
+    cudaFree(d_a_i8);
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);
