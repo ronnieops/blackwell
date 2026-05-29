@@ -190,17 +190,35 @@ __global__ void attention_decode_kernel(
 // - Address is stable (not stack-allocated)
 // - Contents can be updated between graph launches
 // - Graph replays read latest pinned value
+//
+// Thread-safety: alloc_seq_pos() uses atomic flag for one-time init.
+// write_seq_pos() is NOT thread-safe — caller must ensure no concurrent
+// writes to h_seq_pos_pinned from different threads. In practice, each
+// stream's memcpy is ordered, so Stream A's kernel reads Stream A's value.
 // ===========================================================================
 namespace {
     static int* d_seq_pos_global = nullptr;
     static int* h_seq_pos_pinned = nullptr;
+    static volatile int seq_pos_init_flag = 0;  // 0=uninit, 1=initing, 2=done
+    static volatile int smem_attr_set = 0;  // 0=uninit, 1=initing, 2=done
+
     static cudaError_t alloc_seq_pos() {
-        if (d_seq_pos_global) return cudaSuccess;
-        cudaError_t e = cudaMalloc(&d_seq_pos_global, sizeof(int));
-        if (e != cudaSuccess) return e;
-        return cudaHostAlloc(&h_seq_pos_pinned, sizeof(int), cudaHostAllocDefault);
+        if (seq_pos_init_flag == 2) return cudaSuccess;
+        // Spin-lock for one-time initialization
+        int old = __sync_val_compare_and_swap(&seq_pos_init_flag, 0, 1);
+        if (old == 0) {
+            cudaError_t e = cudaMalloc(&d_seq_pos_global, sizeof(int));
+            if (e != cudaSuccess) { seq_pos_init_flag = 0; return e; }
+            e = cudaHostAlloc(&h_seq_pos_pinned, sizeof(int), cudaHostAllocDefault);
+            if (e != cudaSuccess) { cudaFree(d_seq_pos_global); d_seq_pos_global = nullptr; seq_pos_init_flag = 0; return e; }
+            seq_pos_init_flag = 2;
+        } else {
+            while (seq_pos_init_flag != 2) {}
+        }
+        return cudaSuccess;
     }
     // Write seq_pos to pinned memory for graph-safe read by cudaMemcpyAsync
+    // NOT thread-safe — caller must serialize.
     static void write_seq_pos(int seq_pos) {
         if (h_seq_pos_pinned) *h_seq_pos_pinned = seq_pos;
     }
@@ -224,15 +242,16 @@ cudaError_t attention_decode(
                         cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) return e;
 
-    static bool attr_set = false;
     constexpr int smem_bytes = 4096 * 4;  // 16 KB for scores (4096 positions)
-    if (!attr_set) {
-        e = cudaFuncSetAttribute(
-            attention_decode_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_bytes);
-        if (e != cudaSuccess) return e;
-        attr_set = true;
+    if (smem_attr_set == 0) {
+        int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
+        if (old == 0) {
+            cudaFuncSetAttribute(
+                attention_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_attr_set = 2;
+        }
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -259,15 +278,16 @@ cudaError_t attention_decode_gqa(
                         cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) return e;
 
-    static bool attr_set = false;
     constexpr int smem_bytes = 4096 * 4;
-    if (!attr_set) {
-        e = cudaFuncSetAttribute(
-            attention_decode_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_bytes);
-        if (e != cudaSuccess) return e;
-        attr_set = true;
+    if (smem_attr_set == 0) {
+        int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
+        if (old == 0) {
+            cudaFuncSetAttribute(
+                attention_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_attr_set = 2;
+        }
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
