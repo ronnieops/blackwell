@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (114 t/s).
-Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph. Text output correct.
+Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph, **60 t/s** Mode D prefill+decode. Text output correct.
 
 ---
 
@@ -138,7 +138,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_full_int8 4` (pipeline), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 76)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 78)
 
 ---
 
