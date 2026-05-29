@@ -372,19 +372,6 @@ cudaError_t pack_int8(
     int             num_elements,
     cudaStream_t    stream = 0);
 
-// INT8 block-scaled GEMV Persistent (grid-stride, exactly 36 blocks)
-// Launches 36 blocks (one per SM). Each block atomically grabs next N-tile.
-// Eliminates wave quantization for any N.
-cudaError_t gemv_int8_persistent(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_t_int8,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
 // INT8 block-scaled GEMV Split-K (K split into K_splits, AtomicAdd reduction)
 // Caller MUST zero y_out before launch. Grid: (N/256, K_splits).
 // Targets large N with wave quantization (e.g., N=6144: 24 blocks < 36 SMs).
