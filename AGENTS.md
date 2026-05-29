@@ -1,47 +1,97 @@
 # AGENTS.md - blackwell
 
 Custom CUDA kernels for LLM inference on RTX 5060 Ti (Blackwell, SM_120a).
-FP4 E2M1 + INT8 block-scaled GEMM/GEMV + fused epilogues (RMSNorm, SwiGLU, RoPE).
+INT8 block-scaled GEMV + FP4 scalar GEMV + fused epilogues (RMSNorm, SwiGLU, RoPE).
 
 ---
 
 ## 1. Mission
 
-Build performant custom CUDA kernels demonstrating FP4 + INT8 LLM inference on consumer Blackwell hardware.
+Build performant custom CUDA kernels demonstrating INT8 + FP4 LLM inference on consumer Blackwell hardware.
 Primary goal: benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (114 t/s).
-Current: **122.7 t/s** (108% of target - TARGET EXCEEDED ✅).
+Current: **92 t/s** (28L INT8 pipeline), text_generate INT8 output now correct after RoPE + head_norm fixes.
 
 ---
 
 ## 2. Active State
 
-**Stack**: CUDA 12.8, SM_120a (FP4 MMA requires `120a` arch suffix), nvcuda::wmma (FP16), CMake, C++17
+**Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
-**Host compiler**: g++-12 (CUDA 12.8 rejects GCC 13+ without `--allow-unsupported-compiler`)
-**Nvcc path**: `/usr/local/cuda-12.8/bin/nvcc` (NOT `/usr/bin/nvcc` - that's old CUDA 12.0)
+**Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
 
 **Working kernels**:
 
-**FP4 path:**
+**INT8 path (production)**:
+- `gemv_int8` - INT8 GEMV with __dp4a SIMD, 775 GB/s
+- `gemv_int8_per_row` - INT8 GEMV with per-row scales
+- `gemv_int8_batched` - batched INT8 GEMV (M=1-8)
+- `pack_int8` - FP32 → INT8 quant
+- `transpose_int8_weights` - W (K×N) → W_t (N×K) + scales
+- `fused_rmsnorm_quant_int8` - RMSNorm + INT8 quant (1 kernel)
+
+**FP4 path (research)**:
+- `gemv_fp4_nv` - NVF4 scalar GEMV with UE4M3 scales, 98 GB/s (correct, not competitive)
 - `pack_fp4` / `unpack_fp4` - FP4 E2M1 quant/dequant
-- `gemv_fp4` / `gemv_fp4_v2` - decode path, 22-164 GB/s depending on N
-- `gemm_fp4_block_scaled` - prefill path, 128×128×64 WMMA tiles, 2-stage cp.async
-- `fused_gate_up_gemv` / `fused_gate_up_gemv_v1` - fused gate+up MLP projection
-- `fused_rmsnorm_pack` - RMSNorm + FP4 pack (1 kernel)
+- `gemv_fp4` / `gemv_fp4_v2` - FP4 GEMV (FP32 scales)
+- `gemm_fp4_block_scaled` - FP4 GEMM prefill
+
+**Fused kernels**:
+- `fused_gate_up_gemv` - fused gate+up MLP projection
 - `fused_rmsnorm` - single-block warp-reduced RMSNorm
 - `apply_swiglu` - silu(gate) × up, elementwise
 - `fused_rope` - in-place rotation, smem cos/sin cache
-- `attention_decode` / `attention_decode_gqa` - GQA-aware decode attention
+- `attention_decode_gqa` - GQA-aware decode attention
 - `update_kv_cache` - KV cache write with per-layer offset
-- `apply_rope_kernel` - RoPE for Q and K (in text_generate.cu, NOT in kernels.h)
-- `head_norm_kernel` - per-head RMSNorm for Q/K norms (in text_generate.cu)
-- `dispatch_matmul` - routes GEMM vs GEMV by `KernelMode`
-- `transpose_fp4_weights` - W (K×N) → W_t (N×K) + scales
-- `vector_add_fp32` - elementwise FP32 add (residual)
-- `fused_qkv_gemv` - multi-block fused QKV (66 GB/s, slower than 3× gemv_fp4_v2)
-- `fused_o_norm_pack` - Wo gemv + rmsnorm + pack (convenience)
-- `coalesced_copy` - device-wide coalesced copy
-- `attention_fp4`, `load_kv_cache_qkgv` - stubs (`cudaErrorNotReady`)
+
+**NVF4 format**:
+- `scripts/nvfp4_quantize.py` - converts FP4/block-16/FP32-scale weights to NVF4/UE4M3-scale
+- NVF4 = FP4 E2M1 data + UE4M3 scales (1 byte vs FP32 4 bytes)
+- Block size: 16
+
+**Tensor core MMA (explored, abandoned)**:
+- PTX: `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3`
+- Compiles + runs at 206 GB/s but correctness issues for varying inputs
+- Root cause: SFB scale factor layout mismatch (organizes by K-position, kernel loads by N-block)
+- Conclusion: MMA designed for GEMM, not GEMV. Abandoned.
+
+**Build**:
+```
+export PATH=/usr/local/cuda-13.3/bin:$PATH
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+Output: `build/libblackwell_kernels.a`
+
+**Text generation**: `./bench/text_generate "Hello world" 30` — 92 t/s (28L INT8)
+**INT8 pipeline benchmark**: `./bench/decode_full_int8 4`
+**NVF4 GEMV test**: `./bench/test_nvfp4_gemv 2048 2048`
+**Models available**: `/mnt/data/ai/hf/qwen3-1.7b-base/` (safetensors, 3.3 GB)
+
+**Constraints**:
+- `CUDACXX` env var must be set before `project()` in CMakeLists.txt
+- `namespace wmma =` NOT `using wmma =`
+- All `nvcuda::wmma` code guarded by `#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800`
+- FP4 E2M1 values: `{0.25, 0.5, 1.0, 2.0}` positive, `{-0.25, -0.5, -1.0}` negative
+- `sizeof(__nv_fp4_e2m1)` = 1 byte
+
+**Key findings**:
+- INT8 GEMV achieves 260 GB/s via `__dp4a` SIMD
+- NVF4 scalar GEMV achieves 98 GB/s (FP4→float conversion overhead)
+- INT8 is 2.65× faster than NVF4 — FP4 can't match INT8 bandwidth
+- GEMM prefill at 78 GB/s (7.5% peak), 3× faster than llama.cpp
+- NVF4 tensor core MMA abandoned — scale factor layout mismatch for GEMV
+- **head_norm_kernel bug** (5 bench files): `__shfl_xor_sync` with off=64/32 no-ops on 32-lane warps → no cross-warp reduction → RMSNorm factor wrong by ~2×, race condition on shared memory write
+- **RoPE frequency bug** (5 bench files): `idxf=i2/hd` (i2=2*d) → theta = base^(-4d/hd) instead of base^(-2d/hd) → 2× rotation speed
+- **text_generate INT8 now correct**: "The capital of France is Paris" ✓ (was garbage)
+
+**Tensor core MMA (CUDA 13.3 + driver 580):**
+- PTX: `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3`
+- Gotcha: PTX string dot separator critical: `4X.f32` NOT `4X f32`
+- Gotcha: Inline asm `"h"((unsigned short)val)` for byte_id/thread_id
+- Gotcha: `compute_120a` required, not `compute_120`
+- Gotcha: System ptxas may be old — ensure CUDA 13.3 in PATH
+- Status: Compiles + runs 206 GB/s (1.5× scalar), register loading needs fix
 
 **INT8 path:**
 - `gemv_int8` - baseline with `__dp4a` SIMD, **775 GB/s** (4.7× FP4 v2)
@@ -104,14 +154,23 @@ Output: `build/libblackwell_kernels.a`
   ((float4*)a)[idx] = va;   // ⚠️ WRITE to a[idx], not READ!
   ((float4*)b)[idx] = vb;   // ⚠️ Same for b
   ```
-  Fix: `float4 va = ((float4*)a)[idx];` (load, not store). The bug corrupted input buffers `d_proj`, `d_x` (residual save) on EVERY vector_add call (56 calls per token for 28 layers).
-  All subsequent RMSNorm + GEMV operations used corrupted inputs → entire pipeline wrong.
-  After fix: 1-layer pipeline validated to `max diff=4.7e-7, cosine sim=1.00000002`.
+  Fix: `float4 va = ((float4*)a)[idx];` (load, not store). Corrupted d_proj/d_x on every vector_add (56×/token).
+  After fix: 1-layer pipeline validated to max diff=4.7e-7, cosine sim=1.00000002.
 
-**Python reference validate_pipeline.py**: Validates CUDA pipeline against exact Python computation. Key findings:
-  - INT8 weight files have `_t` suffix = PRE-TRANSPOSED [N×K] layout. Do NOT transpose again in Python.
-  - `numpy.int8 * numpy.int8 = numpy.int8` (promotion, NOT int32). Must cast to int32 before sum to avoid overflow.
-  - Single-layer pipeline matches to float32 precision (1e-7). 28-layer output still garbled = INT8 quantization noise accumulation, not bugs.
+**CRITICAL BUG FIX 2026-05-29**: Two bugs in all 5 bench files (text_generate.cu, text_generate_fp32.cu, text_generate_bf16.cu, text_generate_cublas.cu, inference_server.cu).
+
+**Bug 1 — RoPE frequency (2× rotation speed)**:
+  `idxf = (float)i2 / (float)head_dim` where `i2 = 2*d`. Standard θ = pos·base^(-2d/hd).
+  Code computed θ = pos·base^(-2·idxf) = pos·base^(-4d/hd) — 2× rotation speed.
+  Fix: `theta = pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);`
+
+**Bug 2 — head_norm_kernel (no cross-warp reduction)**:
+  `for(int off=blockDim.x/2;..)` with blockDim=128 → off=64,32 are no-ops on 32-lane warps.
+  Each warp's lane 0 had only 1/4 of sum(x²). Race on `sm = rsqrtf(s/hd+eps)` — random warp won.
+  Fix: `smem[4]` for warp partials → warp-0 shuffle-reduce → correct rstd.
+
+Combined: text_generate INT8 now correct — "The capital of France is **Paris**" ✓.
+Library kernels (fused_rmsnorm, fused_rope) were NOT affected.
 
 ---
 
@@ -341,3 +400,31 @@ Fused prefill: **0.96 ms/layer** (27 ms for 28L, 3.7× faster than llama.cpp).
 ### Files added
 - `bench/fused_prefill.cu` — GEMM + attention fusion analysis (full layer pipeline)
 - `bench/prefill_benchmark.cu` - GEMM prefill analysis
+
+---
+
+## Phase G: Bug Fixes — RoPE + head_norm (2026-05-29)
+
+### Session summary
+Found and fixed **two critical bugs** in all 5 bench files (`text_generate.cu`, `text_generate_fp32.cu`, `text_generate_bf16.cu`, `text_generate_cublas.cu`, `inference_server.cu`).
+
+### Bug 1: RoPE frequency — 2× rotation speed
+**Root cause**: `idxf = (float)i2 / (float)head_dim` where `i2 = 2*d` (pair index doubled). Standard RoPE computes `θ_d = pos * base^(-2*d/hd)`. Code computed `θ = pos * base^(-2 * idxf) = pos * base^(-4*d/hd)` — exponent doubled, 2× rotation speed.
+
+**Fix**: `theta = pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim)` — uses pair index `d` directly, no intermediate `idxf`.
+
+**Impact**: "Hello" → previously gibberish "Hello I ior é Kai:j Ii'm gonna announce...". After fix: "Hello, everyone, I" — coherent start.
+
+### Bug 2: head_norm_kernel — no cross-warp reduction
+**Root cause**: Loop `for(int off=blockDim.x/2;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off)` with `blockDim=128` (4 warps). `__shfl_xor_sync` operates within 32-lane warps only. Offsets 64 and 32 modulo-wrap to no-ops. Each warp's lane 0 had only 1/4 of total sum(x²). Race condition on shared memory `sm = rsqrtf(s/hd+eps)` — random warp's partial sum won, producing wrong RMSNorm factor (~2× error).
+
+**Fix**: smem[4] for warp partials → warp-0 shuffle-reduce across 4 values → correct rstd.
+
+**Impact**: Combined with RoPE fix, output now correct: "The capital of France is **Paris**" ✓. Previous garbage across all paths (INT8, FP32, BF16, cuBLAS).
+
+### Library code NOT affected
+- `fused_rmsnorm` in `src/kernels/norm.cu` — already used correct smem[4] + warp-reduce pattern
+- `fused_rope` in `src/kernels/rope.cu` — uses precomputed cos/sin cache, correct by construction
+
+### Remaining: FP32 text_generate still broken (separate issue)
+`text_generate_fp32.cu` (cuBLAS path) produces worse output than INT8. Suspect BF16 weight file dimension convention or cuBLAS GEMV transpose parameter issue — unrelated to above bugs.

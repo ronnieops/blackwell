@@ -44,17 +44,23 @@ static void sgemv(cublasHandle_t h, float* y, const float* W,
 // Kernels
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
     int h=blockIdx.x; if(h>=nh) return;
-    float* d=data+h*hd; __shared__ float sm; float s=0; int lane=threadIdx.x;
-    for(int i=lane;i<hd;i+=blockDim.x) s+=d[i]*d[i];
-    for(int off=blockDim.x/2;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
-    if(lane==0) sm=rsqrtf(s/hd+eps); __syncthreads(); float is=sm;
-    for(int i=lane;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
+    float* d=data+h*hd;
+    __shared__ float wp[4];
+    float s=0; int tid=threadIdx.x;
+    for(int i=tid;i<hd;i+=blockDim.x) s+=d[i]*d[i];
+    for(int off=16;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
+    if((tid&31)==0) wp[tid>>5]=s; __syncthreads();
+    if(tid<4) s=wp[tid]; else s=0;
+    for(int off=2;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
+    if(tid==0) wp[0]=rsqrtf(s/hd+eps); __syncthreads();
+    float is=wp[0];
+    for(int i=tid;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
 }
 __global__ void apply_rope_kernel(float* data, int nh, int hd, int pos) {
     int h=blockIdx.x; int d=threadIdx.x;
     if(h>=nh||d>=hd/2) return;
-    int i2=d*2; float* p=data+h*hd+i2; float idxf=(float)i2/(float)hd;
-    const float rt=1000000.0f; float t=(float)pos*powf(rt,-2.0f*idxf);
+    int i2=d*2; float* p=data+h*hd+i2;
+    const float rt=1000000.0f; float t=(float)pos*powf(rt,-2.0f*(float)d/(float)hd);
     float c=cosf(t),s=sinf(t),x=p[0],y=p[1]; p[0]=x*c-y*s; p[1]=x*s+y*c;
 }
 // BF16→FP32 dequant kernel (for embedding lookup)

@@ -37,13 +37,20 @@ __global__ void absmax_scales_kernel(const float* in, float* sc, int n) {
 // Per-head RMSNorm for Q/K norms
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
     int h=blockIdx.x; if(h>=nh) return;
-    float* d=data+h*hd; __shared__ float sm; float s=0; int lane=threadIdx.x;
-    for(int i=lane;i<hd;i+=blockDim.x) s+=d[i]*d[i];
-    for(int off=blockDim.x/2;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
-    if(lane==0) sm=rsqrtf(s/hd+eps);
+    float* d=data+h*hd;
+    __shared__ float warp_partial[4];
+    float s=0;
+    int tid=threadIdx.x;
+    for(int i=tid;i<hd;i+=blockDim.x) s+=d[i]*d[i];
+    for(int off=16;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
+    if((tid&31)==0) warp_partial[tid>>5]=s;
     __syncthreads();
-    float is=sm;
-    for(int i=lane;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
+    if(tid<4) s=warp_partial[tid]; else s=0;
+    for(int off=2;off>0;off>>=1) s+=__shfl_xor_sync(0xffffffff,s,off);
+    if(tid==0) warp_partial[0]=rsqrtf(s/hd+eps);
+    __syncthreads();
+    float is=warp_partial[0];
+    for(int i=tid;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
 }
 
 // RoPE kernel: apply rotary position embeddings to Q and K
@@ -54,10 +61,10 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     if (h >= n_heads || d >= head_dim/2) return;
     int i2 = d * 2;
     float* pair = data + h * head_dim + i2;
-    float idxf = (float)i2 / (float)head_dim;
+    // Standard RoPE: theta_i = pos * base^(-2*i/d) for pair index i=0..hd/2-1
     // Qwen3-1.7B uses rope_theta=1000000 (config.json), not Llama default 10000
     const float rope_theta = 1000000.0f;
-    float theta = (float)pos * powf(rope_theta, -2.0f * idxf);
+    float theta = (float)pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);
     float c = cosf(theta), s = sinf(theta);
     float x = pair[0], y = pair[1];
     pair[0] = x * c - y * s;

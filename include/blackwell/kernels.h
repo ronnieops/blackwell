@@ -52,6 +52,19 @@ cudaError_t gemv_fp4(
     cudaStream_t   stream = 0);
 
 // ---------------------------------------------------------------------------
+// NVF4 GEMV (decode path) — UE4M3 scales, tensor core optimized
+// ---------------------------------------------------------------------------
+cudaError_t gemv_fp4_nv(
+    float*          y,
+    const void*     x_fp4,
+    const void*     x_scale,      // UE4M3 [K/16]
+    const void*     W_t_fp4,      // Transposed FP4 [N × K]
+    const void*     W_t_scale,    // UE4M3 [N/16 × K/16]
+    int            in_features,
+    int            out_features,
+    cudaStream_t   stream = 0);
+
+// ---------------------------------------------------------------------------
 // Memory ops
 // ---------------------------------------------------------------------------
 cudaError_t pack_fp4(

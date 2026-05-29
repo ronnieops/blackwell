@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.26)
+
+# ---------------------------------------------------------------------------
+# CUDA 13.3 for Blackwell (SM_120a) support — must be BEFORE project()
+# ---------------------------------------------------------------------------
+set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.3/bin/nvcc")
+set(CMAKE_CUDA_ARCHITECTURES 120a)
+
+# Ensure nvcc finds its own ptxas, not the system one
+set(ENV{PATH} "/usr/local/cuda-13.3/bin:$ENV{PATH}")
+
 project(blackwell_inference VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -6,29 +16,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# RTX 5060 Ti = compute_120a, sm_120a (120a enables FP4 block-scaled MMA)
-set(CMAKE_CUDA_ARCHITECTURES 120a)
-
-# ---------------------------------------------------------------------------
-# CUDA 12.8 for Blackwell (SM_120) support
-# ---------------------------------------------------------------------------
-# CMake always runs a host-compiler compile test to determine compiler ID.
-# CUDA 12.8 only supports GCC <= 14, but the system has GCC-13.3 which fails
-# the check.  We must use --allow-unsupported-compiler for the CMake ID test,
-# and set a supported host compiler (g++-12) for actual builds.
-# NOTE: CMakeDetermineCUDACompiler.cmake invokes nvcc -cccdin --compiler-bindir
-# <host> which is what we need to override.  Using CMAKE_CUDA_HOST_COMPILER
-# here does NOT help the CMake ID step (that happens before project() reads it).
-# Instead, add the override in CMAKE_CUDA_FLAGS so it applies to the ID probe.
-# ---------------------------------------------------------------------------
-set(CMAKE_CUDA_COMPILER "/usr/local/cuda-12.8/bin/nvcc")
-
 # Force CUDA 12.8 nvcc before ANY CMake detection runs.
 # CMakeDetermineCUDACompiler checks CUDACXX env var first, so this must be set
 # before project().  CMake also needs -allow-unsupported-compiler during its
 # CUDA compiler-ID probe (which uses the system g++-13; GCC-13 is technically
 # supported by CUDA 12.8 since the check is "< 14").
-set(ENV{CUDACXX} "/usr/local/cuda-12.8/bin/nvcc")
+set(ENV{CUDACXX} "/usr/local/cuda-13.3/bin/nvcc")
 
 # GCC-13.3 is technically supported by CUDA 12.8 (check is < 14).  This means
 # CMAKE_CUDA_FLAGS override via -cccdin is not strictly needed here, but
@@ -67,6 +60,7 @@ set(KERNEL_SOURCES
     src/kernels/gemv_v2.cu
     src/kernels/gemv_int8.cu
     src/kernels/gemv_bf16.cu
+    src/kernels/gemv_fp4_nv.cu
     src/kernels/fused_mlp.cu
 )
 
