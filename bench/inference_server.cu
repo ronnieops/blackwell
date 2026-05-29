@@ -402,9 +402,11 @@ int main(int argc, char** argv) {
         cudaStreamSynchronize(st);
         for(int s=0;s<SEQ;++s){
             for(int l=0;l<NL;++l){
-                // Batch RMSNorm+quant
-                die(blackwell::kernels::fused_rmsnorm_quant_int8(
-                    (int8_t*)d_xiM_f,d_xsM,d_xM,d_rn,H,eps,st),"norm");
+                // Batch RMSNorm+quant (per-seq — kernel processes H elements)
+                for(int m=0;m<M;++m){
+                    die(blackwell::kernels::fused_rmsnorm_quant_int8(
+                        (int8_t*)d_xiM_f+m*H,d_xsM+m*(H/16),d_xM+m*H,d_rn,H,eps,st),"norm");
+                }
                 // Batched Q,K,V
                 die(blackwell::kernels::gemv_int8_batched(d_QM,(int8_t*)d_xiM_f,d_xsM,
                     W[l].q.d,W[l].q.sc,H,QD,M,st),"q");
@@ -434,9 +436,11 @@ int main(int argc, char** argv) {
                     die(blackwell::kernels::vector_add_fp32(d_projM+m*H,d_projM+m*H,d_xM+m*H,H,st),"res1");
                     die(cudaMemcpyAsync(d_resM+m*H,d_projM+m*H,H*4,cudaMemcpyDeviceToDevice,st),"save_res");
                 }
-                // Batch MLP RMSNorm
-                die(blackwell::kernels::fused_rmsnorm_quant_int8(
-                    (int8_t*)d_xiM_f,d_xsM,d_projM,d_rn,H,eps,st),"norm2");
+                // Batch MLP RMSNorm (per-seq)
+                for(int m=0;m<M;++m){
+                    die(blackwell::kernels::fused_rmsnorm_quant_int8(
+                        (int8_t*)d_xiM_f+m*H,d_xsM+m*(H/16),d_projM+m*H,d_rn,H,eps,st),"norm2");
+                }
                 // Batched Gate + Up
                 die(blackwell::kernels::gemv_int8_batched(d_gateM,(int8_t*)d_xiM_f,d_xsM,
                     W[l].g.d,W[l].g.sc,H,ID,M,st),"gate");
