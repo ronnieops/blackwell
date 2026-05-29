@@ -112,7 +112,7 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 
 ## 7. Known Issues
 
-1. **Mode D prefill broken** — inference_server prefill mode: "rmsnorm illegal memory access". KV cache init layout bug, pre-dates current work.
+1. **Mode D prefill** — FIXED (6e775eb). GEMM B buffer OOB in synthetic prefill. Now runs: 68 t/s pipeline.
 2. **FP32 text_generate broken** — `text_generate_fp32.cu` produces worse output than INT8. Separate issue (BF16 weight file convention or cuBLAS transpose).
 3. **GEMM prefill correctness unverified** — no reference comparison. Timing-only validation.
 4. **7 stub functions unimplemented** — `attention_fp4`, `load_kv_cache_qkgv`, `capture_decode_graph`, `launch_decode_graph`, `destroy_decode_graph`, `shared_copy_async`, `async_pipeline_stage`.

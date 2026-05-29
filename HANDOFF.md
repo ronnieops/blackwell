@@ -62,7 +62,7 @@ INT8 CUDA Graph: **112%** of baseline ✅
 
 ## 5. Known Issues
 
-1. **Mode D prefill broken** — "rmsnorm illegal memory access". KV cache layout bug.
+1. **Mode D prefill** — FIXED (6e775eb). GEMM B buffer OOB in synthetic prefill. Now runs: 68 t/s full pipeline, 106 t/s decode.
 2. **FP32 text_generate broken** — cuBLAS path worse than INT8. Separate issue.
 3. **GEMM prefill correctness** — no reference comparison. Timing-only.
 4. **7 stub functions** — unimplemented (see AGENTS.md §7).
@@ -72,7 +72,6 @@ INT8 CUDA Graph: **112%** of baseline ✅
 ## 6. Pending Tasks
 
 ### Low priority
-- [ ] Fix Mode D prefill (KV cache layout bug)
 - [ ] Fix FP32 text_generate (cuBLAS path)
 - [ ] Verify GEMM prefill correctness against reference
 
@@ -115,7 +114,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 | INT8 CUDA Graph | ✅ 128 t/s |
 | text_generate output | ✅ "Paris" |
 | inference_server Modes A-C | ✅ |
-| inference_server Mode D | ❌ prefill broken |
+| inference_server Mode D | ✅ 68 t/s pipeline |
 | NVF4 scalar GEMV | ✅ cosine 0.999 |
 | NVF4 MMA | ❌ abandoned |
 
@@ -127,7 +126,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 |-------|-------|
 | updated_at | 2026-05-29 |
 | branch | master |
-| last_commit | `2251ad1` Phase G bug fixes |
+| last_commit | `6e775eb` Mode D prefill OOB fix |
 | repo_state | Clean (binaries untracked) |
 | library | 76 symbols |
 
@@ -139,7 +138,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 
 **Current state**: INT8 production-complete at 93.9 t/s (128 t/s CUDA Graph). NVF4 research complete — 98 GB/s scalar (can't match INT8's 260 GB/s).
 
-**What to do next**: Fix Mode D prefill, or proceed to next optimization. All Phase G bugs fixed and committed.
+**What to do next**: Proceed to next optimization or deploy. All modes pass. All Phase G bugs fixed.
 
 **Critical things to NOT do**:
 - Don't use `compute_120` — must be `compute_120a`
