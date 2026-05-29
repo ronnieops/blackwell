@@ -75,7 +75,7 @@ def write_weight(prefix, int8_data, scales, K_in, N_out):
     """Write .int8_t and .scale_t files with header.
 
     Scales are [N_out, K_in/16] — per-row scales for GEMV/GEMM kernels.
-    Header: [K_in, N_out, BLOCK, K_in/16, N_out]
+    Header: [K_in, N_out, BLOCK, K_in/16, N_out] (reader uses h[3]*h[4] for count)
     """
     num_K_blks = K_in // BLOCK
     header = np.array([K_in, N_out, BLOCK, num_K_blks, N_out], dtype=np.int32)
