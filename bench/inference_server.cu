@@ -256,6 +256,30 @@ int main(int argc, char** argv) {
         d_attn,d_Q,d_kc,d_vc,0,nqh,nkv,hd,MAXSEQ,st);
     cudaStreamSynchronize(st);
     
+    // Precompute cos/sin cache for all positions (for RoPE in CUDA Graph)
+    const int ROPE_PAIRS = hd / 2;  // 64 for head_dim=128
+    float *d_rope_cos, *d_rope_sin;
+    die(cudaMalloc(&d_rope_cos, MAXSEQ * ROPE_PAIRS * sizeof(float)), "rope_cos");
+    die(cudaMalloc(&d_rope_sin, MAXSEQ * ROPE_PAIRS * sizeof(float)), "rope_sin");
+    {
+        std::vector<float> h_cos(MAXSEQ * ROPE_PAIRS), h_sin(MAXSEQ * ROPE_PAIRS);
+        for (int pos = 0; pos < MAXSEQ; ++pos) {
+            for (int i = 0; i < ROPE_PAIRS; ++i) {
+                float theta = (float)pos * powf(1000000.0f, -2.0f * (float)i / (float)hd);
+                h_cos[pos * ROPE_PAIRS + i] = cosf(theta);
+                h_sin[pos * ROPE_PAIRS + i] = sinf(theta);
+            }
+        }
+        die(cudaMemcpy(d_rope_cos, h_cos.data(), MAXSEQ * ROPE_PAIRS * sizeof(float), cudaMemcpyHostToDevice), "rope_cos_cpy");
+        die(cudaMemcpy(d_rope_sin, h_sin.data(), MAXSEQ * ROPE_PAIRS * sizeof(float), cudaMemcpyHostToDevice), "rope_sin_cpy");
+    }
+    printf("  RoPE cache: %d positions × %d pairs (%.1f MB)\n", MAXSEQ, ROPE_PAIRS,
+           2.0f * MAXSEQ * ROPE_PAIRS * sizeof(float) / (1024*1024));
+    
+    // Get device pointer to seq_pos for CUDA Graph RoPE
+    int* d_seq_pos_ptr = nullptr;
+    die(blackwell::kernels::get_seq_pos_device_ptr(&d_seq_pos_ptr), "get_seq_pos");
+    
     blackwell::kernels::update_decode_seq_pos(0,st);
     cudaStreamSynchronize(st);
     
@@ -269,6 +293,9 @@ int main(int argc, char** argv) {
         blackwell::kernels::gemv_int8(d_V,(int8_t*)d_xi_f,d_xs,W[l].v.d,W[l].v.sc,H,KV,st);
         head_norm_kernel<<<nqh,128,0,st>>>(d_Q,W[l].qn,nqh,hd,eps);
         head_norm_kernel<<<nkv,128,0,st>>>(d_K,W[l].kn,nkv,hd,eps);
+        // RoPE: read seq_pos from device memory, index precomputed cache
+        blackwell::kernels::fused_rope_decode(d_Q,d_rope_cos,d_rope_sin,d_seq_pos_ptr,nqh,hd,MAXSEQ,st);
+        blackwell::kernels::fused_rope_decode(d_K,d_rope_cos,d_rope_sin,d_seq_pos_ptr,nkv,hd,MAXSEQ,st);
         blackwell::kernels::update_kv_cache(d_kc+kb,d_vc+kb,d_K,d_V,0,0,nkv,hd,MAXSEQ,st);
         blackwell::kernels::attention_decode_gqa(
             d_attn,d_Q,d_kc+kb,d_vc+kb,0,nqh,nkv,hd,MAXSEQ,st);

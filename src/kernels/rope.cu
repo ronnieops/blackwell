@@ -152,6 +152,49 @@ __global__ void rope_out_kernel(
     }
 }
 
+// ===========================================================================
+// Decode-specific RoPE kernel: reads seq_pos from device memory.
+// Used in CUDA Graph where seq_pos changes per replay via pinned memory.
+// cos/sin_cache layout: [MAXSEQ, head_dim/2] — precomputed for all positions.
+// ===========================================================================
+__launch_bounds__(64, 1)
+__global__ void rope_decode_kernel(
+    float* __restrict__ out_inplace,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    const int* __restrict__ seq_pos_ptr,
+    int num_heads, int head_dim, int max_seq_len) {
+
+    int hp_idx = blockIdx.x;
+    int h = hp_idx % num_heads;
+    if (hp_idx >= num_heads) return;
+
+    int seq_pos = *seq_pos_ptr;
+    int num_pairs = head_dim / 2;
+
+    __shared__ float smem_cos[64];
+    __shared__ float smem_sin[64];
+
+    int tid = threadIdx.x;
+    int cos_sin_idx = seq_pos * num_pairs + tid;
+
+    if (tid < num_pairs) {
+        smem_cos[tid] = cos_cache[cos_sin_idx];
+        smem_sin[tid] = sin_cache[cos_sin_idx];
+    }
+    __syncthreads();
+
+    // Each thread handles one rotation pair
+    if (tid < num_pairs) {
+        int i2 = tid * 2;
+        float* pair = out_inplace + h * head_dim + i2;
+        float x = pair[0], y = pair[1];
+        float c = smem_cos[tid], s = smem_sin[tid];
+        pair[0] = x * c - y * s;
+        pair[1] = x * s + y * c;
+    }
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -172,6 +215,25 @@ cudaError_t fused_rope(
     rope_kernel<<<grid, block, 0, stream>>>(
         out_inplace, cos_cache, sin_cache,
         heads, seq_len, head_dim, 1 /* batch_size=1 for sequence decode */);
+
+    return cudaPeekAtLastError();
+}
+
+// Decode-specific RoPE: reads seq_pos from device memory (CUDA Graph safe)
+cudaError_t fused_rope_decode(
+    float* out_inplace,
+    const float* cos_cache,
+    const float* sin_cache,
+    const int* seq_pos_ptr,
+    int heads, int head_dim, int max_seq_len,
+    cudaStream_t stream) {
+
+    dim3 grid(heads);
+    dim3 block((head_dim / 2 + 63) / 64 * 64);
+
+    rope_decode_kernel<<<grid, block, 0, stream>>>(
+        out_inplace, cos_cache, sin_cache, seq_pos_ptr,
+        heads, head_dim, max_seq_len);
 
     return cudaPeekAtLastError();
 }

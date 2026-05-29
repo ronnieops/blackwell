@@ -107,6 +107,17 @@ cudaError_t fused_rope(
     int             head_dim,
     cudaStream_t    stream = 0);
 
+// Decode-specific RoPE: reads seq_pos from device memory (CUDA Graph safe)
+cudaError_t fused_rope_decode(
+    float*          out_inplace,
+    const float*    cos_cache,
+    const float*    sin_cache,
+    const int*      seq_pos_ptr,
+    int             heads,
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
 cudaError_t apply_swiglu(
     float*          out,
     const float*    gate,
@@ -549,6 +560,12 @@ cudaError_t destroy_decode_graph(
 cudaError_t update_decode_seq_pos(
     int             seq_pos,
     cudaStream_t    stream = 0);
+
+// Get device pointer to seq_pos (for CUDA Graph RoPE)
+cudaError_t get_seq_pos_device_ptr(int** ptr);
+
+// Get pinned host pointer to seq_pos (for graph-safe host writes)
+cudaError_t get_seq_pos_host_ptr(int** ptr);
 
 } // namespace kernels
 } // namespace blackwell

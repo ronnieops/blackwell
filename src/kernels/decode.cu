@@ -320,6 +320,22 @@ cudaError_t update_decode_seq_pos(int seq_pos, cudaStream_t stream) {
     return cudaPeekAtLastError();
 }
 
+// Return device pointer to seq_pos (for CUDA Graph RoPE)
+cudaError_t get_seq_pos_device_ptr(int** ptr) {
+    cudaError_t e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    *ptr = d_seq_pos_global;
+    return cudaSuccess;
+}
+
+// Return pinned host pointer to seq_pos (for graph-safe host writes)
+cudaError_t get_seq_pos_host_ptr(int** ptr) {
+    cudaError_t e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    *ptr = h_seq_pos_pinned;
+    return cudaSuccess;
+}
+
 cudaError_t load_kv_cache_qkgv(
     float* Q, float* K_val, float* V_val,
     const float* k_cache, const float* v_cache,
