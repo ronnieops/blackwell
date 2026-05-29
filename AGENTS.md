@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (114 t/s).
-Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph, **60 t/s** Mode D prefill+decode. Text output correct.
+Current: **92.5 t/s** (28L INT8 pipeline), **99 t/s** with CUDA Graph + RoPE, **87 t/s** Mode D prefill+decode. Text output correct. **82 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph, **60 t/s
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 78 symbols in `build/libblackwell_kernels.a`
+**Library**: 82 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8` — INT8 GEMV, `__dp4a` SIMD, 775 GB/s (kernel), 260 GB/s (effective)
@@ -39,7 +39,6 @@ Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph, **60 t/s
 - `gemm_int8` — INT8 GEMM prefill (M>1, per-block scales, 4×4 tiling)
 
 **Deprecated / DO NOT USE**:
-- `gemv_int8_persistent` — 23× slower than baseline
 - `gemv_int8_from_fp4` — 2.8× slower than baseline
 - `phase_a.cu` — depends on unimplemented symbols (`gemv_fp4_splitk`, `gemv_fp4_v3`, `gemv_fp4_batched`)
 - NVF4 tensor core MMA — scale factor layout mismatch for GEMV
@@ -116,7 +115,7 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 1. **Mode D prefill** — FIXED (6e775eb). GEMM B buffer OOB in synthetic prefill. Now runs: 68 t/s pipeline.
 2. **FP32 text_generate broken** — `text_generate_fp32.cu` produces worse output than INT8. Separate issue (BF16 weight file convention or cuBLAS transpose).
 3. **GEMM prefill correctness unverified** — no reference comparison. Timing-only validation.
-4. **7 stub functions unimplemented** — `attention_fp4`, `load_kv_cache_qkgv`, `capture_decode_graph`, `launch_decode_graph`, `destroy_decode_graph`, `shared_copy_async`, `async_pipeline_stage`.
+4. ~~**7 stub functions unimplemented**~~ — ALL IMPLEMENTED (2026-05-29). `attention_fp4`, `load_kv_cache_qkgv`, `capture_decode_graph`, `launch_decode_graph`, `destroy_decode_graph`, `shared_copy_async`, `async_pipeline_stage`, `run_prefill_layer`.
 
 ---
 
