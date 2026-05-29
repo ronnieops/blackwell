@@ -489,47 +489,21 @@ int main(int argc, char** argv) {
     for(int i=0;i<nqh*PP*hd;++i){cos_h[i]=cosf(i*0.01f);sin_h[i]=sinf(i*0.01f);}
     cudaMemcpyAsync(d_cos,cos_h.data(),nqh*PP*hd*4,cudaMemcpyHostToDevice,st);
     cudaMemcpyAsync(d_sin,sin_h.data(),nqh*PP*hd*4,cudaMemcpyHostToDevice,st);
+    // Prefill input: FP32 synthetic data
     std::vector<float> xP_h(PP*H);
     for(int i=0;i<PP*H;++i) xP_h[i]=((i*31+7)%127-63)*0.01f;
     cudaMemcpy(d_xP,xP_h.data(),PP*H*4,cudaMemcpyHostToDevice);
 
     cudaMemset(d_kc,0,NL*nkv*MAXSEQ*hd*4); cudaMemset(d_vc,0,NL*nkv*MAXSEQ*hd*4);
 
-    // Synthetic prefill weights (INT8 bytes treated as FP4 for dispatch_matmul Prefill mode)
-    // Reuse d_xi_f buffer for prefill RMSNorm temp since it's H*4 = same as PP*H
-    // For GEMMs, dispatch_matmul takes A, B, A_scale, B_scale as ptrs.
-    // Need proper INT8 data. Use d_xP as-is (it's FP32).
-    // dispatch_matmul Prefill mode calls gemm_fp4_block_scaled which reads 1 byte per element.
-    // Pass FP32 bytes as FP4 — NOT correct but benchmarks kernel.
-    // For correct prefill we'd need FP4 weights. For now, use synthetic data like existing benchmarks.
-    // Actually, use d_xP FP32 bytes directly. dispatch_matmul reads as FP4.
-    // This gives garbage output but benchmarks kernel launch + memory.
-
-    // Simpler approach: generate proper INT8 synthetic data for prefill GEMM inputs
-    std::vector<int8_t> syn_i8(PP*H);
-    for(int i=0;i<PP*H;++i) syn_i8[i]=((i*17+13)%127)-64;
-    cudaMemcpy(d_xP,syn_i8.data(),PP*H,cudaMemcpyHostToDevice);
-    // Scales: all 1/127
-    std::vector<float> syn_sc(PP*H/16,1.f/127.f);
-    cudaMemcpy(d_rP,syn_sc.data(),PP*(H/16)*4,cudaMemcpyHostToDevice);
-    // Prefill layer weights (same INT8 data as inputs)
-    int8_t *d_sW; float* d_sWs;
-    cudaMalloc(&d_sW,12*1024*1024); // 12MB synthetic weight buffer (enough for 2048x6144)
-    cudaMemcpy(d_sW,syn_i8.data(),PP*H,cudaMemcpyHostToDevice); // reuse
-    cudaMalloc(&d_sWs,PP*(H/16)*4);
-    cudaMemcpy(d_sWs,syn_sc.data(),PP*(H/16)*4,cudaMemcpyHostToDevice);
-
     t0=Clock::now();
     for(int l=0;l<NL;++l){
-        // RMSNorm (synthetic — uses d_xi_f as temp)
+        // RMSNorm
         die(blackwell::kernels::fused_rmsnorm(d_rP,(float*)d_xP,d_rn,H,eps,st),"rn");
-        // QKV — Prefill mode (synthetic INT8 data)
-        die(blackwell::kernels::dispatch_matmul(d_Qf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
-            PP,QD,H,blackwell::kernels::KernelMode::Prefill,st),"q");
-        die(blackwell::kernels::dispatch_matmul(d_Kf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
-            PP,KV,H,blackwell::kernels::KernelMode::Prefill,st),"k");
-        die(blackwell::kernels::dispatch_matmul(d_Vf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
-            PP,KV,H,blackwell::kernels::KernelMode::Prefill,st),"v");
+        // QKV — INT8 GEMM (real weights)
+        die(blackwell::kernels::gemm_int8(d_Qf,d_rP,W[l].q.d,W[l].q.sc,PP,QD,H,st),"q");
+        die(blackwell::kernels::gemm_int8(d_Kf,d_rP,W[l].k.d,W[l].k.sc,PP,KV,H,st),"k");
+        die(blackwell::kernels::gemm_int8(d_Vf,d_rP,W[l].v.d,W[l].v.sc,PP,KV,H,st),"v");
         // RoPE
         die(blackwell::kernels::fused_rope(d_Qf,d_cos,d_sin,nqh,PP,hd,st),"rope_q");
         die(blackwell::kernels::fused_rope(d_Kf,d_cos,d_sin,nkv,PP,hd,st),"rope_k");
@@ -540,29 +514,25 @@ int main(int argc, char** argv) {
         // Flash attention
         die(blackwell::kernels::attention_prefill(d_Att,d_Qt,d_Kt,d_Vt,
             PP,hd,nqh,nkv,qpg,sc_at,st),"attn");
-        // Wo GEMM (Prefill mode)
-        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_Att,(void*)d_sW,d_rP,d_sWs,
-            PP,H,QD,blackwell::kernels::KernelMode::Prefill,st),"wo");
+        // Wo GEMM — INT8 GEMM (real weights)
+        die(blackwell::kernels::gemm_int8(d_Of,d_Att,W[l].o.d,W[l].o.sc,PP,H,QD,st),"wo");
         // Residual
         die(blackwell::kernels::vector_add_fp32(d_Of,d_Of,(float*)d_xP,PP*H,st),"res1");
         die(cudaMemcpyAsync(d_rf,d_Of,PP*H*4,cudaMemcpyDeviceToDevice,st),"rf");
         // MLP RMSNorm
         die(blackwell::kernels::fused_rmsnorm(d_rP,d_Of,d_rn,H,eps,st),"rn2");
-        // Gate+Up
-        // Gate+Up — use d_sW (12 MB) for B to avoid OOB (B is [K×N]=[H×ID]=[2048×6144] FP4 = 6.3 MB, d_rP only 1 MB)
-        die(blackwell::kernels::dispatch_matmul(d_gf,(void*)d_rP,(void*)d_sW,d_rP,d_sWs,
-            PP,ID,H,blackwell::kernels::KernelMode::Prefill,st),"gate");
-        die(blackwell::kernels::dispatch_matmul(d_uf,(void*)d_rP,(void*)d_sW,d_rP,d_sWs,
-            PP,ID,H,blackwell::kernels::KernelMode::Prefill,st),"up");
+        // Gate+Up — INT8 GEMM (real weights)
+        die(blackwell::kernels::gemm_int8(d_gf,d_rP,W[l].g.d,W[l].g.sc,PP,ID,H,st),"gate");
+        die(blackwell::kernels::gemm_int8(d_uf,d_rP,W[l].u.d,W[l].u.sc,PP,ID,H,st),"up");
+        // SwiGLU
         die(blackwell::kernels::apply_swiglu(d_mlf,d_gf,d_uf,PP*ID,st),"swiglu");
-        // Down — use d_sW (12 MB) for B to avoid OOB (B is [K×N]=[6144×2048] FP4 = 6.3 MB, d_mlf only 3 MB)
-        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_mlf,(void*)d_sW,d_rP,d_sWs,
-            PP,H,ID,blackwell::kernels::KernelMode::Prefill,st),"down");
+        // Down — INT8 GEMM (real weights)
+        die(blackwell::kernels::gemm_int8(d_Of,d_mlf,W[l].d.d,W[l].d.sc,PP,H,ID,st),"down");
         // Residual
         die(blackwell::kernels::vector_add_fp32((float*)d_xP,d_Of,d_rf,PP*H,st),"res2");
     }
     // Copy last token → decode input
-    cudaMemcpy(d_x,d_xP+(PP-1)*H/4,H*4,cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_x,d_xP+(PP-1)*H,H*4,cudaMemcpyDeviceToDevice);
     // Init KV cache from prefill K/V: contiguous [PP×nkv×hd] → strided [nkv×MAXSEQ×hd]
     for(int t=0;t<PP;++t){
         for(int h=0;h<nkv;++h){
@@ -592,7 +562,6 @@ int main(int argc, char** argv) {
     printf("  Decode: %.0f us/tok  =>  %.0f t/s (%dL)\n",
         ms_dec*1000/N,1000.0*N/ms_dec,NL);
 
-    cudaFree(d_sW); cudaFree(d_sWs);
     cudaFree(d_xP);cudaFree(d_rP);cudaFree(d_Qf);cudaFree(d_Kf);
     cudaFree(d_Vf);cudaFree(d_Att);cudaFree(d_Of);cudaFree(d_gf);
     cudaFree(d_uf);cudaFree(d_mlf);cudaFree(d_rf);

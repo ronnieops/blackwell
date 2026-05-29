@@ -789,5 +789,108 @@ cudaError_t gemv_int8_batched(
     }
     return cudaPeekAtLastError();
 }
+
+// ===========================================================================
+// INT8 GEMM — C[M×N] = A[M×K] × B^T[N×K]
+// A is FP32 activations, B is INT8 weights [N×K] with scales [N × K/16]
+// Uses 4×4 register tiling with vectorized loads.
+// ===========================================================================
+__launch_bounds__(256, 1)
+__global__ void gemm_int8_kernel(
+    float* __restrict__ C,          // [M×N]
+    const float* __restrict__ A,    // [M×K] FP32
+    const int8_t* __restrict__ B_i8, // [N×K] INT8 transposed
+    const float* __restrict__ B_sc,  // [N × K/16] scales
+    int M, int N, int K)
+{
+    constexpr int TILE_M = 4;
+    constexpr int TILE_N = 4;
+    constexpr int THREADS_M = 16;
+    constexpr int THREADS_N = 16;
+    constexpr int BSIZE = 16;  // K-block size
+
+    int bm = blockIdx.y * THREADS_M * TILE_M;
+    int bn = blockIdx.x * THREADS_N * TILE_N;
+    int tm = threadIdx.y;
+    int tn = threadIdx.x;
+    int m = bm + tm * TILE_M;
+    int n = bn + tn * TILE_N;
+    int num_K_blks = K / BSIZE;
+
+    float acc[TILE_M][TILE_N] = {};
+
+    for (int kb = 0; kb < num_K_blks; ++kb) {
+        float w_sc[TILE_N];
+        #pragma unroll
+        for (int j = 0; j < TILE_N; ++j) {
+            int nj = n + j;
+            w_sc[j] = (nj < N) ? B_sc[nj * num_K_blks + kb] : 0.0f;
+        }
+
+        float a_vals[TILE_M][BSIZE];
+        #pragma unroll
+        for (int i = 0; i < TILE_M; ++i) {
+            int mi = m + i;
+            if (mi < M) {
+                const float* a_ptr = &A[mi * K + kb * BSIZE];
+                *reinterpret_cast<float4*>(&a_vals[i][0]) = *reinterpret_cast<const float4*>(a_ptr);
+                *reinterpret_cast<float4*>(&a_vals[i][4]) = *reinterpret_cast<const float4*>(a_ptr + 4);
+                *reinterpret_cast<float4*>(&a_vals[i][8]) = *reinterpret_cast<const float4*>(a_ptr + 8);
+                *reinterpret_cast<float4*>(&a_vals[i][12]) = *reinterpret_cast<const float4*>(a_ptr + 12);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < TILE_N; ++j) {
+            int nj = n + j;
+            if (nj < N) {
+                const int8_t* w_ptr = &B_i8[nj * K + kb * BSIZE];
+                alignas(16) int8_t w_buf[BSIZE];
+                *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+
+                #pragma unroll
+                for (int i = 0; i < TILE_M; ++i) {
+                    float block_sum = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < BSIZE; ++k) {
+                        block_sum += (float)w_buf[k] * a_vals[i][k];
+                    }
+                    acc[i][j] += block_sum * w_sc[j];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TILE_M; ++i) {
+        int mi = m + i;
+        if (mi < M) {
+            #pragma unroll
+            for (int j = 0; j < TILE_N; ++j) {
+                int nj = n + j;
+                if (nj < N) C[mi * N + nj] = acc[i][j];
+            }
+        }
+    }
+}
+
+cudaError_t gemm_int8(
+    float*          C,              // [M×N] output
+    const float*    A,              // [M×K] FP32 activations
+    const void*     B_int8,         // [N×K] INT8 transposed weights
+    const float*    B_scale,        // [N × K/16] weight scales
+    int             M, int N, int K,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0) return cudaErrorInvalidValue;
+    constexpr int TILE = 4;
+    constexpr int THREADS = 16;
+    dim3 block(THREADS, THREADS);
+    dim3 grid((N + THREADS * TILE - 1) / (THREADS * TILE),
+              (M + THREADS * TILE - 1) / (THREADS * TILE));
+    gemm_int8_kernel<<<grid, block, 0, stream>>>(
+        C, A, static_cast<const int8_t*>(B_int8), B_scale, M, N, K);
+    return cudaPeekAtLastError();
+}
 } // namespace kernels
 } // namespace blackwell

@@ -472,6 +472,17 @@ cudaError_t gemv_int8(
     int             N,
     cudaStream_t    stream = 0);
 
+// INT8 GEMM: C[M×N] = A[M×K] × B^T[N×K]
+// A is FP32 activations, B is INT8 weights [N×K] with scales [N × K/16]
+// Uses 4×4 register tiling. K must be multiple of 16.
+cudaError_t gemm_int8(
+    float*          C,              // [M×N] output
+    const float*    A,              // [M×K] FP32 activations
+    const void*     B_int8,         // [N×K] INT8 transposed weights
+    const float*    B_scale,        // [N × K/16] weight scales
+    int             M, int N, int K,
+    cudaStream_t    stream = 0);
+
 cudaError_t transpose_fp4_weights(
     void*           dst,          // [N × K] FP4 transposed
     float*          dst_scale,    // [N/16 × K/16] transposed
