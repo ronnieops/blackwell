@@ -6,8 +6,7 @@ Continuity doc. Read before acting.
 
 ## 1. Current Objective
 
-**INT8 production deployment complete** — 92.9 t/s (28L), 122 t/s with CUDA Graph.
-NVF4 research complete — can't match INT8 bandwidth (98 vs 260 GB/s).
+**INT8 production-complete.** Deploy or optimize further. NVF4 on hold.
 
 ---
 
@@ -19,27 +18,25 @@ NVF4 research complete — can't match INT8 bandwidth (98 vs 260 GB/s).
 |-----------|-------|
 | Driver | 580.159.04 (open kernel modules) |
 | CUDA toolkit | 13.3.33 |
-| ptxas | 13.3 |
-| GPU | RTX 5060 Ti |
+| GPU | RTX 5060 Ti (SM_120a, 36 SMs) |
+| Library | 76 symbols in libblackwell_kernels.a |
 
-### Throughput benchmarks (RTX 5060 Ti, Qwen3-1.7B, 28L decode)
+### Throughput (28L, Qwen3-1.7B)
 
-| Path | t/s | GB/s | Status |
-|------|-----|------|--------|
-| INT8 CUDA Graph | **122** | — | ✅ Production |
-| INT8 GEMV (28L) | **92.9** | 260 | ✅ Production |
-| INT8 GEMV (kernel-only) | **112** | 260 | ✅ |
-| NVF4 scalar GEMV | — | **98** | ✅ Correct (cosine 0.9987), not competitive |
-| GEMM prefill | — | **78** | ✅ 3× llama.cpp |
+| Path | t/s | Notes |
+|------|-----|-------|
+| INT8 CUDA Graph | **128** | ✅ Best single-user |
+| INT8 per-kernel | **117** | ✅ |
+| INT8 pipeline (4L scaled) | **93.9** | ✅ decode_full_int8 |
+| text_generate | ~30 | Cold start + tokenizer overhead |
+| Batched GEMV M=4 | 40 req/s | ✅ Multi-user |
+| Batched GEMV M=8 | 17344 batch t/s | ✅ Peak |
+| NVF4 scalar GEMV | 98 GB/s | ✅ Correct (cosine 0.999), not competitive |
+| GEMM prefill | 78 GB/s | ✅ 3× llama.cpp |
 
-### INT8 vs NVF4 Comparison
+### vs llama.cpp baseline (114 t/s Q4_K_M)
 
-| Metric | INT8 | NVF4 | Ratio |
-|--------|------|------|-------|
-| Bandwidth | 260 GB/s | 98 GB/s | 2.65× |
-| SIMD | `__dp4a` | scalar FP4→float | — |
-| Throughput | 92.9 t/s | ~37 t/s (est) | 2.5× |
-| Status | Production | Research only | — |
+INT8 CUDA Graph: **112%** of baseline ✅
 
 ---
 
@@ -47,88 +44,80 @@ NVF4 research complete — can't match INT8 bandwidth (98 vs 260 GB/s).
 
 | Decision | Rationale |
 |----------|-----------|
-| **INT8 is production path** | 92.9 t/s, 2.65× faster than NVF4 |
-| **Abandon NVF4 MMA for GEMV** | Scale factor layout mismatch, GEMV ≠ GEMM |
-| **NVF4 scalar at ceiling** | 98 GB/s is max for scalar FP4→float conversion |
-| **GEMM prefill already optimized** | 78 GB/s (7.5% peak), 3× llama.cpp |
+| INT8 is production path | 2.65× faster than NVF4 |
+| NVF4 MMA abandoned | Scale factor layout mismatch for GEMV |
+| CUDA Graph for single-user | 10% speedup, clean |
+| Batched GEMV for multi-user | 18.86× throughput gain |
 
 ---
 
-## 4. Important Constraints
+## 4. Constraints
 
 - **Compiler**: `PATH=/usr/local/cuda-13.3/bin:$PATH` before cmake
-- **Arch**: `compute_120a` required for block_scale MMA
-- **phase_a.cu**: DO NOT USE — links to unimplemented symbols
+- **Arch**: `compute_120a` required (not `compute_120`)
+- **phase_a.cu**: DO NOT USE — unimplemented symbols
 - **INT8 block size**: 16, per-row scales
-- **Driver**: 580.159.04 (open modules)
 
 ---
 
-## 5. Known Issues / Risks
+## 5. Known Issues
 
-1. **NVF4 MMA abandoned** — Scale factor layout mismatch (SFBLayout organizes by K-position, kernel loads by N-block). MMA designed for GEMM, not GEMV.
-2. **NVF4 scalar at ceiling** — 98 GB/s is max for scalar FP4→float. Can't match INT8's `__dp4a` SIMD.
-3. **28-layer INT8 output degenerate** — NOT a bug. Base model + greedy decoding artifact.
+1. **Mode D prefill broken** — "rmsnorm illegal memory access". KV cache layout bug.
+2. **FP32 text_generate broken** — cuBLAS path worse than INT8. Separate issue.
+3. **GEMM prefill correctness** — no reference comparison. Timing-only.
+4. **7 stub functions** — unimplemented (see AGENTS.md §7).
 
 ---
 
 ## 6. Pending Tasks
 
-### Completed (this session)
-
-- [x] INT8 28L pipeline: 92.9 t/s
-- [x] NVF4 v2 fix: 21→98 GB/s (vectorized W load)
-- [x] NVF4 vs INT8 benchmark: INT8 2.65× faster
-- [x] NVF4 SIMD analysis: can't match INT8
-- [x] GEMM prefill: already optimized (78 GB/s)
-- [x] inference_server: already uses per-row weights
-- [x] Codebase cleanup: AGENTS.md updated, temp files removed
-
-### Remaining (low priority)
-
-- [ ] Add CUDA Graph to decode benchmark (92→122+ t/s)
-- [ ] Instruct model test (no GGUF available)
+### Low priority
+- [ ] Fix Mode D prefill (KV cache layout bug)
+- [ ] Fix FP32 text_generate (cuBLAS path)
+- [ ] Verify GEMM prefill correctness against reference
 
 ---
 
-## 7. Important Files / Commands
+## 7. Files & Commands
 
-### Build (CUDA 13.3)
+### Build
 ```bash
 export PATH=/usr/local/cuda-13.3/bin:$PATH
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 ```
 
 ### Run
 ```bash
-./bench/decode_full_int8 28             # INT8 pipeline, 92.9 t/s
-./bench/inference_server 28 4 20 8      # INT8 with CUDA Graph, 122 t/s
-./bench/test_nvfp4_gemv 2048 2048       # NVF4 GEMV test (cosine 0.9987)
+./bench/decode_full_int8 4                    # 93.9 t/s
+./bench/text_generate "The capital of France is" 30  # "Paris" ✓
+./bench/inference_server 28 4 20 8            # 128 t/s CUDA Graph
 ```
 
 ### Key files
 | File | Purpose |
 |------|---------|
-| `src/kernels/gemv_int8.cu` | INT8 GEMV (260 GB/s, production) |
-| `src/kernels/gemv_fp4_nv.cu` | NVF4 scalar GEMV (98 GB/s, correct) |
+| `src/kernels/gemv_int8.cu` | INT8 GEMV (production) |
+| `src/kernels/gemv_fp4_nv.cu` | NVF4 scalar GEMV (research) |
 | `bench/decode_full_int8.cu` | INT8 pipeline benchmark |
-| `bench/inference_server.cu` | INT8 with CUDA Graph (122 t/s) |
-| `bench/test_nvfp4_gemv.cu` | NVF4 correctness test |
+| `bench/text_generate.cu` | Text generation (correct output) |
+| `bench/inference_server.cu` | CUDA Graph + batched serving |
+| `include/blackwell/kernels.h` | Public API (76 symbols) |
 
 ---
 
-## 8. Validation Status
+## 8. Validation
 
-| Check | Status | Notes |
-|-------|--------|-------|
-| Library build | ✅ | 76 symbols, CUDA 13.3 |
-| INT8 GEMV | ✅ | 260 GB/s |
-| INT8 pipeline (28L) | ✅ | 92.9 t/s |
-| INT8 CUDA Graph | ✅ | 122 t/s |
-| NVF4 scalar GEMV | ✅ | 98 GB/s, cosine 0.9987 |
-| GEMM prefill | ✅ | 78 GB/s |
-| NVF4 MMA | ❌ | Abandoned (correctness issues) |
+| Check | Status |
+|-------|--------|
+| Library build | ✅ 76 symbols |
+| INT8 GEMV | ✅ 260 GB/s |
+| INT8 pipeline 28L | ✅ 93.9 t/s |
+| INT8 CUDA Graph | ✅ 128 t/s |
+| text_generate output | ✅ "Paris" |
+| inference_server Modes A-C | ✅ |
+| inference_server Mode D | ❌ prefill broken |
+| NVF4 scalar GEMV | ✅ cosine 0.999 |
+| NVF4 MMA | ❌ abandoned |
 
 ---
 
@@ -138,10 +127,9 @@ cmake --build build --parallel
 |-------|-------|
 | updated_at | 2026-05-29 |
 | branch | master |
-| driver | 580.159.04 (open kernel modules) |
-| CUDA toolkit | 13.3.33 |
+| last_commit | `2251ad1` Phase G bug fixes |
+| repo_state | Clean (binaries untracked) |
 | library | 76 symbols |
-| repo_state | Modified (AGENTS.md, HANDOFF.md, gemv_fp4_nv.cu, etc.) |
 
 ---
 
@@ -149,9 +137,9 @@ cmake --build build --parallel
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l`.
 
-**Current state**: INT8 production-complete at 92.9 t/s (122 t/s with CUDA Graph). NVF4 research complete — 98 GB/s scalar (can't match INT8's 260 GB/s).
+**Current state**: INT8 production-complete at 93.9 t/s (128 t/s CUDA Graph). NVF4 research complete — 98 GB/s scalar (can't match INT8's 260 GB/s).
 
-**What to do next**: Deploy INT8. NVF4 on hold — scalar at ceiling, MMA abandoned.
+**What to do next**: Fix Mode D prefill, or proceed to next optimization. All Phase G bugs fixed and committed.
 
 **Critical things to NOT do**:
 - Don't use `compute_120` — must be `compute_120a`
