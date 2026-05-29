@@ -524,11 +524,11 @@ int main(int argc, char** argv) {
         // RMSNorm (synthetic — uses d_xi_f as temp)
         die(blackwell::kernels::fused_rmsnorm(d_rP,(float*)d_xP,d_rn,H,eps,st),"rn");
         // QKV — Prefill mode (synthetic INT8 data)
-        die(blackwell::kernels::dispatch_matmul(d_Qf,(void*)d_xP,(void*)d_xP,d_rP,d_rP,
+        die(blackwell::kernels::dispatch_matmul(d_Qf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
             PP,QD,H,blackwell::kernels::KernelMode::Prefill,st),"q");
-        die(blackwell::kernels::dispatch_matmul(d_Kf,(void*)d_xP,(void*)d_xP,d_rP,d_rP,
+        die(blackwell::kernels::dispatch_matmul(d_Kf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
             PP,KV,H,blackwell::kernels::KernelMode::Prefill,st),"k");
-        die(blackwell::kernels::dispatch_matmul(d_Vf,(void*)d_xP,(void*)d_xP,d_rP,d_rP,
+        die(blackwell::kernels::dispatch_matmul(d_Vf,(void*)d_xP,(void*)d_sW,d_rP,d_sWs,
             PP,KV,H,blackwell::kernels::KernelMode::Prefill,st),"v");
         // RoPE
         die(blackwell::kernels::fused_rope(d_Qf,d_cos,d_sin,nqh,PP,hd,st),"rope_q");
@@ -541,7 +541,7 @@ int main(int argc, char** argv) {
         die(blackwell::kernels::attention_prefill(d_Att,d_Qt,d_Kt,d_Vt,
             PP,hd,nqh,nkv,qpg,sc_at,st),"attn");
         // Wo GEMM (Prefill mode)
-        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_Att,(void*)d_Att,d_rP,d_rP,
+        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_Att,(void*)d_sW,d_rP,d_sWs,
             PP,H,QD,blackwell::kernels::KernelMode::Prefill,st),"wo");
         // Residual
         die(blackwell::kernels::vector_add_fp32(d_Of,d_Of,(float*)d_xP,PP*H,st),"res1");
@@ -549,13 +549,14 @@ int main(int argc, char** argv) {
         // MLP RMSNorm
         die(blackwell::kernels::fused_rmsnorm(d_rP,d_Of,d_rn,H,eps,st),"rn2");
         // Gate+Up
-        die(blackwell::kernels::dispatch_matmul(d_gf,(void*)d_rP,(void*)d_rP,d_rP,d_rP,
+        // Gate+Up — use d_sW (12 MB) for B to avoid OOB (B is [K×N]=[H×ID]=[2048×6144] FP4 = 6.3 MB, d_rP only 1 MB)
+        die(blackwell::kernels::dispatch_matmul(d_gf,(void*)d_rP,(void*)d_sW,d_rP,d_sWs,
             PP,ID,H,blackwell::kernels::KernelMode::Prefill,st),"gate");
-        die(blackwell::kernels::dispatch_matmul(d_uf,(void*)d_rP,(void*)d_rP,d_rP,d_rP,
+        die(blackwell::kernels::dispatch_matmul(d_uf,(void*)d_rP,(void*)d_sW,d_rP,d_sWs,
             PP,ID,H,blackwell::kernels::KernelMode::Prefill,st),"up");
         die(blackwell::kernels::apply_swiglu(d_mlf,d_gf,d_uf,PP*ID,st),"swiglu");
-        // Down
-        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_mlf,(void*)d_mlf,d_rP,d_rP,
+        // Down — use d_sW (12 MB) for B to avoid OOB (B is [K×N]=[6144×2048] FP4 = 6.3 MB, d_mlf only 3 MB)
+        die(blackwell::kernels::dispatch_matmul(d_Of,(void*)d_mlf,(void*)d_sW,d_rP,d_sWs,
             PP,H,ID,blackwell::kernels::KernelMode::Prefill,st),"down");
         // Residual
         die(blackwell::kernels::vector_add_fp32((float*)d_xP,d_Of,d_rf,PP*H,st),"res2");
