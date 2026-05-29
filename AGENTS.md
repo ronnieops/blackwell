@@ -16,7 +16,7 @@ Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph. Text out
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 76 symbols in `build/libblackwell_kernels.a`
+**Library**: 78 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8` — INT8 GEMV, `__dp4a` SIMD, 775 GB/s (kernel), 260 GB/s (effective)
@@ -36,6 +36,7 @@ Current: **93.9 t/s** (28L INT8 pipeline), **128 t/s** with CUDA Graph. Text out
 - `gemv_fp4_nv` — NVF4 scalar GEMV, UE4M3 scales, 98 GB/s (correct, not competitive)
 - `pack_fp4` / `unpack_fp4` — FP4 E2M1 quant/dequant
 - `gemm_fp4_block_scaled` — FP4 GEMM prefill
+- `gemm_int8` — INT8 GEMM prefill (M>1, per-block scales, 4×4 tiling)
 
 **Deprecated / DO NOT USE**:
 - `gemv_int8_persistent` — 23× slower than baseline

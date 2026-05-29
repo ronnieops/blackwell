@@ -19,7 +19,7 @@ Continuity doc. Read before acting.
 | Driver | 580.159.04 (open kernel modules) |
 | CUDA toolkit | 13.3.33 |
 | GPU | RTX 5060 Ti (SM_120a, 36 SMs) |
-| Library | 76 symbols in libblackwell_kernels.a |
+| Library | 78 symbols in libblackwell_kernels.a |
 
 ### Throughput (28L, Qwen3-1.7B)
 
@@ -62,7 +62,7 @@ INT8 CUDA Graph: **112%** of baseline ✅
 
 ## 5. Known Issues
 
-1. **Mode D prefill** — FIXED (6e775eb). GEMM B buffer OOB in synthetic prefill. Now runs: 68 t/s full pipeline, 106 t/s decode.
+1. **Mode D prefill** — FIXED + OPTIMIZED. INT8 GEMM kernel (4×4 tiling). Now runs: 60 t/s full pipeline, 107 t/s decode, 146ms prefill for 128 tokens.
 2. **FP32 text_generate broken** — cuBLAS path worse than INT8. Separate issue.
 3. **GEMM prefill correctness** — no reference comparison. Timing-only.
 4. **7 stub functions** — unimplemented (see AGENTS.md §7).
@@ -100,7 +100,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 | `bench/decode_full_int8.cu` | INT8 pipeline benchmark |
 | `bench/text_generate.cu` | Text generation (correct output) |
 | `bench/inference_server.cu` | CUDA Graph + batched serving |
-| `include/blackwell/kernels.h` | Public API (76 symbols) |
+| `include/blackwell/kernels.h` | Public API (78 symbols) |
 
 ---
 
@@ -108,13 +108,13 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 
 | Check | Status |
 |-------|--------|
-| Library build | ✅ 76 symbols |
+| Library build | ✅ 78 symbols |
 | INT8 GEMV | ✅ 260 GB/s |
 | INT8 pipeline 28L | ✅ 93.9 t/s |
 | INT8 CUDA Graph | ✅ 128 t/s |
 | text_generate output | ✅ "Paris" |
 | inference_server Modes A-C | ✅ |
-| inference_server Mode D | ✅ 68 t/s pipeline |
+| inference_server Mode D | ✅ 60 t/s pipeline |
 | NVF4 scalar GEMV | ✅ cosine 0.999 |
 | NVF4 MMA | ❌ abandoned |
 
@@ -126,9 +126,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 |-------|-------|
 | updated_at | 2026-05-29 |
 | branch | master |
-| last_commit | `6e775eb` Mode D prefill OOB fix |
+| last_commit | `3a25843` INT8 GEMM for Mode D prefill |
 | repo_state | Clean (binaries untracked) |
-| library | 76 symbols |
+| library | 78 symbols |
 
 ---
 
