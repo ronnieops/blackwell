@@ -141,14 +141,44 @@ cudaError_t attention_fp4(
     int batch_size, int seq_len, int num_heads, int head_dim,
     float scale, cudaStream_t stream) {
 
-    // Currently this is a stub that returns not ready.
-    // The actual prefill attention needs FP4→FP32 dequant + full flash attention.
-    // For now, return not ready to fall back to existing path.
-    (void)output; (void)Q_fp4; (void)K_fp4; (void)V_fp4;
-    (void)Q_scale; (void)K_scale; (void)V_scale;
-    (void)batch_size; (void)seq_len; (void)num_heads;
-    (void)head_dim; (void)scale; (void)stream;
-    return cudaErrorNotReady;
+    if (!output || !Q_fp4 || !K_fp4 || !V_fp4)
+        return cudaErrorInvalidValue;
+    if (!Q_scale || !K_scale || !V_scale)
+        return cudaErrorInvalidValue;
+
+    int total_q = batch_size * seq_len * num_heads * head_dim;
+    int num_kv_heads = num_heads;  // assume GQA ratio=1 for FP4 path
+    int total_kv = batch_size * seq_len * num_kv_heads * head_dim;
+
+    // Dequantize FP4 → FP32
+    float* Q_f32 = nullptr;
+    float* K_f32 = nullptr;
+    float* V_f32 = nullptr;
+    cudaError_t e;
+    e = cudaMalloc(&Q_f32, total_q * sizeof(float));
+    if (e != cudaSuccess) return e;
+    e = cudaMalloc(&K_f32, total_kv * sizeof(float));
+    if (e != cudaSuccess) { cudaFree(Q_f32); return e; }
+    e = cudaMalloc(&V_f32, total_kv * sizeof(float));
+    if (e != cudaSuccess) { cudaFree(Q_f32); cudaFree(K_f32); return e; }
+
+    e = unpack_fp4(Q_f32, Q_fp4, Q_scale, total_q, stream);
+    if (e != cudaSuccess) goto cleanup;
+    e = unpack_fp4(K_f32, K_fp4, K_scale, total_kv, stream);
+    if (e != cudaSuccess) goto cleanup;
+    e = unpack_fp4(V_f32, V_fp4, V_scale, total_kv, stream);
+    if (e != cudaSuccess) goto cleanup;
+
+    // Run FP32 attention
+    e = attention_prefill(output, Q_f32, K_f32, V_f32,
+                          seq_len, head_dim, num_heads, num_kv_heads,
+                          num_heads / num_kv_heads, scale, stream);
+
+cleanup:
+    cudaFree(Q_f32);
+    cudaFree(K_f32);
+    cudaFree(V_f32);
+    return e;
 }
 
 // FP32 prefill attention (for use after GEMM outputs FP32 Q/K/V)

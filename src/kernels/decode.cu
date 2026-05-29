@@ -342,11 +342,20 @@ cudaError_t load_kv_cache_qkgv(
     int batch_idx, int seq_pos, int num_heads,
     int head_dim, int max_seq_len, cudaStream_t stream) {
 
-    (void)Q; (void)K_val; (void)V_val;
-    (void)k_cache; (void)v_cache;
-    (void)batch_idx; (void)seq_pos; (void)num_heads;
-    (void)head_dim; (void)max_seq_len; (void)stream;
-    return cudaErrorNotReady;
+    if (!Q || !K_val || !V_val || !k_cache || !v_cache)
+        return cudaErrorInvalidValue;
+
+    // Read K/V from cache at [batch_idx, seq_pos] → K_val, V_val
+    // Q is passed through unchanged.
+    int per_head = max_seq_len * head_dim;
+    for (int h = 0; h < num_heads; ++h) {
+        int offset = h * per_head + seq_pos * head_dim;
+        cudaMemcpyAsync(K_val + h * head_dim, k_cache + offset,
+                        head_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(V_val + h * head_dim, v_cache + offset,
+                        head_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    }
+    return cudaPeekAtLastError();
 }
 
 } // namespace kernels

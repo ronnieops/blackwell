@@ -194,6 +194,21 @@ cudaError_t attention_prefill(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
+// Prefill layer orchestration
+// ---------------------------------------------------------------------------
+cudaError_t run_prefill_layer(
+    float*          hidden_states,
+    const int8_t*   W_q, const float* W_q_sc,
+    const int8_t*   W_k, const float* W_k_sc,
+    const int8_t*   W_v, const float* W_v_sc,
+    const int8_t*   W_o, const float* W_o_sc,
+    float*          k_cache, float* v_cache,
+    int             batch_size, int seq_len,
+    int             num_heads, int num_kv_heads,
+    int             hidden_dim, int head_dim, int max_seq_len,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
 // KV-cache (decode)
 // ---------------------------------------------------------------------------
 cudaError_t update_kv_cache(
