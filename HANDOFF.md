@@ -30,7 +30,7 @@ Continuity doc. Read before acting.
 | INT8 pipeline (4L scaled) | **92.5** | ✅ decode_full_int8 |
 | Mode D prefill+decode | **87** | ✅ INT8 GEMM, 165ms prefill |
 | Mode D decode only | **87** | ✅ |
-| Batched GEMV M=4 | 40 req/s | ✅ Multi-user |
+| Batched GEMV M=4 | 61 req/s | ✅ Multi-user (3.4× after batch offset fix) |
 | Batched GEMV M=8 | 17344 batch t/s | ✅ Peak |
 | Speculative (M=4) | 227 batch t/s | ✅ 2.18× vs autoregressive |
 | NVF4 scalar GEMV | 98 GB/s | ✅ Correct, not competitive |
