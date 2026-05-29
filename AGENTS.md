@@ -58,7 +58,7 @@ cmake --build build --parallel
 ```bash
 ./bench/decode_full_int8 4                    # INT8 pipeline, 93.9 t/s (scaled 28L)
 ./bench/text_generate "The capital of France is" 30  # Text gen, "Paris" ✓
-./bench/inference_server 28 4 20 8            # CUDA Graph 128 t/s, batched 40 req/s
+./bench/inference_server 28 4 20 8            # CUDA Graph 99 t/s, batched 61 req/s
 ```
 
 ### Model
@@ -75,7 +75,7 @@ cmake --build build --parallel
 | NVF4 scalar BW | 98 GB/s | FP4→float conversion ceiling |
 | INT8 vs NVF4 | 2.65× | FP4 can't match INT8 for decode |
 | GEMM prefill | 78 GB/s | 3× faster than llama.cpp |
-| CUDA Graph speedup | ~10% | 117→128 t/s |
+| CUDA Graph speedup | ~14% | 87→99 t/s |
 | Batched GEMV M=8 | 17344 batch t/s | 18.86× vs per-kernel |
 
 ---
@@ -137,7 +137,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_full_int8 4` (pipeline), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 78)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 82)
 
 ---
 
