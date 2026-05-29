@@ -25,11 +25,11 @@ Continuity doc. Read before acting.
 
 | Path | t/s | Notes |
 |------|-----|-------|
-| INT8 CUDA Graph | **128** | ✅ Best single-user |
-| INT8 per-kernel | **117** | ✅ |
-| INT8 pipeline (4L scaled) | **93.9** | ✅ decode_full_int8 |
-| Mode D prefill+decode | **60** | ✅ INT8 GEMM, 146ms prefill |
-| Mode D decode only | **107** | ✅ |
+| INT8 CUDA Graph | **100** | ✅ Best single-user |
+| INT8 per-kernel | **94** | ✅ |
+| INT8 pipeline (4L scaled) | **92.5** | ✅ decode_full_int8 |
+| Mode D prefill+decode | **87** | ✅ INT8 GEMM, 165ms prefill |
+| Mode D decode only | **87** | ✅ |
 | Batched GEMV M=4 | 40 req/s | ✅ Multi-user |
 | Batched GEMV M=8 | 17344 batch t/s | ✅ Peak |
 | Speculative (M=4) | 227 batch t/s | ✅ 2.18× vs autoregressive |
@@ -38,7 +38,9 @@ Continuity doc. Read before acting.
 
 ### vs llama.cpp baseline (114 t/s Q4_K_M)
 
-INT8 CUDA Graph: **112%** of baseline ✅
+INT8 CUDA Graph: **88%** of baseline ⚠️ (re-quantized weights, lower throughput)
+
+text_generate: **"Paris"** ✅ (correct output)
 
 ---
 
@@ -47,11 +49,14 @@ INT8 CUDA Graph: **112%** of baseline ✅
 | Decision | Rationale |
 |----------|-----------|
 | INT8 is production path | 2.65× faster than NVF4 |
-| INT8 GEMM for Mode D | 4×4 tiling, real INT8 weights, 60 t/s pipeline |
+| INT8 GEMM for Mode D | 4×4 tiling, real INT8 weights |
 | NVF4 MMA abandoned | Scale factor layout mismatch for GEMV |
 | CUDA Graph for single-user | 10% speedup, clean |
 | Batched GEMV for multi-user | 18.86× throughput gain |
-| FP32 text_generate deferred | Precision accumulation over 28 layers, not a bug |
+| FP32 text_generate deferred | Precision accumulation over 28 layers |
+| Per-row scales for all weights | GEMV/GEMM kernels use n_out indexing (per-row [N, K/16]) |
+| GEMM __dp4a abandoned | On-the-fly quantization overhead 4× slower |
+| GEMM tile 4×4 kept | Larger tiles reduce occupancy, no benefit |
 
 ---
 
@@ -70,6 +75,10 @@ INT8 CUDA Graph: **112%** of baseline ✅
 1. **FP32 text_generate** — Precision accumulation: BF16→FP32 loses precision vs INT8→FP32 with per-block scales. Over 28 layers, small differences compound into divergent logits. Not a code bug — inherent to BF16 format.
 2. **GEMM prefill correctness** — No reference comparison. Timing-only validation.
 3. **7 stub functions** — Unimplemented: `attention_fp4`, `load_kv_cache_qkgv`, `capture_decode_graph`, `launch_decode_graph`, `destroy_decode_graph`, `shared_copy_async`, `async_pipeline_stage`.
+4. **Re-quantized weights** — Per-row block-16 quantization (session 2026-05-29). Throughput dropped ~15% from original. Text quality improved ("Paris" output correct).
+5. **RoPE missing in inference_server decode** — CUDA Graph capture and per-kernel decode don't apply RoPE. Throughput numbers valid but output quality unknown.
+6. **GEMM __dp4a not feasible** — On-the-fly FP32→INT8 quantization overhead exceeds __dp4a speedup. Would need pre-quantized activations.
+7. **fused_rmsnorm_quant_int8 batched N>2048** — Returns error for Mode C with M≥2. Not verified in this session.
 
 ---
 
@@ -135,9 +144,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 |-------|-------|
 | updated_at | 2026-05-29 |
 | branch | master |
-| last_commit | `2c2b034` docs update |
-| repo_state | Clean (4 untracked binaries) |
+| last_commit | `ca5a57b` docs update |
+| repo_state | Clean (untracked binaries) |
 | library | 78 symbols |
+| session_notes | Fixed scale layout mismatch (quantize_per_row.py). GEMM __dp4a attempted but too slow. text_generate now outputs correct text ("Paris"). Throughput ~15% lower after re-quantization. |
 
 ---
 

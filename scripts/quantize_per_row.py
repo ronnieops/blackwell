@@ -49,31 +49,35 @@ def quantize_per_row(W_f32):
 
     W_f32: [N_out, K_in] float32
     Returns: (int8_data [N_out, K_in], scales [N_out, K_in/16])
+
+    GEMV/GEMM kernels use per-row scales: W_t_scale[n_out * num_K_blks + kb].
     """
     N, K = W_f32.shape
     assert K % BLOCK == 0, f"K={K} not divisible by block={BLOCK}"
-    num_blks = K // BLOCK
+    num_K_blks = K // BLOCK
 
-    # Reshape into blocks: [N, num_blks, BLOCK]
-    W_blk = W_f32.reshape(N, num_blks, BLOCK)
-
-    # Per-row per-block absmax
-    scales = np.max(np.abs(W_blk), axis=2) / 127.0  # [N, num_blks]
+    # Per-row block-16 scales: [N, K/16]
+    W_blk = W_f32.reshape(N, num_K_blks, BLOCK)
+    scales = np.max(np.abs(W_blk), axis=2) / 127.0  # [N, K/16]
     scales = np.maximum(scales, 1e-10)
 
-    # Quantize: q = round(W / scale), clip to [-127, 127]
-    # Broadcast scales: [N, num_blks, 1]
-    q = np.round(W_blk / scales[:, :, np.newaxis])
+    # Quantize: broadcast scales to [N, K]
+    scale_broadcast = scales[:, :, np.newaxis]  # [N, K/16, 1]
+    scale_broadcast = np.repeat(scale_broadcast, BLOCK, axis=2)  # [N, K/16, BLOCK]
+    scale_broadcast = scale_broadcast.reshape(N, K)  # [N, K]
+
+    q = np.round(W_f32 / scale_broadcast)
     q = np.clip(q, -127, 127).astype(np.int8)
 
-    # Flatten back
-    int8_data = q.reshape(N, K)
-    return int8_data, scales.astype(np.float32)
+    return q, scales.astype(np.float32)
 
 def write_weight(prefix, int8_data, scales, K_in, N_out):
-    """Write .int8_t and .scale_t files with header."""
-    num_K_blks = K_in // BLOCK
+    """Write .int8_t and .scale_t files with header.
 
+    Scales are [N_out, K_in/16] — per-row scales for GEMV/GEMM kernels.
+    Header: [K_in, N_out, BLOCK, K_in/16, N_out]
+    """
+    num_K_blks = K_in // BLOCK
     header = np.array([K_in, N_out, BLOCK, num_K_blks, N_out], dtype=np.int32)
 
     # .int8_t: header + N_out*K_in int8 bytes
@@ -108,6 +112,7 @@ for layer in range(NL):
         write_weight(prefix, int8_data, scales, K_in, N_out)
 
 # embed_tokens (also used as lm_head since tie_word_embeddings=true)
+# Per-block scales [V/16, K/16] — same as weight matrices for GEMV kernel
 print("Processing embed_tokens...")
 W_emb = read_bf16_tensor("model.embed_tokens.weight")  # [vocab, hidden]
 N_out, K_in = W_emb.shape
@@ -115,4 +120,4 @@ int8_data, scales = quantize_per_row(W_emb)
 write_weight(f"{OUT}/embed_tokens", int8_data, scales, K_in, N_out)
 
 print(f"\nDone. {NL} layers × {len(WEIGHT_NAMES)} weights + embed_tokens")
-print("Per-row block-16 INT8 quantization (each row has independent scales)")
+print("Per-row block-16 scales [N, K/16] for all weights + embeddings.")

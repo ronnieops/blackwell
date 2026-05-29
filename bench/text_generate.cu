@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
 
     const int NL=28;
 
-    #define AL(p,n) die(cudaMalloc(&(p),(n)),#p)
+    #define AL(p,n) { cudaError_t _e=cudaMalloc(&(p),(n)); if(_e!=cudaSuccess) printf("FAIL malloc %s: %s\n",#p,cudaGetErrorString(_e)); die(_e,#p); }
     AL(d_x,H*4); AL(d_xi_f,H*4); AL(d_xs,(H/16)*4);
     AL(d_Q,QD*4); AL(d_K,KV*4); AL(d_V,KV*4);
     AL(d_attn,QD*4); AL(d_ai,QD); AL(d_as,(QD/16)*4);

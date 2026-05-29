@@ -5,7 +5,7 @@
 // Activations in INT8, scales per 16-element K-block.
 //
 // Weight format: W_t [N×K] INT8 (transposed row-major).
-// Scale format:  W_scale [N/16 × K/16] FP32 per block.
+// Scale format:  W_scale [N/16 × K/16] FP32 per block (one scale per 16×16 block).
 // Activation:    x_int8 [K], x_scale [K/16] FP32 per block.
 
 #include <cuda_runtime.h>
@@ -38,7 +38,6 @@ __global__ void gemv_int8_kernel(
     if (n_out >= N) return;
 
     int num_K_blks = K / B;
-    int n_blk = n_out / B;
 
     float acc = 0.0f;
 
@@ -50,7 +49,7 @@ __global__ void gemv_int8_kernel(
         *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
         *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
 
-        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
         float x_sc = x_scale[kb];
         float prod_scale = w_sc * x_sc;
 
@@ -87,7 +86,6 @@ __global__ void gemv_int8_from_fp4_kernel(
     if (n_out >= N) return;
 
     int num_K_blks = K / B;
-    int n_blk = n_out / B;
 
     float acc = 0.0f;
 
@@ -118,7 +116,7 @@ __global__ void gemv_int8_from_fp4_kernel(
         alignas(16) int8_t w_buf[B];
         *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
 
-        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
 
         // Quantize x values to INT8 and accumulate
         #pragma unroll
@@ -205,7 +203,6 @@ __global__ void gemv_fp32_int8_kernel(
     if (n_out >= N) return;
 
     int num_K_blks = K / B;
-    int n_blk = n_out / B;
 
     float acc = 0.0f;
 
@@ -224,7 +221,7 @@ __global__ void gemv_fp32_int8_kernel(
         int w2 = reinterpret_cast<const int*>(w_ptr)[2];
         int w3 = reinterpret_cast<const int*>(w_ptr)[3];
 
-        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
 
         // Unpack int8 (sign-extend) → float and multiply-add (16-wide)
         #define SE(i) (float)(int8_t)((i) & 0xFF)
@@ -522,7 +519,6 @@ __global__ void gemv_int8_splitk_kernel(
 
     int split_id = blockIdx.y;
     int num_K_blks = K / B;
-    int n_blk = n_out / B;
 
     // Each split handles K/K_splits columns
     int split_blks = num_K_blks / K_splits;
@@ -539,7 +535,7 @@ __global__ void gemv_int8_splitk_kernel(
         *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
         *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
 
-        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
         float x_sc = x_scale[kb];
         float prod_scale = w_sc * x_sc;
 
@@ -618,7 +614,6 @@ __global__ void gemv_int8_persistent_kernel(
         float acc = 0.0f;
         if (n_out < N) {
             int num_K_blks = K / B;
-            int n_blk = n_out / B;
 
             for (int kb = 0; kb < num_K_blks; ++kb) {
                 const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
@@ -627,7 +622,7 @@ __global__ void gemv_int8_persistent_kernel(
                 *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
                 *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
 
-                float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+                float w_sc = W_t_scale[n_out * num_K_blks + kb];
                 float x_sc = x_scale[kb];
                 float prod_scale = w_sc * x_sc;
 
@@ -692,7 +687,6 @@ __global__ void gemv_int8_batched_kernel(
     if (n_out >= N) return;
 
     int num_K_blks = K / B;
-    int n_blk = n_out / B;
 
     float acc = 0.0f;
 
@@ -702,7 +696,7 @@ __global__ void gemv_int8_batched_kernel(
         alignas(16) int8_t w_buf[B];
         *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
 
-        float w_sc = W_t_scale[n_blk * num_K_blks + kb];
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
 
         // Load this token's activation
         const int8_t* x_ptr = &x_int8[m * K + kb * B];
@@ -807,7 +801,7 @@ __global__ void gemm_int8_kernel(
     constexpr int TILE_N = 4;
     constexpr int THREADS_M = 16;
     constexpr int THREADS_N = 16;
-    constexpr int BSIZE = 16;  // K-block size
+    constexpr int BSIZE = 16;
 
     int bm = blockIdx.y * THREADS_M * TILE_M;
     int bn = blockIdx.x * THREADS_N * TILE_N;

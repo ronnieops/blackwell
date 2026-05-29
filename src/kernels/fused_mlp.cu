@@ -79,7 +79,7 @@ __global__ void fused_gate_up_v2_kernel(
             *reinterpret_cast<uint4*>(buf_gate) = *reinterpret_cast<const uint4*>(
                 &W_gate_t[n_out0 * K + kb * B]);
 
-            float w_gate_scale = W_gate_scale[n_blk0 * num_K_blks + kb];
+            float w_gate_scale = W_gate_scale[n_out0 * num_K_blks + kb];
             const Fp4* w_gate_vals = reinterpret_cast<const Fp4*>(buf_gate);
 
             #pragma unroll
@@ -96,7 +96,7 @@ __global__ void fused_gate_up_v2_kernel(
                 &W_up_t[n_out1 * K + kb * B]);
 
             int n_blk1 = n_out1 / B;
-            float w_up_scale = W_up_scale[n_blk1 * num_K_blks + kb];
+            float w_up_scale = W_up_scale[n_out1 * num_K_blks + kb];
             const Fp4* w_up_vals = reinterpret_cast<const Fp4*>(buf_up);
 
             #pragma unroll
@@ -147,7 +147,7 @@ __global__ void fused_gate_up_kernel(
         *reinterpret_cast<uint4*>(buf) = *reinterpret_cast<const uint4*>(
             &W_t[n_out * K + kb * B]);
 
-        float w_scale = W_scale[n_blk * num_K_blks + kb];
+        float w_scale = W_scale[n_out * num_K_blks + kb];
         float x_sc = x_scale[kb];
 
         const __nv_fp4_e2m1* w_vals = reinterpret_cast<const __nv_fp4_e2m1*>(buf);

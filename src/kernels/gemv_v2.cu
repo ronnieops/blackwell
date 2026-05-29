@@ -62,7 +62,7 @@ __global__ void gemv_fp4_v2_kernel(
             &W_t_fp4[n_out * K + kb * B]);
 
         // Load weight scale for this block
-        float w_scale = W_t_scale[n_blk * num_K_blks + kb];
+        float w_scale = W_t_scale[n_out * num_K_blks + kb];
 
         // Load x values for this K-block (16 values)
         // x is small (K bytes total) — L1 cached, broadcast via read-only path
