@@ -136,17 +136,6 @@ int main(int argc, char** argv) {
     // Weight matrices (4-12 MB each) stream through and evict naturally.
     cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 8 * 1024 * 1024);
 
-    // Mark RMSNorm weights as persisting (tiny, reused every layer)
-    cudaAccessPolicyWindow norm_policy;
-    norm_policy.base_ptr = (void*)d_rn;
-    norm_policy.num_bytes = H * 4;  // 8 KB
-    norm_policy.hitRatio = 1.0f;
-    norm_policy.hitProp = cudaAccessPropertyPersisting;
-    norm_policy.missProp = cudaAccessPropertyStreaming;
-    cudaStreamAttrValue norm_attr;
-    norm_attr.accessPolicyWindow = norm_policy;
-    cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &norm_attr);
-
     // ── Fill KV cache (seq=0..128) on default stream ────────────────────────
     printf("Filling KV cache (seq=0..128)... ");
     fflush(stdout);
@@ -324,6 +313,18 @@ int main(int argc, char** argv) {
 
     cudaStream_t graph_stream;
     cudaStreamCreate(&graph_stream);
+
+    // Mark RMSNorm weights as persisting (tiny, reused every layer)
+    // Must be set on graph_stream (not stream 0) for CUDA Graph path
+    cudaAccessPolicyWindow norm_policy;
+    norm_policy.base_ptr = (void*)d_rn;
+    norm_policy.num_bytes = H * 4;  // 8 KB
+    norm_policy.hitRatio = 1.0f;
+    norm_policy.hitProp = cudaAccessPropertyPersisting;
+    norm_policy.missProp = cudaAccessPropertyStreaming;
+    cudaStreamAttrValue norm_attr;
+    norm_attr.accessPolicyWindow = norm_policy;
+    cudaStreamSetAttribute(graph_stream, cudaStreamAttributeAccessPolicyWindow, &norm_attr);
 
     // Pre-trigger attention_decode_gqa on graph_stream (sets smem config)
     blackwell::kernels::attention_decode_gqa(

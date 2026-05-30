@@ -83,7 +83,7 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 | ~~P0~~ | ~~Build INT4 full pipeline with CUDA Graph~~ | ❌ Cancelled — INT4 GEMV not competitive |
 | ~~P1~~ | ~~Migrate 24 bench files to gemv_int8_warp~~ | ✅ Done (22 files, 164 call sites migrated) |
 | ~~P1~~ | ~~Research + optimize attention_decode_gqa~~ | ✅ Done (+5.9% throughput: 173.6→183.9 t/s) |
-| P2 | Fix L2 cache hint (target graph_stream) | — |
+| ~~P2~~ | ~~Fix L2 cache hint (target graph_stream)~~ | ✅ Done (no measurable improvement, 8 KB too small to matter) |
 
 **Key finding (Session 9):** INT4 packed GEMV (signed 4-bit, nibble→float→dp4a) is **0.40× SLOWER** than INT8. The nibble unpack overhead (~35 instructions/byte) negates the 2× bandwidth savings. Same root cause as FP4 E2M1. **Sub-byte GEMV is not competitive for M=1 decode on SM_120a.**
 
@@ -133,7 +133,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 | llama.cpp F16 | ✅ **108.3 t/s** |
 | text_generate | ✅ "Paris" — head_norm bug fixed |
 | hashcat | ⚠️ Interferes with all measurements |
-| L2 hints | ❌ Wrong stream (stream 0, not graph_stream) |
+| L2 hints | ✅ Fixed (target graph_stream, no measurable impact) |
 
 ---
 
