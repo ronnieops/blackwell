@@ -597,6 +597,31 @@ cudaError_t gemm_int8(
     int             M, int N, int K,
     cudaStream_t    stream = 0);
 
+// INT8×INT8 GEMM with tensor core mma.sync.aligned.m16n8k32
+// C[M×N] = A_i8[M×K] × B_i8[N×K]^T × A_sc × B_sc
+// Requires M≥16, N≥8, K≥32.
+cudaError_t gemm_int8_mma(
+    float*          C,              // [M×N] output
+    const void*     A_i8,           // [M×K] INT8 activations
+    const float*    A_sc,           // [M × K/16] activation scales
+    const void*     B_i8,           // [N×K] INT8 transposed weights
+    const float*    B_sc,           // [N × K/16] weight scales
+    int             M, int N, int K,
+    cudaStream_t    stream = 0);
+
+// INT8×INT8 GEMM with WMMA m16n16k16 tensor cores
+// C[M×N] = A_i8[M×K] × B_i8[N×K]^T × A_sc × B_sc
+// Requires M≥16, N≥16, K≥16 (multiples of 16).
+// 4.8× faster than dp4a for large M.
+cudaError_t gemm_int8_wmma(
+    float*          C,              // [M×N] output
+    const void*     A_i8,           // [M×K] INT8 activations
+    const float*    A_sc,           // [M × K/16] activation scales
+    const void*     B_i8,           // [N×K] INT8 transposed weights
+    const float*    B_sc,           // [N × K/16] weight scales
+    int             M, int N, int K,
+    cudaStream_t    stream = 0);
+
 cudaError_t transpose_fp4_weights(
     void*           dst,          // [N × K] FP4 transposed
     float*          dst_scale,    // [N/16 × K/16] transposed

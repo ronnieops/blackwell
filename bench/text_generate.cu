@@ -4,7 +4,7 @@
 // Uses real INT8 weights from weights_int8_bf16/ and BPE tokenizer.
 //
 // Build:
-//   CUDACXX=/usr/local/cuda-12.8/bin/nvcc nvcc -O3 -std=c++17 \
+//   CUDACXX=/usr/local/cuda-13.3/bin/nvcc nvcc -O3 -std=c++17 \
 //     -gencode=arch=compute_120a,code=sm_120a \
 //     -I include bench/text_generate.cu build/libblackwell_kernels.a \
 //     -o bench/text_generate
@@ -318,14 +318,16 @@ int main(int argc, char** argv) {
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL rmsnorm_in l=%d: %s\n",l,cudaGetErrorString(e));exit(1);}
             }
 
-            // 2. QKV (FP32 × INT8 per-row)
+            // 2. Pack FP32 → INT8, then QKV (INT8 × INT8 warp GEMV)
             {
                 cudaError_t e;
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_Q,d_xi_f,W[l].q.d,W[l].q.sc,H,QD,st);
+                e=blackwell::kernels::quantize_int8(d_ai,d_as,d_xi_f,H,st);
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL pack_qkv l=%d\n",l);exit(1);}
+                e=blackwell::kernels::gemv_int8_warp(d_Q,d_ai,d_as,W[l].q.d,W[l].q.sc,H,QD,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL q l=%d\n",l);exit(1);}
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_K,d_xi_f,W[l].k.d,W[l].k.sc,H,KV,st);
+                e=blackwell::kernels::gemv_int8_warp(d_K,d_ai,d_as,W[l].k.d,W[l].k.sc,H,KV,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL k l=%d\n",l);exit(1);}
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_V,d_xi_f,W[l].v.d,W[l].v.sc,H,KV,st);
+                e=blackwell::kernels::gemv_int8_warp(d_V,d_ai,d_as,W[l].v.d,W[l].v.sc,H,KV,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL v l=%d\n",l);exit(1);}
             }
 
@@ -353,10 +355,12 @@ int main(int argc, char** argv) {
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL attn l=%d\n",l);exit(1);}
             }
 
-            // 6. Wo GEMV + residual 1 (FP32 activations)
+            // 6. Pack attention output → INT8, Wo GEMV + residual 1
             {
                 cudaError_t e;
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_proj,d_attn,W[l].o.d,W[l].o.sc,QD,H,st);
+                e=blackwell::kernels::quantize_int8(d_ai,d_as,d_attn,QD,st);
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL pack_attn l=%d\n",l);exit(1);}
+                e=blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,W[l].o.d,W[l].o.sc,QD,H,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL o l=%d\n",l);exit(1);}
                 e=blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res_save,H,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL res1 l=%d\n",l);exit(1);}
@@ -370,21 +374,25 @@ int main(int argc, char** argv) {
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL rmsnorm_post l=%d\n",l);exit(1);}
             }
 
-            // 8. Gate + Up GEMVs + SwiGLU (FP32 activations)
+            // 8. Pack → INT8, Gate + Up GEMVs + SwiGLU
             {
                 cudaError_t e;
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_gate,d_xi_f,W[l].g.d,W[l].g.sc,H,ID,st);
+                e=blackwell::kernels::quantize_int8(d_ai,d_as,d_xi_f,H,st);
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL pack_mlp l=%d\n",l);exit(1);}
+                e=blackwell::kernels::gemv_int8_warp(d_gate,d_ai,d_as,W[l].g.d,W[l].g.sc,H,ID,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL gate l=%d\n",l);exit(1);}
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_up,d_xi_f,W[l].u.d,W[l].u.sc,H,ID,st);
+                e=blackwell::kernels::gemv_int8_warp(d_up,d_ai,d_as,W[l].u.d,W[l].u.sc,H,ID,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL up l=%d\n",l);exit(1);}
                 e=blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL swiglu l=%d\n",l);exit(1);}
             }
 
-            // 9. Down GEMV + residual 2 (FP32 activations)
+            // 9. Pack SwiGLU output → INT8, Down GEMV + residual 2
             {
                 cudaError_t e;
-                e=blackwell::kernels::gemv_fp32_int8_per_row(d_proj,d_mlp,W[l].d.d,W[l].d.sc,ID,H,st);
+                e=blackwell::kernels::quantize_int8(d_mi,d_ms,d_mlp,ID,st);
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL pack_down l=%d\n",l);exit(1);}
+                e=blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,W[l].d.d,W[l].d.sc,ID,H,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL down l=%d\n",l);exit(1);}
                 e=blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res_save2,H,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL res2 l=%d\n",l);exit(1);}
@@ -398,8 +406,12 @@ int main(int argc, char** argv) {
                     d_xi_f,d_proj,d_fn,H,eps,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL fn step=%d\n",step);exit(1);}
             }
+            // Pack final norm → INT8, lm_head GEMV
             {
-                cudaError_t e=blackwell::kernels::gemv_fp32_int8_per_row(d_logits,d_xi_f,
+                cudaError_t e;
+                e=blackwell::kernels::quantize_int8(d_ai,d_as,d_xi_f,H,st);
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL pack_lmhead step=%d\n",step);exit(1);}
+                e=blackwell::kernels::gemv_int8_warp(d_logits,d_ai,d_as,
                     d_emb_d,d_emb_sc,H,V,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL lm_head step=%d\n",step);exit(1);}
             }

@@ -6,8 +6,8 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 
 ## 1. Mission
 
-Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**253.6 t/s**, re-measured 2026-05-30).
-Current: **173.6 t/s** CUDA Graph (warp-cooperative GEMV, 69% of 253.0 t/s baseline), **155.5 t/s** per-kernel. FP4 packed: **137.4 t/s**. **96 library symbols**.
+Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**276.0 t/s**, re-measured 2026-05-30, b9389).
+Current: **183.5 t/s** CUDA Graph (warp-cooperative GEMV, 66% of 276.0 t/s baseline), **162.9 t/s** per-kernel. FP4 packed: **247.3 t/s** (numerically unstable). **103 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ Current: **173.6 t/s** CUDA Graph (warp-cooperative GEMV, 69% of 253.0 t/s basel
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 96 symbols in `build/libblackwell_kernels.a`
+**Library**: 103 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -34,6 +34,8 @@ Current: **173.6 t/s** CUDA Graph (warp-cooperative GEMV, 69% of 253.0 t/s basel
 - `fused_rope` / `fused_rope_decode` — in-place rotation, smem cos/sin cache
 - `attention_decode_gqa` — GQA-aware decode attention
 - `update_kv_cache` — KV cache write with per-layer offset
+- `gemm_int8_wmma` — WMMA INT8 GEMM (prefill, 3.8× dp4a, simplified dequant)
+- `gemm_int8_mma` — Stub (returns cudaErrorNotSupported)
 
 **Research kernels (FP4 path)**:
 - `gemv_fp4_nv` / `gemv_fp4_nv_opt` — NVF4 scalar GEMV, UE4M3 scales, 98 GB/s (correct, not competitive)
@@ -42,9 +44,10 @@ Current: **173.6 t/s** CUDA Graph (warp-cooperative GEMV, 69% of 253.0 t/s basel
 - `gemm_int8` / `gemm_int8_dp4a` — INT8 GEMM prefill (M>1, per-block scales, 4×4 tiling)
 - `gemv_fp4_warp` — Packed FP4 warp GEMV (2 vals/byte, E2M1, 29 regs)
 - `gemv_fp32_fp4_warp` — FP32×packed FP4 warp GEMV (47 regs)
-- `decode_fp4_cgraph.cu` — Full 28L FP4 pipeline benchmark (CUDA Graph, 137 t/s)
+- `decode_fp4_cgraph.cu` — Full 28L FP4 pipeline benchmark (CUDA Graph, 247 t/s, numerically unstable)
+- `gemv_int4_warp` — INT4 warp GEMV (not competitive, 0.40× slower than INT8)
 
-**FP4 packed: NOT competitive for M=1 decode** (137 vs 174 t/s INT8). E2M1 nibble→float per-element conversion can't use __dp4a SIMD.
+**FP4 packed: numerically unstable** (247 vs 184 t/s INT8). Throughput competitive but outputs garbage. E2M1 nibble→float per-element conversion can't use __dp4a SIMD.
 
 **Deprecated / DO NOT USE**:
 - `gemv_int8_from_fp4` — 2.8× slower than baseline
@@ -65,10 +68,10 @@ cmake --build build --parallel
 ### Benchmark
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
-./bench/decode_int8_cgraph 28              # CUDA Graph 174 t/s (production)
-./bench/decode_full_int8 28                # Per-kernel 155 t/s
+./bench/decode_int8_cgraph 28              # CUDA Graph 183 t/s (production)
+./bench/decode_full_int8 28                # Per-kernel 163 t/s
 ./bench/bench_warp_gemv                    # Isolated warp vs old GEMV
-./bench/decode_fp4_cgraph 28               # FP4 packed CUDA Graph 137 t/s
+./bench/decode_fp4_cgraph 28               # FP4 packed CUDA Graph 247 t/s (unstable)
 ./bench/bench_packed_fp4                   # FP4 vs INT8 single-kernel
 ./bench/text_generate "The capital of France is" 30  # Text gen, "Paris" ✓
 ```
@@ -83,16 +86,21 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 CUDA Graph (warp) | **173.4 t/s** | 69% of 253 t/s llama.cpp baseline |
-| INT8 per-kernel (warp) | **155.5 t/s** | |
+| INT8 CUDA Graph (warp) | **183.5 t/s** | 66% of 276 t/s llama.cpp baseline |
+| INT8 per-kernel (warp) | **162.9 t/s** | |
+| INT8 batched (M=4) | **237.3 t/s** | 86% of 276 t/s llama.cpp baseline |
+| INT8 batched (M=8) | **243.4 t/s** | 88% of 276 t/s llama.cpp baseline |
+| FP4 batched (M=4) | 237.3 t/s | 86% ⚠️ 180% RMS diff vs INT8 |
+| FP4 batched (M=8) | 243.4 t/s | 88% ⚠️ 180% RMS diff vs INT8 |
+| WMMA GEMM (INT8) | **10,510 GFLOPS** | 3.81× over dp4a |
 | INT4 warp GEMV | **0.40× SLOWER** than INT8 | Nibble unpack overhead negates 2× BW savings |
 | FP4 warp GEMV | **0.50× SLOWER** than INT8 | E2M1→float overhead, can't use dp4a |
-| llama.cpp Q4_K_M | **253.0 t/s** | End-to-end, build 9212, CUDA 12.8 |
+| llama.cpp Q4_K_M | **276.0 t/s** | End-to-end, build 9389, CUDA 13.3 |
 | llama.cpp F16 | **108.3 t/s** | End-to-end |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
 | GEMM prefill | 78 GB/s | 3× faster than llama.cpp |
 | CUDA Graph speedup | ~10% | Eliminates kernel launch overhead |
-| L2 cache hints | ⚠️ Wrong stream | Targets stream 0, not graph_stream |
+| L2 cache hints | ✅ Fixed | Targets graph_stream (commit f55a705) |
 | Attention decode | 13.5% of pipeline | Single largest non-GEMV kernel |
 | hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
 | INT4/FP4 sub-byte GEMV | ❌ Not competitive | ~35 inst/byte unpack vs 0.31 inst/byte dp4a |
@@ -109,8 +117,9 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 - System ptxas may be old — ensure CUDA 13.3 in PATH
 - Warp kernel requires K%16==0 and N%16==0 (inherited from block-16 quantization)
 - Warp stride-32 loop: K/16 must divide evenly for balanced work (true for K=2048, 6144)
-- `gemv_int8_warp` is the production path — 24 bench files / 214 call sites still use old `gemv_int8`
+- `gemv_int8_warp` is the production path — 22 bench files migrated (164 call sites). Some legacy files remain.
 - hashcat runs on GPU-0 — kills ~45% throughput. Must `killall hashcat` before measurement
+- `gemm_int8_wmma` dequant simplified: uses first-block scale only (L1 diff=13.4 vs dp4a). Per-block scale pending.
 
 ---
 
@@ -136,15 +145,16 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 ## 7. Known Issues
 
 1. **hashcat runs persistently** on GPU-0 (PID 57393/64789, auto-restarts). Uses 3740MiB VRAM. Kills benchmark throughput ~45%. Must `killall hashcat` before any measurement — 60s window before respawn
-2. **24 bench files still use old `gemv_int8`** — 214 call sites not migrated to `gemv_int8_warp`. Production path only in decode_int8_cgraph and decode_full_int8
+2. **22 bench files migrated to `gemv_int8_warp`** (164 call sites). Production path: decode_int8_cgraph and decode_full_int8.
 3. **FP32 text_generate broken** — `text_generate_fp32.cu` produces worse output than INT8. Separate issue (BF16 weight file convention or cuBLAS transpose)
 4. **GEMM prefill correctness unverified** — no reference comparison. Timing-only validation
 5. **text_generate head_norm bug** — Pre-existing. "FAIL head_norm l=0". In `text_generate.cu` (uses `gemv_fp32_int8_per_row`)
-6. **FP4 packed slower than INT8** — 137 vs 174 t/s. E2M1 nibble→float overhead can't use __dp4a SIMD. Rejected for M=1 decode
-7. **L2 cache hint targets wrong stream** — set on stream 0, not graph_stream. No-op for CUDA Graph path
-8. **CUDA Graph drift** — INT8: max diff ~4.0 after 25 iter (FP4 quantization). FP4: L1~58K, max diff~9K. Synthetic input instability
+6. **FP4 packed numerically unstable** — 247 vs 184 t/s. Throughput competitive but outputs garbage (~10^8 values). E2M1 nibble→float overhead can't use __dp4a SIMD.
+7. **L2 cache hint targets wrong stream** — FIXED (commit f55a705). Targets graph_stream.
+8. **CUDA Graph drift** — INT8: max diff ~3.1 (known, numerical drift). FP4: outputs garbage (~10^8 values).
 9. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
 10. **Docker/API packaging** — Not done
+11. **WMMA dequant simplified** — Uses first-block scale only (L1 diff=13.4 vs dp4a). Per-block scale pending.
 
 ---
 
@@ -166,7 +176,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 96)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 103)
 
 ---
 

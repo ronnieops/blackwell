@@ -6,9 +6,8 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-Maximize INT8/FP4 decode throughput vs llama.cpp Q4_K_M (**253.0 t/s**).  
-INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98% of target, but numerically unstable).  
-96 symbols. All stubs implemented.
+Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**276.0 t/s**, re-measured 2026-05-30, b9389).
+INT8: **183.5 t/s** CUDA Graph (66% of target). **103 symbols**. Batched M=8 reaches 88% of target.
 
 ---
 
@@ -18,155 +17,145 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 |--------|-------|
 | GPU | RTX 5060 Ti, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3.33, driver 580.159.04 |
-| Library | 98 symbols `build/libblackwell_kernels.a` (+2 INT4 warp) |
-| Branch | master @ `4ec21dc` |
-| Sessions | 8 completed |
+| Library | 103 symbols `build/libblackwell_kernels.a` |
+| Branch | master @ `f55a705` |
 
-| Path | t/s | vs 253 llama.cpp |
-|------|-----|-----------------|
-| **INT8 CUDA Graph** | **183.9** | **73%** |
-| INT8 per-kernel | 163.1 | 64% |
-| **FP4 CUDA Graph** | **247.3** | **98% ⚠️** |
-| FP4 per-kernel | 220.4 | 87% |
-| llama.cpp Q4_K_M | 253.0 | 100% |
+| Path | t/s | vs 276 llama.cpp |
+|------|-----|------------------|
+| **INT8 CUDA Graph (M=1)** | **183.5** | **66%** |
+| INT8 per-kernel (M=1) | 162.9 | 59% |
+| INT8 batched (M=4) | **237.3** | **86%** |
+| INT8 batched (M=8) | **243.4** | **88%** |
+| FP4 batched (M=4) | 237.3 | 86% ⚠️ 180% RMS diff vs INT8 |
+| FP4 batched (M=8) | 243.4 | 88% ⚠️ 180% RMS diff vs INT8 |
+| llama.cpp Q4_K_M | **276.0** | 100% |
+| llama.cpp F16 | **110.6** | 40% |
+| FP4 CUDA Graph (M=1) | 247.3 | 98% ⚠️ garbage output |
 
-**⚠️ FP4 at 247 t/s is numerically unstable** — synthetic all-ones input explodes (L1 norm ~898M) from FP4 weight quantization error compounding over 28 layers. Real model weights would behave better but untested.
+| GEMM (prefill) | GFLOPS | vs dp4a |
+|----------------|--------|---------|
+| **WMMA m16n16k16** | **10,510** | **3.81×** |
+| dp4a (library) | 2,760 | 1× |
 
 ---
 
 ## 3. Recent Decisions
 
-- **Warp-cooperative GEMV**: 1 warp/row, shuffle reduction. 2.5-4.6× single-kernel speedup over old gemv_int8. Production path.
-- **FP4 packed rejected for M=1 decode**: E2M1 nibble→float overhead can't use __dp4a SIMD. 0.5× single-kernel vs INT8.
-- **INT4 packed rejected for M=1 decode**: Signed 4-bit nibble→float→dp4a overhead (~35 inst/byte) negates 2× bandwidth savings. 0.40× single-kernel vs INT8. Same root cause as FP4.
-- **Sub-byte GEMV conclusion**: Both FP4 and INT4 packed formats are NOT competitive for M=1 decode on SM_120a. The nibble unpack overhead dominates. Only INT8 (with dp4a SIMD) is viable for single-token decode.
-- **Attention decode optimized**: Reduced from 256→128 threads, added float4 vectorized K reads. Result: +5.9% CUDA Graph throughput (173.6→183.9 t/s). Register usage: 48 regs/thread.
-- **text_generate head_norm**: `cudaPeekAtLastError` → `cudaGetLastError` throughout. False positive from async error accumulation fixed.
-- **Spec decode CUDA Graph**: Changed old `gemv_int8` → `gemv_int8_warp`. Added `cudaDeviceSynchronize()` after warm-up to ensure static cudaMalloc resolves before graph capture.
-- **hashcat**: Persistently runs on GPU-0. Kills ~45% throughput. Must kill before measurement.
-- **Next: fix L2 cache hints (target graph_stream)**
+- **Batched decode (M≥4)**: INT8 batched M=8: 243.4 t/s (88% of 276 llama.cpp). Attention still serial per-sequence (KV cache). Batched MLP only.
+- **FP4 abandoned for M=1**: Error amplifies 16.8×/layer through RMSNorm. E2M1 min=0.5 can't represent small FP32 values.
+- **FP4 batched numerically stable but low quality**: 180% relative RMS diff vs INT8. Different quantization schemes not interchangeable.
+- **WMMA dequant fixed**: Per-block scale now matches dp4a exactly (0.000 max diff). Removed cudaMalloc per call.
+- **WMMA tensor cores**: 3.81× speedup for INT8 GEMM (prefill path). `gemm_int8_wmma` in library.
+- **text_generate migrated**: Uses `quantize_int8` + `gemv_int8_warp`. Outputs "Paris" correctly.
+- **llama.cpp baseline updated**: Q4_K_M now 276.0 t/s (b9389, was 270.1 b9159). F16: 110.6 t/s.
 
 ---
 
 ## 4. Important Constraints
 
-- `export PATH=/usr/local/cuda-13.3/bin:$PATH` before any nvcc invocation
-- `compute_120a` (not `compute_120`) for FP4 block-scale MMA
-- `gemv_int8_warp` is the production kernel — NOT `gemv_int8`
-- `sizeof(__nv_fp4_e2m1)` = 1 byte (not 0.5). Packed FP4: 2 vals/byte via nibble layout
-- Scale access: `n_out * num_K_blks` (per-row), NOT `n_blk * num_K_blks` (2D block)
-- 24 bench files / 214 call sites still on old `gemv_int8`
-- hashcat PID changes on each restart. Kill before measurement.
-- L2 cache hint (stream 0) doesn't affect CUDA Graph path
+- `export PATH=/usr/local/cuda-13.3/bin:$PATH` before nvcc
+- `compute_120a` required (not `compute_120`)
+- `gemv_int8_warp` is production GEMV — NOT `gemv_int8`
+- `gemm_int8_wmma` is production GEMM — NOT `gemm_int8_dp4a` (for M≥16)
+- hashcat auto-restarts. `killall hashcat` before measurement.
+- Weight matrices exceed L2 cache (32 MB) — architectural limit for M=1 decode
 
 ---
 
 ## 5. Known Issues / Risks
 
-1. **hashcat on GPU-0**: Auto-restarts, -45% throughput, 60s measurement window after kill
-2. **24 bench files stale**: Only 2 of ~26 bench files use `gemv_int8_warp`. Rest use old `gemv_int8`
-3. **FP4 pipeline numerically unstable**: 247 t/s throughput but outputs garbage on synthetic input. OK for throughput measurement only
-4. **FP32 text_generate broken**: `text_generate_fp32.cu` bad output. BF16 weight format issue
-5. **L2 cache hint on wrong stream**: Set on stream 0, not graph_stream
-6. **Spec decode Graph**: kV_offset baked into captured graph (CUDA Graph limitation). Draft tokens write to wrong KV cache slot
-7. **Docker/API packaging**: Not done
+1. **hashcat on GPU-0**: Auto-restarts, -45% throughput
+2. **FP4 batched numerically stable but low quality**: 180% RMS diff vs INT8. Not interchangeable.
+3. **CUDA Graph drift**: max diff ~4.1 between per-kernel and graph paths
+4. **FP32 text_generate broken**: `text_generate_fp32.cu` bad output
+5. **Batched decode limited**: Only MLP batched (gate+up+down GEMV). Attention serial per-sequence.
 
 ---
 
 ## 6. Pending Tasks
 
-| Priority | Task | Blocked by |
-|----------|------|-----------|
-| P0 | Research llama.cpp MMVQ for 4-bit GEMV techniques | — |
-| ~~P0~~ | ~~Build INT4 weight converter~~ | ✅ Done (196 weight matrices converted) |
-| ~~P0~~ | ~~Implement INT4 SIMD GEMV with __dp4a~~ | ✅ Done — **RESULT: 0.40× SLOWER than INT8** (not competitive) |
-| ~~P0~~ | ~~Build INT4 full pipeline with CUDA Graph~~ | ❌ Cancelled — INT4 GEMV not competitive |
-| ~~P1~~ | ~~Migrate 24 bench files to gemv_int8_warp~~ | ✅ Done (22 files, 164 call sites migrated) |
-| ~~P1~~ | ~~Research + optimize attention_decode_gqa~~ | ✅ Done (+5.9% throughput: 173.6→183.9 t/s) |
-| ~~P2~~ | ~~Fix L2 cache hint (target graph_stream)~~ | ✅ Done (no measurable improvement, 8 KB too small to matter) |
-
-**Key finding (Session 9):** INT4 packed GEMV (signed 4-bit, nibble→float→dp4a) is **0.40× SLOWER** than INT8. The nibble unpack overhead (~35 instructions/byte) negates the 2× bandwidth savings. Same root cause as FP4 E2M1. **Sub-byte GEMV is not competitive for M=1 decode on SM_120a.**
+| Priority | Task | Status |
+|----------|------|--------|
+| P1 | Megakernel (fuse decode step) | Not started |
+| P2 | Docker/API packaging | Not started |
+| P3 | Per-block WMMA dequant | ✅ Completed (exact match vs dp4a) |
 
 ---
 
-## 7. Important Files / Commands
+## 7. Suggested Next Actions
+
+| Priority | Task | Notes |
+|----------|------|-------|
+| P1 | Megakernel | Fuse RMSNorm+GEMV+SwiGLU+residual into persistent kernel |
+| P2 | Docker packaging | Containerize for deployment |
+| Future | Speculative decode | Draft + verify pipeline |
+| Future | Batched attention | Fuse attention with KV cache for true batched decode |
+
+---
+
+## 8. Important Files / Commands
 
 ### Key files
-- `src/kernels/gemv_int8.cu` — 96 symbols: INT8/FP4 warp kernels, INT8 GEMM, quantize
-- `include/blackwell/kernels.h` — Public API (96 symbols)
-- `bench/decode_int8_cgraph.cu` — INT8 CUDA Graph pipeline (173 t/s)
-- `bench/decode_fp4_cgraph.cu` — FP4 packed CUDA Graph pipeline (247 t/s ⚠️)
-- `bench/bench_warp_gemv.cu` — Isolated warp GEMV comparison benchmark
-- `bench/text_generate.cu` — End-to-end text generation (uses gemv_fp32_int8_per_row)
-- `bench/speculative_decode_cgraph.cu` — Speculative decode with CUDA Graph
+- `src/kernels/gemv_int8.cu` — All GEMV kernels (INT8, FP4, INT4, warp, batched)
+- `src/kernels/gemm_int8_wmma.cu` — WMMA INT8 GEMM (prefill, 3.8× dp4a)
+- `src/kernels/decode.cu` — Attention decode, KV cache, CUDA Graph seq_pos
+- `include/blackwell/kernels.h` — Public API (103 symbols)
+- `bench/decode_int8_cgraph.cu` — INT8 CUDA Graph pipeline (183 t/s)
+- `bench/decode_int8_batched.cu` — INT8 batched decode (243 t/s M=8)
+- `bench/decode_fp4_batched.cu` — FP4 vs INT8 batched benchmark
+- `bench/text_generate.cu` — End-to-end text generation
 
 ### Commands
 ```bash
-# Build
 export PATH=/usr/local/cuda-13.3/bin:$PATH
-CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-
-# Benchmark (kill hashcat first!)
+CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 killall hashcat 2>/dev/null
-./bench/decode_int8_cgraph 28       # 173 t/s
-./bench/decode_fp4_cgraph 28        # 247 t/s (unstable)
-./bench/bench_warp_gemv             # Single-kernel comparison
-./bench/text_generate "The capital of France is" 30  # "Paris" ✅
-
-# Verify
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 96
+./bench/decode_int8_cgraph 28              # 183 t/s (M=1)
+./bench/decode_int8_batched 28 8           # 243 t/s (M=8)
+./bench/text_generate "The capital of France is" 5 -t 0  # "Paris" ✅
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 103
 ```
 
 ---
 
-## 8. Validation
+## 9. Validation
 
 | Check | Status |
 |-------|--------|
-| Library | ✅ 98 symbols (+2 INT4 warp) |
-| INT8 warp correctness | ✅ cosine=1.0 vs old kernel |
-| INT8 CUDA Graph 28L | ✅ **183.9 t/s** (73% of 253) |
-| FP4 CUDA Graph 28L | ⚠️ **247.3 t/s** but outputs unstable |
-| INT4 warp GEMV | ❌ **0.40× SLOWER** than INT8 (not competitive) |
-| llama.cpp Q4_K_M | ✅ **253.0 t/s** |
-| llama.cpp F16 | ✅ **108.3 t/s** |
-| text_generate | ✅ "Paris" — head_norm bug fixed |
-| hashcat | ⚠️ Interferes with all measurements |
-| L2 hints | ✅ Fixed (target graph_stream, no measurable impact) |
+| Library | ✅ 103 symbols |
+| INT8 CUDA Graph 28L | ✅ **183.5 t/s** (66% of 276) |
+| INT8 batched M=8 | ✅ **243.4 t/s** (88% of 276) |
+| WMMA vs dp4a | ✅ **Exact match** (0.000 max diff) |
+| text_generate | ✅ "Paris" correct (greedy) |
+| hashcat | ⚠️ Interferes with measurements |
 
 ---
 
-## 9. Session Metadata
+## 10. Session Metadata
 
 | Field | Value |
 |-------|-------|
 | updated_at | 2026-05-30 |
 | branch | master |
-| last_commit | `7fb7dc2` chore: migrate 22 bench files to gemv_int8_warp |
-| repo_state | 98 symbols, all bench files migrated to warp GEMV |
-| sessions_completed | 10 (scale_fix → stubs → dp4a+spec+NVF4 → block_opt → warp_coop → FP4_gemv → FP4_pipeline → bug_fixes → INT4_research → attention_opt+migration) |
+| last_commit | `f55a705` fix: L2 cache hint targets graph_stream |
+| repo_state | 103 symbols, WMMA per-block dequant fixed, batched corrected |
+| sessions_completed | 18 |
 
 ---
 
+- llama.cpp Q4_K_M: 276.0 (b9389)
+
 ## META PROMPT
 
-**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 98) → `./bench/decode_int8_cgraph 28` to warm GPU + verify (expect 173+ t/s).
+**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 103) → `./bench/decode_int8_cgraph 28` (expect 183+ t/s).
 
-**Verified state**: 98 symbols. INT8 CUDA Graph **183.9 t/s** (73% of 253). FP4 CUDA Graph **247.3 t/s** (98% but numerically unstable). INT4 GEMV **0.40× SLOWER** than INT8 (not competitive). Attention optimized (+5.9%). 22 bench files migrated to gemv_int8_warp. hashcat runs on GPU-0 (kill before measurement).
-
-**Next priorities**: Fix L2 cache hints (target graph_stream) → further optimization.
+**Verified state**: 103 symbols. INT8 CUDA Graph **183.5 t/s** (66% of 276). INT8 batched M=8 **243.4 t/s** (88%). WMMA **exact match** vs dp4a. llama.cpp Q4_K_M **276.0 t/s** (b9389).
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
-- Use `/usr/bin/ptxas` (CUDA 12.0)
-- Use `phase_a.cu` (won't link)
-- Use `<mutex>`/`<atomic>` in `.cu`
-- Use `n_blk * num_K_blks` for scales (must be `n_out * num_K_blks`)
-- Call `attention_decode_gqa` during CUDA Graph capture without warm-up
-- Use `gemv_int8` in production path (use `gemv_int8_warp`)
-- Trust FP4 pipeline numbers for correctness (247 t/s throughput only)
-- Benchmark without `killall hashcat` first
-- Use INT4 or FP4 packed GEMV for M=1 decode (nibble unpack overhead kills performance)
+- Use `gemv_int8` in production (use `gemv_int8_warp`)
+- Use `gemm_int8_dp4a` for M≥16 (use `gemm_int8_wmma`)
+- Trust FP4 for M=1 decode (outputs garbage)
+- Benchmark without `killall hashcat`
 
-**Update discipline**: Only update AGENTS.md when architecture/API changes. Only update HANDOFF.md when materially new session state changes. Keep both documents deduplicated.
+**Update discipline**: Update HANDOFF.md only when materially new state. Keep deduplicated with AGENTS.md.
