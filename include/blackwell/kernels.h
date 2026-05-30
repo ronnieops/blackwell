@@ -508,6 +508,30 @@ cudaError_t gemv_fp32_int8_per_row_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Packed FP4 warp GEMV — 2 E2M1 values per byte, 2× less bandwidth than INT8.
+// Packed FP4 activations × packed FP4 weights, per-row scales.
+// x_packed: [K/2] bytes, x_scale: [K/16] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32
+cudaError_t gemv_fp4_warp(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
+// FP32 activations × packed FP4 weights — mixed precision warp GEMV.
+// x_fp32: [K] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32
+cudaError_t gemv_fp32_fp4_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
 // Fixes quality: per-row scales prevent 16-row quantization error accumulation.

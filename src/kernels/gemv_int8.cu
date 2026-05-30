@@ -309,6 +309,157 @@ __global__ void gemv_fp32_int8_per_row_warp_kernel(
     if (tid == 0) y_out[n_out] = acc;
 }
 
+// ===========================================================================
+// Warp-cooperative FP4 GEMV — 1 warp per output row, packed 2 vals/byte
+// FP4 E2M1 weights packed as 2 nibbles per byte. Each byte holds 2 values.
+// Weight layout: W_packed [N][K/2], scale layout: W_scale [N][K/16] FP32.
+// 2× less bandwidth than INT8 for same K×N matrix.
+// ===========================================================================
+
+// Device-side: extract FP4 E2M1 nibble and convert to float
+__device__ __forceinline__ float fp4_nibble_to_float(uint8_t packed, int nibble_idx) {
+    // nibble_idx: 0 = low nibble, 1 = high nibble
+    uint8_t raw = (nibble_idx == 0) ? (packed & 0x0F) : (packed >> 4);
+    // E2M1: 1 sign + 2 exp + 1 mantissa
+    // Values: 0=+0, 1=+0.5, 2=+1, 3=+2, 4=+3, 5=+inf, 6=NaN, 7=NaN
+    //         8=-0, 9=-0.5, 10=-1, 11=-2, 12=-3, 13=-inf, 14=NaN, 15=NaN
+    // Use __nv_fp4_e2m1 conversion via union
+    __nv_fp4_e2m1 v;
+    memcpy(&v, &raw, 1);  // only low byte matters
+    return static_cast<float>(v);
+}
+
+__launch_bounds__(32, 8)
+__global__ void gemv_fp4_warp_kernel(
+    float* __restrict__ y_out,
+    const uint8_t* __restrict__ x_packed,    // [K/2] packed FP4 activations
+    const float* __restrict__ x_scale,       // [K/16] FP32 activation scales
+    const uint8_t* __restrict__ W_packed,    // [N][K/2] packed FP4 weights
+    const float* __restrict__ W_scale,       // [N][K/16] FP32 weight scales
+    int K, int N)
+{
+    constexpr int B = 16;    // quantization block size
+    constexpr int PB = 8;    // packed bytes per block (B/2)
+    int n_out = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int num_K_blks = K / B;
+    float acc = 0.0f;
+
+    // Stride-32 loop: each thread handles scattered K-blocks
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 8 packed bytes = 16 FP4 values from weight row
+        const uint8_t* w_ptr = &W_packed[(size_t)n_out * (K / 2) + kb * PB];
+        alignas(16) uint8_t w_packed[PB];
+        *reinterpret_cast<uint2*>(w_packed) = *reinterpret_cast<const uint2*>(w_ptr);
+
+        // Load 8 packed bytes = 16 FP4 values from activation
+        const uint8_t* x_ptr = &x_packed[kb * PB];
+        alignas(16) uint8_t x_packed_buf[PB];
+        *reinterpret_cast<uint2*>(x_packed_buf) = *reinterpret_cast<const uint2*>(x_ptr);
+
+        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+        float x_sc = x_scale[kb];
+        float prod_scale = w_sc * x_sc;
+
+        // Proper E2M1 conversion: nibble → __nv_fp4_e2m1 → float → accumulate
+        float sum_f = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < PB; ++j) {
+            uint8_t lo_w = w_packed[j] & 0x0F;
+            uint8_t hi_w = (w_packed[j] >> 4) & 0x0F;
+            uint8_t lo_x = x_packed_buf[j] & 0x0F;
+            uint8_t hi_x = (x_packed_buf[j] >> 4) & 0x0F;
+
+            // Convert nibbles to FP4 via __nv_fp4_e2m1 cast
+            __nv_fp4_e2m1 fw_lo, fw_hi, fx_lo, fx_hi;
+            memcpy(&fw_lo, &lo_w, 1);
+            memcpy(&fw_hi, &hi_w, 1);
+            memcpy(&fx_lo, &lo_x, 1);
+            memcpy(&fx_hi, &hi_x, 1);
+
+            sum_f += static_cast<float>(fw_lo) * static_cast<float>(fx_lo);
+            sum_f += static_cast<float>(fw_hi) * static_cast<float>(fx_hi);
+        }
+        acc += sum_f * prod_scale;
+    }
+
+    // Warp shuffle reduction
+    acc += __shfl_xor_sync(0xffffffff, acc, 16);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+
+    if (tid == 0) y_out[n_out] = acc;
+}
+
+// ===========================================================================
+// Warp-cooperative FP4 GEMV — FP32 activations × packed FP4 weights
+// Same as above but activations are FP32 (no quantization needed)
+// ===========================================================================
+__launch_bounds__(32, 8)
+__global__ void gemv_fp32_fp4_warp_kernel(
+    float* __restrict__ y_out,
+    const float* __restrict__ x_fp32,        // [K] FP32 activations
+    const uint8_t* __restrict__ W_packed,    // [N][K/2] packed FP4 weights
+    const float* __restrict__ W_scale,       // [N][K/16] FP32 weight scales
+    int K, int N)
+{
+    constexpr int B = 16;
+    constexpr int PB = 8;
+    int n_out = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int num_K_blks = K / B;
+    float acc = 0.0f;
+
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 8 packed bytes = 16 FP4 values from weight row
+        const uint8_t* w_ptr = &W_packed[(size_t)n_out * (K / 2) + kb * PB];
+        alignas(16) uint8_t w_packed[PB];
+        *reinterpret_cast<uint2*>(w_packed) = *reinterpret_cast<const uint2*>(w_ptr);
+
+        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+
+        // Load 16 FP32 activation values
+        int x_off = kb * B;
+        float4 v0 = reinterpret_cast<const float4*>(&x_fp32[x_off])[0];
+        float4 v1 = reinterpret_cast<const float4*>(&x_fp32[x_off])[1];
+        float4 v2 = reinterpret_cast<const float4*>(&x_fp32[x_off])[2];
+        float4 v3 = reinterpret_cast<const float4*>(&x_fp32[x_off])[3];
+
+        // Unpack FP4 nibbles to float via E2M1, then dot with FP32 activations
+        float a16[16];
+        a16[0]=v0.x; a16[1]=v0.y; a16[2]=v0.z; a16[3]=v0.w;
+        a16[4]=v1.x; a16[5]=v1.y; a16[6]=v1.z; a16[7]=v1.w;
+        a16[8]=v2.x; a16[9]=v2.y; a16[10]=v2.z; a16[11]=v2.w;
+        a16[12]=v3.x; a16[13]=v3.y; a16[14]=v3.z; a16[15]=v3.w;
+
+        float sum_b = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < PB; ++j) {
+            __nv_fp4_e2m1 fp4_lo, fp4_hi;
+            uint8_t lo = w_packed[j] & 0x0F;
+            uint8_t hi = (w_packed[j] >> 4) & 0x0F;
+            memcpy(&fp4_lo, &lo, 1);
+            memcpy(&fp4_hi, &hi, 1);
+            sum_b += static_cast<float>(fp4_lo) * a16[j * 2];
+            sum_b += static_cast<float>(fp4_hi) * a16[j * 2 + 1];
+        }
+        acc += sum_b * w_sc;
+    }
+
+    // Warp shuffle reduction
+    acc += __shfl_xor_sync(0xffffffff, acc, 16);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+
+    if (tid == 0) y_out[n_out] = acc;
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -601,6 +752,50 @@ cudaError_t gemv_fp32_int8_per_row_warp(
     gemv_fp32_int8_per_row_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
         y_out, x_fp32,
         static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
+// Packed FP4 warp GEMV — packed FP4 activations × packed FP4 weights
+// ===========================================================================
+cudaError_t gemv_fp4_warp(
+    float*          y_out,
+    const void*     x_packed,      // [K/2] packed FP4
+    const float*    x_scale,       // [K/16] FP32
+    const void*     W_packed,      // [N][K/2] packed FP4
+    const float*    W_scale,       // [N][K/16] FP32 per-row
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    gemv_fp4_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+        y_out,
+        static_cast<const uint8_t*>(x_packed), x_scale,
+        static_cast<const uint8_t*>(W_packed), W_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// FP32 activations × packed FP4 weights
+cudaError_t gemv_fp32_fp4_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_packed,      // [N][K/2] packed FP4
+    const float*    W_scale,       // [N][K/16] FP32 per-row
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    gemv_fp32_fp4_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+        y_out, x_fp32,
+        static_cast<const uint8_t*>(W_packed), W_scale,
         K, N);
     return cudaPeekAtLastError();
 }
