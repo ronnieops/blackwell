@@ -483,6 +483,31 @@ cudaError_t gemv_fp32_int8_per_row(
     int             N,
     cudaStream_t    stream = 0);
 
+// Warp-cooperative INT8 GEMV — 1 warp per output row, shuffle reduction.
+// 32 threads cooperatively compute each dot product. Better coalescing
+// than per-thread GEMV (all threads read same row → 1 transaction vs 32).
+// ~25 regs/thread → 8 blocks/SM occupancy. Best for decode (M=1).
+cudaError_t gemv_int8_warp(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
+// Warp-cooperative FP32×INT8 per-row GEMV — 1 warp/row, shuffle reduce.
+// FP32 activations × INT8 per-row scaled weights. Same coalescing benefit.
+cudaError_t gemv_fp32_int8_per_row_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
 // Fixes quality: per-row scales prevent 16-row quantization error accumulation.

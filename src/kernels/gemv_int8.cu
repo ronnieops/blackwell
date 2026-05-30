@@ -184,6 +184,131 @@ __global__ void transpose_scales_int8_kernel(
     dst[nb * num_K_blks + kb] = src[kb * num_N_blks + nb];
 }
 
+// ===========================================================================
+// Warp-cooperative INT8 GEMV — 1 warp per output row
+// 32 threads cooperatively compute one dot product via shuffle reduction.
+// Key benefit: all threads read same weight row → perfectly coalesced loads.
+// Each thread handles scattered K-blocks (stride-32), reducing register pressure
+// from 57 (full-row) to ~25 (K/32 elements per thread).
+// ===========================================================================
+__launch_bounds__(32, 8)
+__global__ void gemv_int8_warp_kernel(
+    float* __restrict__ y_out,
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int n_out = blockIdx.x;
+    int tid = threadIdx.x;  // 0..31
+
+    int num_K_blks = K / B;
+
+    float acc = 0.0f;
+
+    // Each thread processes K-blocks at stride-32: tid, tid+32, tid+64, ...
+    // Warp-wide: 32 threads cover 32 consecutive K-blocks per iteration.
+    // Memory access: all 32 threads read from same row n_out * K → coalesced.
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 16 INT8 weight values (coalesced — same row, sequential offsets)
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        alignas(16) int8_t w_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(w_ptr);
+
+        // Load 16 INT8 activation values (also coalesced across warp)
+        alignas(16) int8_t x_buf[B];
+        *reinterpret_cast<uint4*>(x_buf) = *reinterpret_cast<const uint4*>(x_int8 + kb * B);
+
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
+        float x_sc = x_scale[kb];
+        float prod_scale = w_sc * x_sc;
+
+        // dp4a: 4 × 4-way SIMD dot product
+        const int* w32 = reinterpret_cast<const int*>(w_buf);
+        const int* x32 = reinterpret_cast<const int*>(x_buf);
+        int sumi = 0;
+        sumi = __dp4a(w32[0], x32[0], sumi);
+        sumi = __dp4a(w32[1], x32[1], sumi);
+        sumi = __dp4a(w32[2], x32[2], sumi);
+        sumi = __dp4a(w32[3], x32[3], sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
+    }
+
+    // Warp shuffle reduction: sum partial products across 32 lanes
+    acc += __shfl_xor_sync(0xffffffff, acc, 16);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+
+    // Thread 0 writes the final result
+    if (tid == 0) y_out[n_out] = acc;
+}
+
+// ===========================================================================
+// Warp-cooperative FP32×INT8 per-row GEMV
+// FP32 activations × INT8 weights with per-row scales.
+// Same warp-per-row strategy for coalesced weight access.
+// ===========================================================================
+__launch_bounds__(32, 8)
+__global__ void gemv_fp32_int8_per_row_warp_kernel(
+    float* __restrict__ y_out,
+    const float* __restrict__ x_fp32,
+    const int8_t* __restrict__ W_t_int8,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int n_out = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int num_K_blks = K / B;
+
+    float acc = 0.0f;
+
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 16 FP32 activation values
+        int x_off = kb * B;
+        float4 v0 = reinterpret_cast<const float4*>(&x_fp32[x_off])[0];
+        float4 v1 = reinterpret_cast<const float4*>(&x_fp32[x_off])[1];
+        float4 v2 = reinterpret_cast<const float4*>(&x_fp32[x_off])[2];
+        float4 v3 = reinterpret_cast<const float4*>(&x_fp32[x_off])[3];
+
+        // Load 16 INT8 weight values (coalesced)
+        const int8_t* w_ptr = &W_t_int8[n_out * K + kb * B];
+        int w0 = reinterpret_cast<const int*>(w_ptr)[0];
+        int w1 = reinterpret_cast<const int*>(w_ptr)[1];
+        int w2 = reinterpret_cast<const int*>(w_ptr)[2];
+        int w3 = reinterpret_cast<const int*>(w_ptr)[3];
+
+        float w_sc = W_t_scale[n_out * num_K_blks + kb];
+
+        #define SE_W(i) (float)(int8_t)((i) & 0xFF)
+        float sum_b = 0.0f;
+        sum_b += SE_W(w0 >>  0) * v0.x;  sum_b += SE_W(w0 >>  8) * v0.y;
+        sum_b += SE_W(w0 >> 16) * v0.z;  sum_b += SE_W(w0 >> 24) * v0.w;
+        sum_b += SE_W(w1 >>  0) * v1.x;  sum_b += SE_W(w1 >>  8) * v1.y;
+        sum_b += SE_W(w1 >> 16) * v1.z;  sum_b += SE_W(w1 >> 24) * v1.w;
+        sum_b += SE_W(w2 >>  0) * v2.x;  sum_b += SE_W(w2 >>  8) * v2.y;
+        sum_b += SE_W(w2 >> 16) * v2.z;  sum_b += SE_W(w2 >> 24) * v2.w;
+        sum_b += SE_W(w3 >>  0) * v3.x;  sum_b += SE_W(w3 >>  8) * v3.y;
+        sum_b += SE_W(w3 >> 16) * v3.z;  sum_b += SE_W(w3 >> 24) * v3.w;
+        #undef SE_W
+        acc += sum_b * w_sc;
+    }
+
+    // Warp shuffle reduction
+    acc += __shfl_xor_sync(0xffffffff, acc, 16);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+
+    if (tid == 0) y_out[n_out] = acc;
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -430,6 +555,51 @@ cudaError_t gemv_int8(
     gemv_int8_kernel<<<dim3(nb), dim3(kINT8Block), 0, stream>>>(
         y_out,
         static_cast<const int8_t*>(x_int8), x_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
+// Warp-cooperative INT8 GEMV — 1 warp/row, shuffle reduce
+// ===========================================================================
+cudaError_t gemv_int8_warp(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    // 1 block per output row, 32 threads per block (1 warp)
+    gemv_int8_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+        y_out,
+        static_cast<const int8_t*>(x_int8), x_scale,
+        static_cast<const int8_t*>(W_t_int8), W_t_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// Warp-cooperative FP32×INT8 per-row GEMV
+cudaError_t gemv_fp32_int8_per_row_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    gemv_fp32_int8_per_row_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+        y_out, x_fp32,
         static_cast<const int8_t*>(W_t_int8), W_t_scale,
         K, N);
     return cudaPeekAtLastError();
