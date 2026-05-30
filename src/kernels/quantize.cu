@@ -120,6 +120,57 @@ cudaError_t unpack_fp4(
     return cudaPeekAtLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Fused: unpack FP4 → pack INT8 in 1 kernel
+// Reads FP4 E2M1, converts to float, applies FP4 scale,
+// then quantizes to INT8 with INT8 block scales (block-16)
+// Output: int8_t[N] + float[N/16] scales
+// ---------------------------------------------------------------------------
+__global__ void fused_unpack_pack_kernel(
+    int8_t* __restrict__ out_i8,
+    float* __restrict__ out_scales,
+    const __nv_fp4_e2m1* __restrict__ in_fp4,
+    const float* __restrict__ fp4_scales,    // [1] single per-tensor FP4 scale
+    const float* __restrict__ i8_scales_in,  // pre-computed INT8 block scales (optional)
+    int num_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_elements) return;
+
+    float fp4_scale = fp4_scales[0];
+    float v = static_cast<float>(in_fp4[idx]) * fp4_scale;
+
+    int blk = idx / 16;
+    float sc = i8_scales_in[blk];
+    v = v / sc;
+    v = fminf(127.0f, fmaxf(-127.0f, roundf(v)));
+    out_i8[idx] = static_cast<int8_t>(static_cast<int>(v));
+}
+
+cudaError_t unpack_fp4_pack_int8(
+    void* out_i8,
+    float* out_scales,
+    const void* in_fp4,
+    const float* fp4_scale,
+    const float* i8_scales,
+    int num_elements,
+    cudaStream_t stream) {
+
+    const int threads = 256;
+    dim3 block(threads);
+    dim3 grid((num_elements + threads - 1) / threads);
+
+    fused_unpack_pack_kernel<<<grid, block, 0, stream>>>(
+        static_cast<int8_t*>(out_i8),
+        out_scales,
+        static_cast<const __nv_fp4_e2m1*>(in_fp4),
+        fp4_scale,
+        i8_scales,
+        num_elements);
+
+    return cudaPeekAtLastError();
+}
+
 cudaError_t coalesced_copy(
     float* dst, const float* src, int num_elements, cudaStream_t stream) {
 

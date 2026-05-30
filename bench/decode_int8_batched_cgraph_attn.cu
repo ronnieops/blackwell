@@ -210,8 +210,10 @@ int main(int argc, char** argv) {
         for (int l = 0; l < num_layers; ++l) {
             size_t kv_layer_off = l * nkv * ms * hd;
             for (int m = 0; m < M; ++m) {
-                blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
-                blackwell::kernels::pack_int8(d_xi8_b + m*H, d_res_s, d_xi8s_b + m*(H/16), H, 0);
+                blackwell::kernels::unpack_fp4_pack_int8(
+                    d_xi8_b + m*H, d_xi8s_b + m*(H/16),
+                    d_x_fp4_arr[m], d_xs_arr[m],
+                    d_xi8s_b + m*(H/16), H, 0);
             }
             for (int m = 0; m < M; ++m) {
                 size_t km = m * kv_seq_stride + kv_layer_off;
@@ -247,10 +249,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b+m*H, d_proj_b+m*H, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b+m*H, d_rn, H, 1e-6f, 0);
-                // Copy back to batched buffer
-                cudaMemcpy(d_xi8_b+m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice);
-                cudaMemcpy(d_xi8s_b+m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_b+m*H, d_xi8s_b+m*(H/16), d_proj_b+m*H, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b+m*H, d_rn, H, 1e-6f, 0);
             }
         }
@@ -264,8 +263,10 @@ int main(int argc, char** argv) {
         for (int l = 0; l < num_layers; ++l) {
             size_t kv_layer_off = l * nkv * ms * hd;
             for (int m = 0; m < M; ++m) {
-                blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
-                blackwell::kernels::pack_int8(d_xi8_b + m*H, d_res_s, d_xi8s_b + m*(H/16), H, 0);
+                blackwell::kernels::unpack_fp4_pack_int8(
+                    d_xi8_b + m*H, d_xi8s_b + m*(H/16),
+                    d_x_fp4_arr[m], d_xs_arr[m],
+                    d_xi8s_b + m*(H/16), H, 0);
             }
             for (int m = 0; m < M; ++m) {
                 size_t km = m * kv_seq_stride + kv_layer_off;
@@ -300,9 +301,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b+m*H, d_proj_b+m*H, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b+m*H, d_rn, H, 1e-6f, 0);
-                cudaMemcpy(d_xi8_b+m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice);
-                cudaMemcpy(d_xi8s_b+m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_b+m*H, d_xi8s_b+m*(H/16), d_proj_b+m*H, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b+m*H, d_rn, H, 1e-6f, 0);
             }
         }
@@ -334,8 +333,10 @@ int main(int argc, char** argv) {
             size_t kv_layer_off = l * nkv * ms * hd;
             // Attn: Q/K/V GEMV for all M, then ONE batched attention call
             for (int m = 0; m < M; ++m) {
-                blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
-                blackwell::kernels::pack_int8(d_xi8_b + m*H, d_res_s, d_xi8s_b + m*(H/16), H, 0);
+                blackwell::kernels::unpack_fp4_pack_int8(
+                    d_xi8_b + m*H, d_xi8s_b + m*(H/16),
+                    d_x_fp4_arr[m], d_xs_arr[m],
+                    d_xi8s_b + m*(H/16), H, 0);
             }
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_b + m*H, d_xi8s_b + m*(H/16),
@@ -375,9 +376,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b+m*H, d_proj_b+m*H, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b+m*H, d_rn, H, 1e-6f, 0);
-                cudaMemcpy(d_xi8_b+m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice);
-                cudaMemcpy(d_xi8s_b+m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_b+m*H, d_xi8s_b+m*(H/16), d_proj_b+m*H, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b+m*H, d_rn, H, 1e-6f, 0);
             }
         }
@@ -390,8 +389,10 @@ int main(int argc, char** argv) {
         for (int l = 0; l < num_layers; ++l) {
             size_t kv_layer_off = l * nkv * ms * hd;
             for (int m = 0; m < M; ++m) {
-                blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
-                blackwell::kernels::pack_int8(d_xi8_b + m*H, d_res_s, d_xi8s_b + m*(H/16), H, 0);
+                blackwell::kernels::unpack_fp4_pack_int8(
+                    d_xi8_b + m*H, d_xi8s_b + m*(H/16),
+                    d_x_fp4_arr[m], d_xs_arr[m],
+                    d_xi8s_b + m*(H/16), H, 0);
             }
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_b + m*H, d_xi8s_b + m*(H/16),
@@ -428,9 +429,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b+m*H, d_proj_b+m*H, d_res_s, H, 0);
-                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b+m*H, d_rn, H, 1e-6f, 0);
-                cudaMemcpy(d_xi8_b+m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice);
-                cudaMemcpy(d_xi8s_b+m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice);
+                blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_b+m*H, d_xi8s_b+m*(H/16), d_proj_b+m*H, d_rn, H, 1e-6f, 0);
                 blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b+m*H, d_rn, H, 1e-6f, 0);
             }
         }
@@ -469,10 +468,12 @@ int main(int argc, char** argv) {
     for (int l = 0; l < num_layers; ++l) {
         size_t kv_layer_off = l * nkv * ms * hd;
 
-        // 1. unpack+pack all M
+        // 1. Fused unpack+pack all M (1 kernel instead of 2)
         for (int m = 0; m < M; ++m) {
-            blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, graph_stream);
-            blackwell::kernels::pack_int8(d_xi8_b + m*H, d_res_s, d_xi8s_b + m*(H/16), H, graph_stream);
+            blackwell::kernels::unpack_fp4_pack_int8(
+                d_xi8_b + m*H, d_xi8s_b + m*(H/16),
+                d_x_fp4_arr[m], d_xs_arr[m],
+                d_xi8s_b + m*(H/16), H, graph_stream);
         }
 
         // 2. Q/K/V GEMV + KV cache (per-seq)
@@ -517,9 +518,7 @@ int main(int argc, char** argv) {
         for (int m = 0; m < M; ++m) {
             blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, graph_stream);
             blackwell::kernels::vector_add_fp32(d_proj_b+m*H, d_proj_b+m*H, d_res_s, H, graph_stream);
-            blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_s, d_xi8s_s, d_proj_b+m*H, d_rn, H, 1e-6f, graph_stream);
-            cudaMemcpyAsync(d_xi8_b+m*H, d_xi8_s, H, cudaMemcpyDeviceToDevice, graph_stream);
-            cudaMemcpyAsync(d_xi8s_b+m*(H/16), d_xi8s_s, (H/16)*4, cudaMemcpyDeviceToDevice, graph_stream);
+            blackwell::kernels::fused_rmsnorm_quant_int8(d_xi8_b+m*H, d_xi8s_b+m*(H/16), d_proj_b+m*H, d_rn, H, 1e-6f, graph_stream);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4_arr[m], d_xs_arr[m], d_proj_b+m*H, d_rn, H, 1e-6f, graph_stream);
         }
     }

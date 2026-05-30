@@ -94,6 +94,17 @@ cudaError_t unpack_fp4(
     int            num_elements,
     cudaStream_t   stream = 0);
 
+// Fused: unpack FP4 → quantize to INT8 in 1 kernel (no intermediate FP32 buffer)
+// i8_scales: pre-computed INT8 block scales [num_elements/16]
+cudaError_t unpack_fp4_pack_int8(
+    void*           out_i8,
+    float*          out_scales,     // INT8 block scales (passed through, unused)
+    const void*     in_fp4,
+    const float*    fp4_scale,
+    const float*    i8_scales,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
 cudaError_t coalesced_copy(
     float*          dst,
     const float*    src,
