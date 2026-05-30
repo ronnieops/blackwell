@@ -174,6 +174,25 @@ cudaError_t attention_decode_gqa(
     int             max_seq_len,
     cudaStream_t    stream = 0);
 
+// Batched GQA decode attention: process M sequences in parallel
+// K_cache layout: [M][total_layers][num_kv_heads][max_seq_len][head_dim]
+// kv_batch_elems: stride (in floats) between sequences' data for same layer
+// kv_layer_elems: offset (in floats) from seq base to current layer
+cudaError_t attention_decode_batched_gqa(
+    float*          output,         // [M * num_q_heads * head_dim]
+    const float*    Q,              // [M * num_q_heads * head_dim]
+    const float*    K_cache,        // base pointer (seq 0, layer 0)
+    const float*    V_cache,
+    int             seq_pos,
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             head_dim,
+    int             max_seq_len,
+    int             M,              // batch size
+    size_t          kv_batch_elems, // floats between sequences
+    size_t          kv_layer_elems, // floats from seq base to current layer
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Attention (prefill)
 // ---------------------------------------------------------------------------

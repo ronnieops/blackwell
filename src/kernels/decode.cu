@@ -271,6 +271,148 @@ cudaError_t attention_decode_gqa(
     return cudaPeekAtLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Batched decode attention: M sequences in parallel
+// Grid: M * num_q_heads blocks, each handling one (seq, head) pair
+// ---------------------------------------------------------------------------
+__launch_bounds__(128, 2)
+__global__ void attn_batched_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ Q,
+    const float* __restrict__ K_cache_base,
+    const float* __restrict__ V_cache_base,
+    const int* seq_pos_ptr,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    float scale,
+    int M,
+    size_t kv_batch_elems,   // floats between sequences
+    size_t kv_layer_elems)   // floats to current layer
+{
+    int bid = blockIdx.x;
+    int seq_id = bid / num_q_heads;
+    int head = bid % num_q_heads;
+    if (seq_id >= M) return;
+    if (head >= num_q_heads) return;
+
+    int kv_head = head * num_kv_heads / num_q_heads;
+    int seq_pos = *seq_pos_ptr;
+
+    // Point to this (seq, head) pair's data
+    const float* K_cache = K_cache_base + seq_id * kv_batch_elems + kv_layer_elems
+                         + kv_head * max_seq_len * head_dim;
+    const float* V_cache = V_cache_base + seq_id * kv_batch_elems + kv_layer_elems
+                         + kv_head * max_seq_len * head_dim;
+    float* out = output + seq_id * num_q_heads * head_dim + head * head_dim;
+    const float* q = Q + seq_id * num_q_heads * head_dim + head * head_dim;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid & 31;
+    int npos = seq_pos + 1;
+
+    extern __shared__ float smem[];
+    float* smem_Q = smem;
+    float* scores = smem + head_dim;
+
+    // Load Q into smem
+    if (tid < head_dim) {
+        smem_Q[tid] = q[tid];
+    }
+    __syncthreads();
+
+    // Q into registers via float4
+    float Q_reg[4];
+    {
+        const float4* Q4 = reinterpret_cast<const float4*>(smem_Q);
+        float4 q4 = Q4[lane_id];
+        Q_reg[0] = q4.x; Q_reg[1] = q4.y; Q_reg[2] = q4.z; Q_reg[3] = q4.w;
+    }
+
+    // Compute scores: 4 warps, each handles npos/4
+    for (int t = warp_id; t < npos; t += 4) {
+        const float4* K4 = reinterpret_cast<const float4*>(
+            K_cache + t * head_dim);
+        float4 kv = K4[lane_id];
+        float dot = Q_reg[0] * kv.x + Q_reg[1] * kv.y
+                  + Q_reg[2] * kv.z + Q_reg[3] * kv.w;
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffff, dot, off);
+        if (lane_id == 0) {
+            scores[t] = dot * scale;
+        }
+    }
+    __syncthreads();
+
+    // Softmax
+    float maxv = -FLT_MAX;
+    for (int t = 0; t < npos; ++t)
+        if (scores[t] > maxv) maxv = scores[t];
+    float sumexp = 0.0f;
+    for (int t = 0; t < npos; ++t) {
+        float e = __expf(scores[t] - maxv);
+        scores[t] = e;
+        sumexp += e;
+    }
+    float inv_sum = 1.0f / (sumexp + 1e-9f);
+
+    // V weighted sum
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float out_val = 0.0f;
+        for (int t = 0; t < npos; ++t) {
+            out_val += scores[t] * V_cache[t * head_dim + d];
+        }
+        out[d] = out_val * inv_sum;
+    }
+}
+
+cudaError_t attention_decode_batched_gqa(
+    float* output, const float* Q,
+    const float* K_cache, const float* V_cache,
+    int seq_pos, int num_q_heads, int num_kv_heads,
+    int head_dim, int max_seq_len,
+    int M, size_t kv_batch_elems, size_t kv_layer_elems,
+    cudaStream_t stream) {
+
+    cudaError_t e;
+    e = alloc_seq_pos();
+    if (e != cudaSuccess) return e;
+    write_seq_pos(seq_pos);
+    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    if (e != cudaSuccess) return e;
+
+    constexpr int smem_bytes = 4096 * 4;
+    if (smem_attr_set == 0) {
+        int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
+        if (old == 0) {
+            cudaFuncSetAttribute(
+                attn_batched_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            // Also set for attention_decode_kernel (may not have been triggered)
+            cudaFuncSetAttribute(
+                attention_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_attr_set = 2;
+        }
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int total_blocks = M * num_q_heads;
+    attn_batched_kernel<<<
+        dim3(total_blocks), dim3(128), smem_bytes, stream>>>(
+        output, Q, K_cache, V_cache,
+        d_seq_pos_global, num_q_heads, num_kv_heads,
+        head_dim, max_seq_len, scale,
+        M, kv_batch_elems, kv_layer_elems);
+
+    return cudaPeekAtLastError();
+}
+
 cudaError_t update_kv_cache(
     float* k_cache, float* v_cache,
     const float* k_new, const float* v_new,
