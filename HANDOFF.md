@@ -44,7 +44,7 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 - **text_generate head_norm**: `cudaPeekAtLastError` → `cudaGetLastError` throughout. False positive from async error accumulation fixed.
 - **Spec decode CUDA Graph**: Changed old `gemv_int8` → `gemv_int8_warp`. Added `cudaDeviceSynchronize()` after warm-up to ensure static cudaMalloc resolves before graph capture.
 - **hashcat**: Persistently runs on GPU-0. Kills ~45% throughput. Must kill before measurement.
-- **Next: migrate 22 stale bench files to gemv_int8_warp**
+- **Next: fix L2 cache hints (target graph_stream)**
 
 ---
 
@@ -81,8 +81,8 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 | ~~P0~~ | ~~Build INT4 weight converter~~ | ✅ Done (196 weight matrices converted) |
 | ~~P0~~ | ~~Implement INT4 SIMD GEMV with __dp4a~~ | ✅ Done — **RESULT: 0.40× SLOWER than INT8** (not competitive) |
 | ~~P0~~ | ~~Build INT4 full pipeline with CUDA Graph~~ | ❌ Cancelled — INT4 GEMV not competitive |
-| P1 | Migrate 24 bench files to gemv_int8_warp | — |
-| P1 | Research + optimize attention_decode_gqa | MMVQ research |
+| ~~P1~~ | ~~Migrate 24 bench files to gemv_int8_warp~~ | ✅ Done (22 files, 164 call sites migrated) |
+| ~~P1~~ | ~~Research + optimize attention_decode_gqa~~ | ✅ Done (+5.9% throughput: 173.6→183.9 t/s) |
 | P2 | Fix L2 cache hint (target graph_stream) | — |
 
 **Key finding (Session 9):** INT4 packed GEMV (signed 4-bit, nibble→float→dp4a) is **0.40× SLOWER** than INT8. The nibble unpack overhead (~35 instructions/byte) negates the 2× bandwidth savings. Same root cause as FP4 E2M1. **Sub-byte GEMV is not competitive for M=1 decode on SM_120a.**
@@ -126,7 +126,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|--------|
 | Library | ✅ 98 symbols (+2 INT4 warp) |
 | INT8 warp correctness | ✅ cosine=1.0 vs old kernel |
-| INT8 CUDA Graph 28L | ✅ **173.4 t/s** (68% of 253) |
+| INT8 CUDA Graph 28L | ✅ **183.9 t/s** (73% of 253) |
 | FP4 CUDA Graph 28L | ⚠️ **247.3 t/s** but outputs unstable |
 | INT4 warp GEMV | ❌ **0.40× SLOWER** than INT8 (not competitive) |
 | llama.cpp Q4_K_M | ✅ **253.0 t/s** |
@@ -143,9 +143,9 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-05-30 |
 | branch | master |
-| last_commit | `4ec21dc` fix: text_generate head_norm + spec decode CUDA Graph |
-| repo_state | 98 symbols, commit + untracked bench binaries + INT4 weights |
-| sessions_completed | 9 (scale_fix → stubs → dp4a+spec+NVF4 → block_opt → warp_coop → FP4_gemv → FP4_pipeline → bug_fixes → INT4_research) |
+| last_commit | `7fb7dc2` chore: migrate 22 bench files to gemv_int8_warp |
+| repo_state | 98 symbols, all bench files migrated to warp GEMV |
+| sessions_completed | 10 (scale_fix → stubs → dp4a+spec+NVF4 → block_opt → warp_coop → FP4_gemv → FP4_pipeline → bug_fixes → INT4_research → attention_opt+migration) |
 
 ---
 
@@ -153,9 +153,9 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 98) → `./bench/decode_int8_cgraph 28` to warm GPU + verify (expect 173+ t/s).
 
-**Verified state**: 98 symbols. INT8 CUDA Graph **173.4 t/s** (68% of 253). FP4 CUDA Graph **247.3 t/s** (98% but numerically unstable). INT4 GEMV **0.40× SLOWER** than INT8 (not competitive). head_norm bug fixed. spec decode warm-up fixed. hashcat runs on GPU-0 (kill before measurement).
+**Verified state**: 98 symbols. INT8 CUDA Graph **183.9 t/s** (73% of 253). FP4 CUDA Graph **247.3 t/s** (98% but numerically unstable). INT4 GEMV **0.40× SLOWER** than INT8 (not competitive). Attention optimized (+5.9%). 22 bench files migrated to gemv_int8_warp. hashcat runs on GPU-0 (kill before measurement).
 
-**Next priorities**: attention optimize (13.5% of pipeline) → migrate 24 bench files → L2 cache hints.
+**Next priorities**: Fix L2 cache hints (target graph_stream) → further optimization.
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
