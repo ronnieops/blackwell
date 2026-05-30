@@ -72,9 +72,9 @@ static void layer_single_int8(LW&L,
 
     // ── Attention ──
     // xi8/xi8s already has INT8 activations → use directly in GEMV
-    die(blackwell::kernels::gemv_int8(Q,xi8,xi8s,L.q.d,L.q.ds,H,QD,0),"gemv_q");
-    die(blackwell::kernels::gemv_int8(K,xi8,xi8s,L.k.d,L.k.ds,H,KV,0),"gemv_k");
-    die(blackwell::kernels::gemv_int8(V,xi8,xi8s,L.v.d,L.v.ds,H,KV,0),"gemv_v");
+    die(blackwell::kernels::gemv_int8_warp(Q,xi8,xi8s,L.q.d,L.q.ds,H,QD,0),"gemv_q");
+    die(blackwell::kernels::gemv_int8_warp(K,xi8,xi8s,L.k.d,L.k.ds,H,KV,0),"gemv_k");
+    die(blackwell::kernels::gemv_int8_warp(V,xi8,xi8s,L.v.d,L.v.ds,H,KV,0),"gemv_v");
 
     // KV cache + attention
     die(blackwell::kernels::update_kv_cache(kc+kb,vc+kb,K,V,0,sq,8,128,H,0),"kv");
@@ -82,7 +82,7 @@ static void layer_single_int8(LW&L,
 
     // O projection: pack attention output (FP32) → GEMV
     die(blackwell::kernels::pack_int8(ai8,attn,ai8s,QD,0),"pack_attn");
-    die(blackwell::kernels::gemv_int8(proj,ai8,ai8s,L.o.d,L.o.ds,QD,H,0),"gemv_o");
+    die(blackwell::kernels::gemv_int8_warp(proj,ai8,ai8s,L.o.d,L.o.ds,QD,H,0),"gemv_o");
 
     // Residual: add saved residual, then save new pre-RMSNorm output
     die(blackwell::kernels::vector_add_fp32(proj,proj,res_buf,H,0),"res1");
@@ -93,13 +93,13 @@ static void layer_single_int8(LW&L,
 
     // ── MLP ──
     // xi8/xi8s already has INT8 → use directly
-    die(blackwell::kernels::gemv_int8(gate,xi8,xi8s,L.gate.d,L.gate.ds,H,ID,0),"gemv_gate");
-    die(blackwell::kernels::gemv_int8(up,xi8,xi8s,L.up.d,L.up.ds,H,ID,0),"gemv_up");
+    die(blackwell::kernels::gemv_int8_warp(gate,xi8,xi8s,L.gate.d,L.gate.ds,H,ID,0),"gemv_gate");
+    die(blackwell::kernels::gemv_int8_warp(up,xi8,xi8s,L.up.d,L.up.ds,H,ID,0),"gemv_up");
     die(blackwell::kernels::apply_swiglu(mlp,gate,up,ID,0),"swiglu");
 
     // Pack MLP → GEMV down
     die(blackwell::kernels::pack_int8(mi8,mlp,mi8s,ID,0),"pack_mlp");
-    die(blackwell::kernels::gemv_int8(proj,mi8,mi8s,L.down.d,L.down.ds,ID,H,0),"gemv_down");
+    die(blackwell::kernels::gemv_int8_warp(proj,mi8,mi8s,L.down.d,L.down.ds,ID,H,0),"gemv_down");
 
     // Residual + RMSNorm → INT8 for next layer
     die(blackwell::kernels::vector_add_fp32(proj,proj,res_buf,H,0),"res2");
@@ -118,13 +118,13 @@ static void layer_batched_int8(LW&L,int M,
     // ── Attention (serial per-token KV cache) ──
     for(int m=0;m<M;++m){
         int kb=base_kb+m*8*H*128;
-        die(blackwell::kernels::gemv_int8(Q,xM+m*H,xMs+m*(H/B),L.q.d,L.q.ds,H,QD,0),"q");
-        die(blackwell::kernels::gemv_int8(K,xM+m*H,xMs+m*(H/B),L.k.d,L.k.ds,H,KV,0),"k");
-        die(blackwell::kernels::gemv_int8(V,xM+m*H,xMs+m*(H/B),L.v.d,L.v.ds,H,KV,0),"v");
+        die(blackwell::kernels::gemv_int8_warp(Q,xM+m*H,xMs+m*(H/B),L.q.d,L.q.ds,H,QD,0),"q");
+        die(blackwell::kernels::gemv_int8_warp(K,xM+m*H,xMs+m*(H/B),L.k.d,L.k.ds,H,KV,0),"k");
+        die(blackwell::kernels::gemv_int8_warp(V,xM+m*H,xMs+m*(H/B),L.v.d,L.v.ds,H,KV,0),"v");
         die(blackwell::kernels::update_kv_cache(kc+kb,vc+kb,K,V,0,sq,8,128,H,0),"kv");
         die(blackwell::kernels::attention_decode_gqa(attn,Q,kc+kb,vc+kb,sq,16,8,128,H,0),"attn");
         die(blackwell::kernels::pack_int8(ai8,attn,ai8s,QD,0),"pack_attn");
-        die(blackwell::kernels::gemv_int8(projM+m*H,ai8,ai8s,L.o.d,L.o.ds,QD,H,0),"o");
+        die(blackwell::kernels::gemv_int8_warp(projM+m*H,ai8,ai8s,L.o.d,L.o.ds,QD,H,0),"o");
         die(blackwell::kernels::vector_add_fp32(projM+m*H,projM+m*H,resM+m*H,H,0),"res1");
         die(cudaMemcpyAsync(resM+m*H,projM+m*H,H*4,cudaMemcpyDeviceToDevice,0),"save1");
         die(blackwell::kernels::fused_rmsnorm_quant_int8(

@@ -100,30 +100,30 @@ int main(int argc, char** argv){
     auto do_layer=[&](int l){
         blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi,(float*)d_xs,d_x,d_rn,H,1e-6f,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_Q,d_xi,d_xs,W[l].q.d,W[l].q.sc,H,Q,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_K,d_xi,d_xs,W[l].k.d,W[l].k.sc,H,KV,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_V,d_xi,d_xs,W[l].v.d,W[l].v.sc,H,KV,st);
         blackwell::kernels::update_kv_cache(
             d_kc,d_vc,d_K,d_V,0,0,nkv,hd,SEQ,st);
         blackwell::kernels::attention_decode_gqa(
             d_attn,d_Q,d_kc,d_vc,0,nqh,nkv,hd,SEQ,st);
         blackwell::kernels::pack_int8(d_ai,d_attn,d_as,Q,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_proj,d_ai,d_as,W[l].o.d,W[l].o.sc,Q,H,st);
         blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_x,H,st);
         blackwell::kernels::vector_add_fp32(d_res,d_proj,d_x,H,st);
         blackwell::kernels::fused_rmsnorm_quant_int8(
             d_xi,d_xs,d_proj,d_rn,H,1e-6f,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_gate,d_xi,d_xs,W[l].g.d,W[l].g.sc,H,I,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_up,d_xi,d_xs,W[l].u.d,W[l].u.sc,H,I,st);
         blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,I,st);
         blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,I,st);
-        blackwell::kernels::gemv_int8(
+        blackwell::kernels::gemv_int8_warp(
             d_proj,d_mi,d_ms,W[l].d.d,W[l].d.sc,I,H,st);
         blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
         cudaMemcpyAsync(d_x,d_proj,H*4,cudaMemcpyDeviceToDevice,st);

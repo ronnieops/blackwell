@@ -222,9 +222,9 @@ int main(int argc, char** argv) {
         int kb=0;
         die(blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)xi,xs,xx,d_rn,H,eps,st),"rmsnorm");
-        die(blackwell::kernels::gemv_int8(q,(int8_t*)xi,xs,Wl.q.d,Wl.q.sc,H,QD,st),"q");
-        die(blackwell::kernels::gemv_int8(k,(int8_t*)xi,xs,Wl.k.d,Wl.k.sc,H,KV,st),"k");
-        die(blackwell::kernels::gemv_int8(v,(int8_t*)xi,xs,Wl.v.d,Wl.v.sc,H,KV,st),"v");
+        die(blackwell::kernels::gemv_int8_warp(q,(int8_t*)xi,xs,Wl.q.d,Wl.q.sc,H,QD,st),"q");
+        die(blackwell::kernels::gemv_int8_warp(k,(int8_t*)xi,xs,Wl.k.d,Wl.k.sc,H,KV,st),"k");
+        die(blackwell::kernels::gemv_int8_warp(v,(int8_t*)xi,xs,Wl.v.d,Wl.v.sc,H,KV,st),"v");
         // Apply Q/K norms before attention
         head_norm_kernel<<<nqh,128,0,st>>>(q,Wl.qn,nqh,hd,eps);
         head_norm_kernel<<<nkv,128,0,st>>>(k,Wl.kn,nkv,hd,eps);
@@ -232,17 +232,17 @@ int main(int argc, char** argv) {
         die(blackwell::kernels::attention_decode_gqa(at,q,kc+kb,vc+kb,sp,nqh,nkv,hd,MAXSEQ,st),"attn");
         cs(at,as_,QD,st,"as");
         die(blackwell::kernels::pack_int8(ai_,at,as_,QD,st),"pack");
-        die(blackwell::kernels::gemv_int8(pr,ai_,as_,Wl.o.d,Wl.o.sc,QD,H,st),"o");
+        die(blackwell::kernels::gemv_int8_warp(pr,ai_,as_,Wl.o.d,Wl.o.sc,QD,H,st),"o");
         die(blackwell::kernels::vector_add_fp32(pr,pr,xx,H,st),"res1");
         die(cudaMemcpyAsync(r,pr,H*4,cudaMemcpyDeviceToDevice,st),"save_res");
         die(blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)xi,xs,pr,d_rn,H,eps,st),"rmsnorm2");
-        die(blackwell::kernels::gemv_int8(ga,(int8_t*)xi,xs,Wl.g.d,Wl.g.sc,H,ID,st),"gate");
-        die(blackwell::kernels::gemv_int8(up,(int8_t*)xi,xs,Wl.u.d,Wl.u.sc,H,ID,st),"up");
+        die(blackwell::kernels::gemv_int8_warp(ga,(int8_t*)xi,xs,Wl.g.d,Wl.g.sc,H,ID,st),"gate");
+        die(blackwell::kernels::gemv_int8_warp(up,(int8_t*)xi,xs,Wl.u.d,Wl.u.sc,H,ID,st),"up");
         die(blackwell::kernels::apply_swiglu(ml,ga,up,ID,st),"swiglu");
         cs(ml,ms_,ID,st,"ms");
         die(blackwell::kernels::pack_int8(mi_,ml,ms_,ID,st),"pack2");
-        die(blackwell::kernels::gemv_int8(pr,mi_,ms_,Wl.d.d,Wl.d.sc,ID,H,st),"down");
+        die(blackwell::kernels::gemv_int8_warp(pr,mi_,ms_,Wl.d.d,Wl.d.sc,ID,H,st),"down");
         die(blackwell::kernels::vector_add_fp32(pr,pr,r,H,st),"res2");
     };
 
@@ -288,9 +288,9 @@ int main(int argc, char** argv) {
         int kb=l*nkv*MAXSEQ*hd;
         blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi_f,d_xs,d_x,d_rn,H,eps,st);
-        blackwell::kernels::gemv_int8(d_Q,(int8_t*)d_xi_f,d_xs,W[l].q.d,W[l].q.sc,H,QD,st);
-        blackwell::kernels::gemv_int8(d_K,(int8_t*)d_xi_f,d_xs,W[l].k.d,W[l].k.sc,H,KV,st);
-        blackwell::kernels::gemv_int8(d_V,(int8_t*)d_xi_f,d_xs,W[l].v.d,W[l].v.sc,H,KV,st);
+        blackwell::kernels::gemv_int8_warp(d_Q,(int8_t*)d_xi_f,d_xs,W[l].q.d,W[l].q.sc,H,QD,st);
+        blackwell::kernels::gemv_int8_warp(d_K,(int8_t*)d_xi_f,d_xs,W[l].k.d,W[l].k.sc,H,KV,st);
+        blackwell::kernels::gemv_int8_warp(d_V,(int8_t*)d_xi_f,d_xs,W[l].v.d,W[l].v.sc,H,KV,st);
         head_norm_kernel<<<nqh,128,0,st>>>(d_Q,W[l].qn,nqh,hd,eps);
         head_norm_kernel<<<nkv,128,0,st>>>(d_K,W[l].kn,nkv,hd,eps);
         // RoPE: read seq_pos from device memory, index precomputed cache
@@ -301,18 +301,18 @@ int main(int argc, char** argv) {
             d_attn,d_Q,d_kc+kb,d_vc+kb,0,nqh,nkv,hd,MAXSEQ,st);
         absmax_scales_kernel<<<QD/16,32,0,st>>>(d_attn,d_as,QD);
         blackwell::kernels::pack_int8(d_ai,d_attn,d_as,QD,st);
-        blackwell::kernels::gemv_int8(d_proj,d_ai,d_as,W[l].o.d,W[l].o.sc,QD,H,st);
+        blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,W[l].o.d,W[l].o.sc,QD,H,st);
         blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_x,H,st);
         cudaMemcpyAsync(d_res,d_proj,H*4,cudaMemcpyDeviceToDevice,st);
         blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi_f,d_xs,d_proj,d_rn,H,eps,st);
         // MLP block
-        blackwell::kernels::gemv_int8(d_gate,(int8_t*)d_xi_f,d_xs,W[l].g.d,W[l].g.sc,H,ID,st);
-        blackwell::kernels::gemv_int8(d_up,(int8_t*)d_xi_f,d_xs,W[l].u.d,W[l].u.sc,H,ID,st);
+        blackwell::kernels::gemv_int8_warp(d_gate,(int8_t*)d_xi_f,d_xs,W[l].g.d,W[l].g.sc,H,ID,st);
+        blackwell::kernels::gemv_int8_warp(d_up,(int8_t*)d_xi_f,d_xs,W[l].u.d,W[l].u.sc,H,ID,st);
         blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st);
         absmax_scales_kernel<<<ID/16,32,0,st>>>(d_mlp,d_ms,ID);
         blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,ID,st);
-        blackwell::kernels::gemv_int8(d_proj,d_mi,d_ms,W[l].d.d,W[l].d.sc,ID,H,st);
+        blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,W[l].d.d,W[l].d.sc,ID,H,st);
         blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
         cudaMemcpyAsync(d_x,d_proj,H*4,cudaMemcpyDeviceToDevice,st);
     }
@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
     // Final RMSNorm + lm_head
     die(blackwell::kernels::fused_rmsnorm_quant_int8(
         (int8_t*)d_xi_f,d_fn_sc,d_proj,d_fn,H,eps,st),"fn");
-    die(blackwell::kernels::gemv_int8(d_logits,(int8_t*)d_xi_f,d_fn_sc,
+    die(blackwell::kernels::gemv_int8_warp(d_logits,(int8_t*)d_xi_f,d_fn_sc,
         d_emb_d,d_emb_sc,H,V,st),"lm_head");
     cudaStreamSynchronize(st);
     {

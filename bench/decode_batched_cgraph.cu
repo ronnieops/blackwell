@@ -115,23 +115,23 @@ int main(int argc, char** argv){
                 // d_res = d_proj (save for MLP)
                 // d_x = proj (for next layer) — via async copy
                 blackwell::kernels::fused_rmsnorm_quant_int8(d_xi[m],d_xs[m],d_x[m],d_rn,H,1e-6f,st);
-                blackwell::kernels::gemv_int8(d_Q[m],d_xi[m],d_xs[m],W[l].q.d,W[l].q.sc,H,Q,st);
-                blackwell::kernels::gemv_int8(d_K,d_xi[m],d_xs[m],W[l].k.d,W[l].k.sc,H,KV,st);
-                blackwell::kernels::gemv_int8(d_V,d_xi[m],d_xs[m],W[l].v.d,W[l].v.sc,H,KV,st);
+                blackwell::kernels::gemv_int8_warp(d_Q[m],d_xi[m],d_xs[m],W[l].q.d,W[l].q.sc,H,Q,st);
+                blackwell::kernels::gemv_int8_warp(d_K,d_xi[m],d_xs[m],W[l].k.d,W[l].k.sc,H,KV,st);
+                blackwell::kernels::gemv_int8_warp(d_V,d_xi[m],d_xs[m],W[l].v.d,W[l].v.sc,H,KV,st);
                 blackwell::kernels::update_kv_cache(d_kc,d_vc,d_K,d_V,0,SEQ-1,nkv,hd,SEQ,st);
                 blackwell::kernels::attention_decode_gqa(d_attn[m],d_Q[m],d_kc,d_vc,SEQ-1,nqh,nkv,hd,SEQ,st);
                 blackwell::kernels::pack_int8(d_ai[m],d_attn[m],d_as[m],Q,st);
-                blackwell::kernels::gemv_int8(d_proj[m],d_ai[m],d_as[m],W[l].o.d,W[l].o.sc,Q,H,st);
+                blackwell::kernels::gemv_int8_warp(d_proj[m],d_ai[m],d_as[m],W[l].o.d,W[l].o.sc,Q,H,st);
                 blackwell::kernels::vector_add_fp32(d_proj[m],d_proj[m],d_x[m],H,st);
                 // Save proj to res (for MLP residual), then copy proj to x (for next layer)
                 blackwell::kernels::vector_add_fp32(d_res[m],d_proj[m],d_x[m],H,st); // res = proj
                 // MLP: proj = down * swiglu(gate,up) + res
                 blackwell::kernels::fused_rmsnorm_quant_int8(d_xi[m],d_xs[m],d_proj[m],d_rn,H,1e-6f,st);
-                blackwell::kernels::gemv_int8(d_gate[m],d_xi[m],d_xs[m],W[l].g.d,W[l].g.sc,H,I,st);
-                blackwell::kernels::gemv_int8(d_up[m],  d_xi[m],d_xs[m],W[l].u.d,W[l].u.sc,H,I,st);
+                blackwell::kernels::gemv_int8_warp(d_gate[m],d_xi[m],d_xs[m],W[l].g.d,W[l].g.sc,H,I,st);
+                blackwell::kernels::gemv_int8_warp(d_up[m],  d_xi[m],d_xs[m],W[l].u.d,W[l].u.sc,H,I,st);
                 blackwell::kernels::apply_swiglu(d_mlp[m],d_gate[m],d_up[m],I,st);
                 blackwell::kernels::pack_int8(d_mi[m],d_mlp[m],d_ms[m],I,st);
-                blackwell::kernels::gemv_int8(d_proj[m],d_mi[m],d_ms[m],W[l].d.d,W[l].d.sc,I,H,st);
+                blackwell::kernels::gemv_int8_warp(d_proj[m],d_mi[m],d_ms[m],W[l].d.d,W[l].d.sc,I,H,st);
                 blackwell::kernels::vector_add_fp32(d_proj[m],d_proj[m],d_res[m],H,st);
                 // Copy proj to x (for next layer) — async to be capture-compatible
                 cudaMemcpyAsync(d_x[m],d_proj[m],H*4,cudaMemcpyDeviceToDevice,st);
@@ -172,20 +172,20 @@ int main(int argc, char** argv){
     for(int l=0;l<NL;++l){
         for(int m=0;m<M;++m){
             blackwell::kernels::fused_rmsnorm_quant_int8(d_xi[m],d_xs[m],d_x[m],d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8(d_Q[m],d_xi[m],d_xs[m],W[l].q.d,W[l].q.sc,H,Q,st);
-            blackwell::kernels::gemv_int8(d_K,d_xi[m],d_xs[m],W[l].k.d,W[l].k.sc,H,KV,st);
-            blackwell::kernels::gemv_int8(d_V,d_xi[m],d_xs[m],W[l].v.d,W[l].v.sc,H,KV,st);
+            blackwell::kernels::gemv_int8_warp(d_Q[m],d_xi[m],d_xs[m],W[l].q.d,W[l].q.sc,H,Q,st);
+            blackwell::kernels::gemv_int8_warp(d_K,d_xi[m],d_xs[m],W[l].k.d,W[l].k.sc,H,KV,st);
+            blackwell::kernels::gemv_int8_warp(d_V,d_xi[m],d_xs[m],W[l].v.d,W[l].v.sc,H,KV,st);
             blackwell::kernels::update_kv_cache(d_kc,d_vc,d_K,d_V,0,SEQ-1,nkv,hd,SEQ,st);
             blackwell::kernels::attention_decode_gqa(d_attn[m],d_Q[m],d_kc,d_vc,SEQ-1,nqh,nkv,hd,SEQ,st);
             blackwell::kernels::pack_int8(d_ai[m],d_attn[m],d_as[m],Q,st);
-            blackwell::kernels::gemv_int8(d_proj[m],d_xi[m],d_as[m],W[l].o.d,W[l].o.sc,Q,H,st);
+            blackwell::kernels::gemv_int8_warp(d_proj[m],d_xi[m],d_as[m],W[l].o.d,W[l].o.sc,Q,H,st);
             blackwell::kernels::vector_add_fp32(d_proj[m],d_proj[m],d_x[m],H,st);
             blackwell::kernels::fused_rmsnorm_quant_int8(d_xi[m],d_xs[m],d_proj[m],d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8(d_gate[m],d_xi[m],d_xs[m],W[l].g.d,W[l].g.sc,H,I,st);
-            blackwell::kernels::gemv_int8(d_up[m],  d_xi[m],d_xs[m],W[l].u.d,W[l].u.sc,H,I,st);
+            blackwell::kernels::gemv_int8_warp(d_gate[m],d_xi[m],d_xs[m],W[l].g.d,W[l].g.sc,H,I,st);
+            blackwell::kernels::gemv_int8_warp(d_up[m],  d_xi[m],d_xs[m],W[l].u.d,W[l].u.sc,H,I,st);
             blackwell::kernels::apply_swiglu(d_mlp[m],d_gate[m],d_up[m],I,st);
             blackwell::kernels::pack_int8(d_mi[m],d_mlp[m],d_ms[m],I,st);
-            blackwell::kernels::gemv_int8(d_proj[m],d_mi[m],d_ms[m],W[l].d.d,W[l].d.sc,I,H,st);
+            blackwell::kernels::gemv_int8_warp(d_proj[m],d_mi[m],d_ms[m],W[l].d.d,W[l].d.sc,I,H,st);
             blackwell::kernels::vector_add_fp32(d_proj[m],d_proj[m],d_res[m],H,st);
             // Use d_res as preserved attn output — copy proj to x for next layer
             // Copy proj to d_x[m] for next layer start (async for capture compat)

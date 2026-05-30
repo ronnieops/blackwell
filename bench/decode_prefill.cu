@@ -175,7 +175,7 @@ void bench_gemv(const char* label, int K, int N, int IT, cudaStream_t st){
     cudaStreamSynchronize(st);
     auto t0=Clock::now();
     for(int i=0;i<IT;++i)
-        blackwell::kernels::gemv_int8(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
+        blackwell::kernels::gemv_int8_warp(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
     cudaStreamSynchronize(st);
     auto t1=Clock::now();
     double ms=std::chrono::duration<double,std::milli>(t1-t0).count();

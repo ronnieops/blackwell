@@ -118,13 +118,13 @@ int main() {
     printf("\n## 2. gemv_int8 benchmark (K=%d, N=%d)\n\n", K, N);
 
     for (int i = 0; i < warm; ++i)
-        blackwell::kernels::gemv_int8(d_y, d_x8, d_x8_scale, d_W8_t, d_W8_scale_t, K, N, 0);
+        blackwell::kernels::gemv_int8_warp(d_y, d_x8, d_x8_scale, d_W8_t, d_W8_scale_t, K, N, 0);
     cudaDeviceSynchronize();
 
     GpuTimer t;
     t.begin();
     for (int i = 0; i < bench; ++i)
-        blackwell::kernels::gemv_int8(d_y, d_x8, d_x8_scale, d_W8_t, d_W8_scale_t, K, N, 0);
+        blackwell::kernels::gemv_int8_warp(d_y, d_x8, d_x8_scale, d_W8_t, d_W8_scale_t, K, N, 0);
     float ms = t.end() / bench;
 
     size_t total = K + nw + nb_x*4 + nb_W*4 + N*4;

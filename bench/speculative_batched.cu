@@ -78,8 +78,8 @@ int main(int argc, char** argv) {
     GpuTimer ta;ta.start();
     for(int i=0;i<iters;++i){
         for(int m=0;m<M;++m){
-            blackwell::kernels::gemv_int8(g+m*I,xM+m*H,xMs+m*(H/16),gate.d,gate.ds,H,I,0);
-            blackwell::kernels::gemv_int8(u+m*I,xM+m*H,xMs+m*(H/16),up.d,up.ds,H,I,0);
+            blackwell::kernels::gemv_int8_warp(g+m*I,xM+m*H,xMs+m*(H/16),gate.d,gate.ds,H,I,0);
+            blackwell::kernels::gemv_int8_warp(u+m*I,xM+m*H,xMs+m*(H/16),up.d,up.ds,H,I,0);
         }
     }
     cudaDeviceSynchronize();float ms_a=ta.stop();
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     GpuTimer tc;tc.start();
     for(int i=0;i<iters;++i){
         for(int m=0;m<M;++m){
-            blackwell::kernels::gemv_int8(proj+m*H,xM+m*H,xMs+m*(H/16),down.d,down.ds,H,H,0);
+            blackwell::kernels::gemv_int8_warp(proj+m*H,xM+m*H,xMs+m*(H/16),down.d,down.ds,H,H,0);
         }
     }
     cudaDeviceSynchronize();float ms_c=tc.stop();

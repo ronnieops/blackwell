@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
 
     // Run both GEMVs
     chk(blackwell::kernels::gemv_fp4_v2(d_y4, d_x4, d_xs, d_w_t, d_sc_t, K, N, 0), "gemv_fp4_v2");
-    chk(blackwell::kernels::gemv_int8(d_y8, d_i8_x, d_i8_xs, d_i8_t, d_i8_sc_t, K, N, 0), "gemv_int8");
+    chk(blackwell::kernels::gemv_int8_warp(d_y8, d_i8_x, d_i8_xs, d_i8_t, d_i8_sc_t, K, N, 0), "gemv_int8");
     cudaDeviceSynchronize();
 
     // Compare

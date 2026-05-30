@@ -69,24 +69,24 @@ static void layer_single(LW&L,float*Q,float*K,float*V,float*attn,float*proj,
     // Attention
     blackwell::kernels::unpack_fp4(res,xfp4,xs,2048,0);
     blackwell::kernels::pack_int8(xi8,res,xi8s,2048,0);
-    blackwell::kernels::gemv_int8(Q,xi8,xi8s,L.q.d,L.q.ds,2048,2048,0);
-    blackwell::kernels::gemv_int8(K,xi8,xi8s,L.k.d,L.k.ds,2048,1024,0);
-    blackwell::kernels::gemv_int8(V,xi8,xi8s,L.v.d,L.v.ds,2048,1024,0);
+    blackwell::kernels::gemv_int8_warp(Q,xi8,xi8s,L.q.d,L.q.ds,2048,2048,0);
+    blackwell::kernels::gemv_int8_warp(K,xi8,xi8s,L.k.d,L.k.ds,2048,1024,0);
+    blackwell::kernels::gemv_int8_warp(V,xi8,xi8s,L.v.d,L.v.ds,2048,1024,0);
     blackwell::kernels::update_kv_cache(kc+kb,vc+kb,K,V,0,sq,8,128,2048,0);
     blackwell::kernels::attention_decode_gqa(attn,Q,kc+kb,vc+kb,sq,16,8,128,2048,0);
     blackwell::kernels::pack_int8(ai8,attn,ai8s,2048,0);
-    blackwell::kernels::gemv_int8(proj,ai8,ai8s,L.o.d,L.o.ds,2048,2048,0);
+    blackwell::kernels::gemv_int8_warp(proj,ai8,ai8s,L.o.d,L.o.ds,2048,2048,0);
     blackwell::kernels::vector_add_fp32(proj,proj,res,2048,0);
     blackwell::kernels::fused_rmsnorm_quant_int8(xi8,xi8s,proj,rn,2048,1e-6f,0);
     blackwell::kernels::fused_rmsnorm_pack(xfp4,xs,proj,rn,2048,1e-6f,0);
     // MLP
     blackwell::kernels::unpack_fp4(res,xfp4,xs,2048,0);
     blackwell::kernels::pack_int8(xi8,res,xi8s,2048,0);
-    blackwell::kernels::gemv_int8(gate,xi8,xi8s,L.gate.d,L.gate.ds,2048,6144,0);
-    blackwell::kernels::gemv_int8(up,xi8,xi8s,L.up.d,L.up.ds,2048,6144,0);
+    blackwell::kernels::gemv_int8_warp(gate,xi8,xi8s,L.gate.d,L.gate.ds,2048,6144,0);
+    blackwell::kernels::gemv_int8_warp(up,xi8,xi8s,L.up.d,L.up.ds,2048,6144,0);
     blackwell::kernels::apply_swiglu(mlp,gate,up,6144,0);
     blackwell::kernels::pack_int8(mi8,mlp,mi8s,6144,0);
-    blackwell::kernels::gemv_int8(proj,mi8,mi8s,L.down.d,L.down.ds,6144,2048,0);
+    blackwell::kernels::gemv_int8_warp(proj,mi8,mi8s,L.down.d,L.down.ds,6144,2048,0);
     blackwell::kernels::vector_add_fp32(proj,proj,res,2048,0);
     blackwell::kernels::fused_rmsnorm_quant_int8(xi8,xi8s,proj,rn,2048,1e-6f,0);
     blackwell::kernels::fused_rmsnorm_pack(xfp4,xs,proj,rn,2048,1e-6f,0);
@@ -109,13 +109,13 @@ static void layer_batched_M(LW&L,int M,
     // Attention: serial per-token (KV cache)
     for(int m=0;m<M;++m){
         int kb=base_kb+m*8*2048*128;
-        blackwell::kernels::gemv_int8(Q,xM+m*2048,xMs+m*128,L.q.d,L.q.ds,2048,2048,0);
-        blackwell::kernels::gemv_int8(K,xM+m*2048,xMs+m*128,L.k.d,L.k.ds,2048,1024,0);
-        blackwell::kernels::gemv_int8(V,xM+m*2048,xMs+m*128,L.v.d,L.v.ds,2048,1024,0);
+        blackwell::kernels::gemv_int8_warp(Q,xM+m*2048,xMs+m*128,L.q.d,L.q.ds,2048,2048,0);
+        blackwell::kernels::gemv_int8_warp(K,xM+m*2048,xMs+m*128,L.k.d,L.k.ds,2048,1024,0);
+        blackwell::kernels::gemv_int8_warp(V,xM+m*2048,xMs+m*128,L.v.d,L.v.ds,2048,1024,0);
         blackwell::kernels::update_kv_cache(kc+kb,vc+kb,K,V,0,sq,8,128,2048,0);
         blackwell::kernels::attention_decode_gqa(attn,Q,kc+kb,vc+kb,sq,16,8,128,2048,0);
         blackwell::kernels::pack_int8(ai8+m*2048,attn,ai8s+m*128,2048,0);
-        blackwell::kernels::gemv_int8(proj+m*2048,ai8+m*2048,ai8s+m*128,L.o.d,L.o.ds,2048,2048,0);
+        blackwell::kernels::gemv_int8_warp(proj+m*2048,ai8+m*2048,ai8s+m*128,L.o.d,L.o.ds,2048,2048,0);
         blackwell::kernels::unpack_fp4(res,xfp4M[m],xsM[m],2048,0);
         blackwell::kernels::vector_add_fp32(proj+m*2048,proj+m*2048,res,2048,0);
         blackwell::kernels::fused_rmsnorm_quant_int8(xM+m*2048,xMs+m*128,proj+m*2048,rn,2048,1e-6f,0);

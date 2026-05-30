@@ -361,28 +361,28 @@ int main(int argc, char** argv) {
         // 1. RMSNorm+quant
         die(blackwell::kernels::fused_rmsnorm_quant_int8(d_xid,d_xsd,d_xd,d_rn,H,eps,st),"rmsnorm");
         // 2-4. QKV GEMV
-        die(blackwell::kernels::gemv_int8(d_Qd,d_xid,d_xsd,w.qt.d,w.qt.sc,H,Q,st),"q");
-        die(blackwell::kernels::gemv_int8(d_Kd,d_xid,d_xsd,w.kt.d,w.kt.sc,H,KV,st),"k");
-        die(blackwell::kernels::gemv_int8(d_Vd,d_xid,d_xsd,w.vt.d,w.vt.sc,H,KV,st),"v");
+        die(blackwell::kernels::gemv_int8_warp(d_Qd,d_xid,d_xsd,w.qt.d,w.qt.sc,H,Q,st),"q");
+        die(blackwell::kernels::gemv_int8_warp(d_Kd,d_xid,d_xsd,w.kt.d,w.kt.sc,H,KV,st),"k");
+        die(blackwell::kernels::gemv_int8_warp(d_Vd,d_xid,d_xsd,w.vt.d,w.vt.sc,H,KV,st),"v");
         // 5. KV cache
         die(blackwell::kernels::update_kv_cache(d_kc,d_vc,d_Kd,d_Vd,0,seq_pos,nkv,hd,max_seq,st),"kv");
         // 6. Decode attention
         die(blackwell::kernels::attention_decode_gqa(d_ad,d_Qd,d_kc,d_vc,seq_pos,nqh,nkv,hd,max_seq,st),"attn");
         // 7. Wo GEMV (pack→gemv)
         die(blackwell::kernels::pack_int8(d_ai,d_ad,d_as,Q,st),"pack");
-        die(blackwell::kernels::gemv_int8(d_pd,d_ai,d_as,w.ot.d,w.ot.sc,Q,H,st),"wo");
+        die(blackwell::kernels::gemv_int8_warp(d_pd,d_ai,d_as,w.ot.d,w.ot.sc,Q,H,st),"wo");
         // 8. Residual
         die(blackwell::kernels::vector_add_fp32(d_pd,d_pd,d_xd,H,st),"res");
         // 9. RMSNorm+quant for MLP
         die(blackwell::kernels::fused_rmsnorm_quant_int8(d_xid,d_xsd,d_pd,d_rn,H,eps,st),"rn2");
         // 10. Gate+Up GEMV
-        die(blackwell::kernels::gemv_int8(d_gd,d_xid,d_xsd,w.gt.d,w.gt.sc,H,I,st),"gate");
-        die(blackwell::kernels::gemv_int8(d_ud,d_xid,d_xsd,w.ut.d,w.ut.sc,H,I,st),"up");
+        die(blackwell::kernels::gemv_int8_warp(d_gd,d_xid,d_xsd,w.gt.d,w.gt.sc,H,I,st),"gate");
+        die(blackwell::kernels::gemv_int8_warp(d_ud,d_xid,d_xsd,w.ut.d,w.ut.sc,H,I,st),"up");
         // 11. SwiGLU
         die(blackwell::kernels::apply_swiglu(d_md,d_gd,d_ud,I,st),"swiglu");
         // 12. Down GEMV
         die(blackwell::kernels::pack_int8(d_mi,d_md,d_ms,I,st),"pack2");
-        die(blackwell::kernels::gemv_int8(d_pd,d_mi,d_ms,w.dt.d,w.dt.sc,I,H,st),"down");
+        die(blackwell::kernels::gemv_int8_warp(d_pd,d_mi,d_ms,w.dt.d,w.dt.sc,I,H,st),"down");
         // 13. Residual
         die(blackwell::kernels::vector_add_fp32(d_xd,d_pd,d_xd,H,st),"res2");
         ++seq_pos;

@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
     std::vector<float> xs_h(nb_x, xs_val);
     cudaMemcpy(d_xs, xs_h.data(), nb_x*4, cudaMemcpyHostToDevice);
     check(blackwell::kernels::pack_int8(d_x8, d_x32, d_xs, K,0), "pack_int8(x)");
-    check(blackwell::kernels::gemv_int8(d_y, d_x8, d_xs, d_i8_t, d_i8_t_sc, K, N,0), "gemv_int8");
+    check(blackwell::kernels::gemv_int8_warp(d_y, d_x8, d_xs, d_i8_t, d_i8_t_sc, K, N,0), "gemv_int8");
     cudaDeviceSynchronize();
     printf("  gemv_int8 OK\n");
 

@@ -147,9 +147,9 @@ int main() {
         
         // Also dump d_rn output (stored in d_rn? No, d_rn is weight, not modified)
         
-        die(blackwell::kernels::gemv_int8(d_Q,(int8_t*)d_xi,d_xs,W0.q.d,W0.q.sc,H,QD,st),"q");
-        die(blackwell::kernels::gemv_int8(d_K,(int8_t*)d_xi,d_xs,W0.k.d,W0.k.sc,H,KV,st),"k");
-        die(blackwell::kernels::gemv_int8(d_V,(int8_t*)d_xi,d_xs,W0.v.d,W0.v.sc,H,KV,st),"v");
+        die(blackwell::kernels::gemv_int8_warp(d_Q,(int8_t*)d_xi,d_xs,W0.q.d,W0.q.sc,H,QD,st),"q");
+        die(blackwell::kernels::gemv_int8_warp(d_K,(int8_t*)d_xi,d_xs,W0.k.d,W0.k.sc,H,KV,st),"k");
+        die(blackwell::kernels::gemv_int8_warp(d_V,(int8_t*)d_xi,d_xs,W0.v.d,W0.v.sc,H,KV,st),"v");
         
         die(blackwell::kernels::update_kv_cache(d_kc,d_vc,d_K,d_V,0,sp,nkv,hd,MAXSEQ,st),"kv");
         // Dump specific KV cache slots for heads 0 and 1
@@ -191,7 +191,7 @@ int main() {
         
         compute_scales(d_attn,d_as,QD,st,"attn");
         die(blackwell::kernels::pack_int8(d_ai,d_attn,d_as,QD,st),"pack");
-        die(blackwell::kernels::gemv_int8(d_proj,d_ai,d_as,W0.o.d,W0.o.sc,QD,H,st),"o");
+        die(blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,W0.o.d,W0.o.sc,QD,H,st),"o");
         dump("Wo_out",d_proj,H);
         // Correct residual: hidden = Wo_out + x, save copy, also update d_proj for MLP
         die(blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_x,H,st),"res1");  // proj = Wo_out + x = hidden
@@ -199,12 +199,12 @@ int main() {
         
         die(blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi,d_xs,d_proj,d_rn,H,eps,st),"rmsnorm2");
-        die(blackwell::kernels::gemv_int8(d_gate,(int8_t*)d_xi,d_xs,W0.g.d,W0.g.sc,H,ID,st),"gate");
-        die(blackwell::kernels::gemv_int8(d_up,(int8_t*)d_xi,d_xs,W0.u.d,W0.u.sc,H,ID,st),"up");
+        die(blackwell::kernels::gemv_int8_warp(d_gate,(int8_t*)d_xi,d_xs,W0.g.d,W0.g.sc,H,ID,st),"gate");
+        die(blackwell::kernels::gemv_int8_warp(d_up,(int8_t*)d_xi,d_xs,W0.u.d,W0.u.sc,H,ID,st),"up");
         die(blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st),"swiglu");
         compute_scales(d_mlp,d_ms,ID,st,"mlp");
         die(blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,ID,st),"pack2");
-        die(blackwell::kernels::gemv_int8(d_proj,d_mi,d_ms,W0.d.d,W0.d.sc,ID,H,st),"down");
+        die(blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,W0.d.d,W0.d.sc,ID,H,st),"down");
         // Correct MLP residual: down_out + saved_res
         die(blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st),"res2");
     }

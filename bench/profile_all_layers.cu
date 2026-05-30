@@ -62,11 +62,11 @@ int main(int argc, char** argv){
     std::vector<float> t_gate(L), t_up(L), t_down(L);
     for(int l=0;l<L;++l){
         GpuTimer t;
-        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8(out,x8,xs8,g[l].d,g[l].ds,H,I,0);
+        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8_warp(out,x8,xs8,g[l].d,g[l].ds,H,I,0);
         t_gate[l]=t.stop()/iters*1e6;
-        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8(out,x8,xs8,u[l].d,u[l].ds,H,I,0);
+        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8_warp(out,x8,xs8,u[l].d,u[l].ds,H,I,0);
         t_up[l]=t.stop()/iters*1e6;
-        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8(out,x8,xs8,d[l].d,d[l].ds,H,I,0);
+        t.start(); for(int i=0;i<iters;++i) blackwell::kernels::gemv_int8_warp(out,x8,xs8,d[l].d,d[l].ds,H,I,0);
         t_down[l]=t.stop()/iters*1e6;
         printf("  %2d  %7.2f  %7.2f  %7.2f\n",l,t_gate[l],t_up[l],t_down[l]);
     }
@@ -94,9 +94,9 @@ int main(int argc, char** argv){
     t.start();
     for(int i=0;i<iters;++i){
         for(int l=0;l<L;++l){
-            blackwell::kernels::gemv_int8(out,x8,xs8,g[l].d,g[l].ds,H,I,0);
-            blackwell::kernels::gemv_int8(out,x8,xs8,u[l].d,u[l].ds,H,I,0);
-            blackwell::kernels::gemv_int8(out,x8,xs8,d[l].d,d[l].ds,H,I,0);
+            blackwell::kernels::gemv_int8_warp(out,x8,xs8,g[l].d,g[l].ds,H,I,0);
+            blackwell::kernels::gemv_int8_warp(out,x8,xs8,u[l].d,u[l].ds,H,I,0);
+            blackwell::kernels::gemv_int8_warp(out,x8,xs8,d[l].d,d[l].ds,H,I,0);
         }
     }
     cudaDeviceSynchronize();

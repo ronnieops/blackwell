@@ -67,7 +67,7 @@ int main() {
     // Run GEMVs
     chk(blackwell::kernels::gemv_fp4_v2(d_y_fp4, d_x4, d_xs, d_w4, d_w4s, K, N, 0), "fp4_v2");
     chk(blackwell::kernels::gemv_int8_from_fp4(d_y_fused, d_x4, d_xs, d_w, d_ws, K, N, 0), "fused");
-    chk(blackwell::kernels::gemv_int8(d_y_i8, d_x8, d_x8s, d_w, d_ws, K, N, 0), "int8");
+    chk(blackwell::kernels::gemv_int8_warp(d_y_i8, d_x8, d_x8s, d_w, d_ws, K, N, 0), "int8");
 
     // Compare
     std::vector<float> y_fp4(N), y_fused(N), y_i8(N);

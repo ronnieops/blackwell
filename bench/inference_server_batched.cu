@@ -49,30 +49,30 @@ void decode_seq(float*d_x, float*d_xi, float*d_xs, float*d_res,
         int kb=kb_base+s*nkv*SEQ*hd;
         blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),(float*)d_x+m*H,d_rn,H,1e-6f,st);
-        blackwell::kernels::gemv_int8((float*)d_Q+m*Q*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_Q+m*Q*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
             W[0].q.d,W[0].q.sc,H,Q,st);
-        blackwell::kernels::gemv_int8((float*)d_K+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_K+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
             W[0].k.d,W[0].k.sc,H,KV,st);
-        blackwell::kernels::gemv_int8((float*)d_V+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_V+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
             W[0].v.d,W[0].v.sc,H,KV,st);
         blackwell::kernels::update_kv_cache((float*)d_kc+kb,(float*)d_vc+kb,
             (float*)d_K+m*KV*4,(float*)d_V+m*KV*4,s,s,nkv,hd,SEQ,st);
         blackwell::kernels::attention_decode_gqa((float*)d_attn+m*Q*4,(float*)d_Q+m*Q*4,
             (float*)d_kc+kb,(float*)d_vc+kb,s,nqh,nkv,hd,SEQ,st);
         blackwell::kernels::pack_int8((int8_t*)d_ai+m*Q,(float*)d_attn+m*Q*4,(float*)d_as+m*(Q/16),Q,st);
-        blackwell::kernels::gemv_int8((float*)d_proj+m*H,(int8_t*)d_ai+m*Q,(float*)d_as+m*(Q/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_proj+m*H,(int8_t*)d_ai+m*Q,(float*)d_as+m*(Q/16),
             W[0].o.d,W[0].o.sc,Q,H,st);
         blackwell::kernels::vector_add_fp32((float*)d_proj+m*H,(float*)d_proj+m*H,(float*)d_x+m*H,H,st);
         blackwell::kernels::vector_add_fp32((float*)d_res+m*H,(float*)d_proj+m*H,(float*)d_x+m*H,H,st);
         blackwell::kernels::fused_rmsnorm_quant_int8(
             (int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),(float*)d_proj+m*H,d_rn,H,1e-6f,st);
-        blackwell::kernels::gemv_int8((float*)d_gate+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_gate+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
             W[0].g.d,W[0].g.sc,H,I,st);
-        blackwell::kernels::gemv_int8((float*)d_up+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_up+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
             W[0].u.d,W[0].u.sc,H,I,st);
         blackwell::kernels::apply_swiglu((float*)d_mlp+m*I*4,(float*)d_gate+m*I*4,(float*)d_up+m*I*4,I,st);
         blackwell::kernels::pack_int8((int8_t*)d_mi+m*I,(float*)d_mlp+m*I*4,(float*)d_ms+m*(I/16),I,st);
-        blackwell::kernels::gemv_int8((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
+        blackwell::kernels::gemv_int8_warp((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
             W[0].d.d,W[0].d.sc,I,H,st);
         blackwell::kernels::vector_add_fp32((float*)d_proj+m*H,(float*)d_proj+m*H,(float*)d_res+m*H,H,st);
         cudaMemcpyAsync((float*)d_x+m*H,(float*)d_proj+m*H,H*4,cudaMemcpyDeviceToDevice,st);
@@ -92,30 +92,30 @@ void batch_decode_per_seq(float*d_x, float*d_xi, float*d_xs, float*d_res,
             int kb=m*nkv*SEQ*hd+s*nkv*SEQ*hd;
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 (int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),(float*)d_x+m*H,d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8((float*)d_Q+m*Q*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_Q+m*Q*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
                 W[0].q.d,W[0].q.sc,H,Q,st);
-            blackwell::kernels::gemv_int8((float*)d_K+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_K+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
                 W[0].k.d,W[0].k.sc,H,KV,st);
-            blackwell::kernels::gemv_int8((float*)d_V+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_V+m*KV*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
                 W[0].v.d,W[0].v.sc,H,KV,st);
             blackwell::kernels::update_kv_cache((float*)d_kc+kb,(float*)d_vc+kb,
                 (float*)d_K+m*KV*4,(float*)d_V+m*KV*4,s,s,nkv,hd,SEQ,st);
             blackwell::kernels::attention_decode_gqa((float*)d_attn+m*Q*4,(float*)d_Q+m*Q*4,
                 (float*)d_kc+kb,(float*)d_vc+kb,s,nqh,nkv,hd,SEQ,st);
             blackwell::kernels::pack_int8((int8_t*)d_ai+m*Q,(float*)d_attn+m*Q*4,(float*)d_as+m*(Q/16),Q,st);
-            blackwell::kernels::gemv_int8((float*)d_proj+m*H,(int8_t*)d_ai+m*Q,(float*)d_as+m*(Q/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_proj+m*H,(int8_t*)d_ai+m*Q,(float*)d_as+m*(Q/16),
                 W[0].o.d,W[0].o.sc,Q,H,st);
             blackwell::kernels::vector_add_fp32((float*)d_proj+m*H,(float*)d_proj+m*H,(float*)d_x+m*H,H,st);
             blackwell::kernels::vector_add_fp32((float*)d_res+m*H,(float*)d_proj+m*H,(float*)d_x+m*H,H,st);
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 (int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),(float*)d_proj+m*H,d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8((float*)d_gate+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_gate+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
                 W[0].g.d,W[0].g.sc,H,I,st);
-            blackwell::kernels::gemv_int8((float*)d_up+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_up+m*I*4,(int8_t*)d_xi+m*H,(float*)d_xs+m*(H/16),
                 W[0].u.d,W[0].u.sc,H,I,st);
             blackwell::kernels::apply_swiglu((float*)d_mlp+m*I*4,(float*)d_gate+m*I*4,(float*)d_up+m*I*4,I,st);
             blackwell::kernels::pack_int8((int8_t*)d_mi+m*I,(float*)d_mlp+m*I*4,(float*)d_ms+m*(I/16),I,st);
-            blackwell::kernels::gemv_int8((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
                 W[0].d.d,W[0].d.sc,I,H,st);
             blackwell::kernels::vector_add_fp32((float*)d_proj+m*H,(float*)d_proj+m*H,(float*)d_res+m*H,H,st);
             cudaMemcpyAsync((float*)d_x+m*H,(float*)d_proj+m*H,H*4,cudaMemcpyDeviceToDevice,st);
@@ -174,7 +174,7 @@ void batch_decode_batched(float*d_x, float*d_xi, float*d_xs, float*d_res,
         for(int m=0;m<M;++m){
             blackwell::kernels::apply_swiglu((float*)d_mlp+m*I*4,(float*)d_gate+m*I*4,(float*)d_up+m*I*4,I,st);
             blackwell::kernels::pack_int8((int8_t*)d_mi+m*I,(float*)d_mlp+m*I*4,(float*)d_ms+m*(I/16),I,st);
-            blackwell::kernels::gemv_int8((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
+            blackwell::kernels::gemv_int8_warp((float*)d_proj+m*H,(int8_t*)d_mi+m*I,(float*)d_ms+m*(I/16),
                 W[0].d.d,W[0].d.sc,I,H,st);
             blackwell::kernels::vector_add_fp32((float*)d_proj+m*H,(float*)d_proj+m*H,(float*)d_res+m*H,H,st);
             cudaMemcpyAsync((float*)d_x+m*H,(float*)d_proj+m*H,H*4,cudaMemcpyDeviceToDevice,st);
@@ -257,28 +257,28 @@ int main(int argc, char** argv){
             int kb=s*nkv*MAXSEQ*hd;
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 (int8_t*)d_xi,(float*)d_xs,(float*)d_x,d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8((float*)d_Q,(int8_t*)d_xi,(float*)d_xs,
+            blackwell::kernels::gemv_int8_warp((float*)d_Q,(int8_t*)d_xi,(float*)d_xs,
                 W[0].q.d,W[0].q.sc,H,Q,st);
-            blackwell::kernels::gemv_int8((float*)d_K,(int8_t*)d_xi,(float*)d_xs,
+            blackwell::kernels::gemv_int8_warp((float*)d_K,(int8_t*)d_xi,(float*)d_xs,
                 W[0].k.d,W[0].k.sc,H,KV,st);
-            blackwell::kernels::gemv_int8((float*)d_V,(int8_t*)d_xi,(float*)d_xs,
+            blackwell::kernels::gemv_int8_warp((float*)d_V,(int8_t*)d_xi,(float*)d_xs,
                 W[0].v.d,W[0].v.sc,H,KV,st);
             blackwell::kernels::update_kv_cache((float*)d_kc+kb,(float*)d_vc+kb,
                 d_K,d_V,s,s,nkv,hd,MAXSEQ,st);
             blackwell::kernels::attention_decode_gqa(d_attn,d_Q,(float*)d_kc+kb,(float*)d_vc+kb,s,nqh,nkv,hd,MAXSEQ,st);
             blackwell::kernels::pack_int8(d_ai,d_attn,d_as,Q,st);
-            blackwell::kernels::gemv_int8(d_proj,d_ai,d_as,W[0].o.d,W[0].o.sc,Q,H,st);
+            blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,W[0].o.d,W[0].o.sc,Q,H,st);
             blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_x,H,st);
             blackwell::kernels::vector_add_fp32(d_res,d_proj,d_x,H,st);
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 (int8_t*)d_xi,(float*)d_xs,d_proj,d_rn,H,1e-6f,st);
-            blackwell::kernels::gemv_int8(d_gate,(int8_t*)d_xi,(float*)d_xs,
+            blackwell::kernels::gemv_int8_warp(d_gate,(int8_t*)d_xi,(float*)d_xs,
                 W[0].g.d,W[0].g.sc,H,I,st);
-            blackwell::kernels::gemv_int8(d_up,(int8_t*)d_xi,(float*)d_xs,
+            blackwell::kernels::gemv_int8_warp(d_up,(int8_t*)d_xi,(float*)d_xs,
                 W[0].u.d,W[0].u.sc,H,I,st);
             blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,I,st);
             blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,I,st);
-            blackwell::kernels::gemv_int8(d_proj,d_mi,d_ms,W[0].d.d,W[0].d.sc,I,H,st);
+            blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,W[0].d.d,W[0].d.sc,I,H,st);
             blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
             cudaMemcpyAsync(d_x,d_proj,H*4,cudaMemcpyDeviceToDevice,st);
         }

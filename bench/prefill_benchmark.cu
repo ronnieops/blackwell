@@ -81,10 +81,10 @@ int main(int argc,char** argv){
         cudaMemcpy(d_xsc,xsc.data(),xsc.size()*4,cudaMemcpyHostToDevice);
         cudaMemcpy(d_W,W.data(),K*N,cudaMemcpyHostToDevice);
         cudaMemcpy(d_Wsc,Wsc.data(),Wsc.size()*4,cudaMemcpyHostToDevice);
-        for(int w=0;w<3;++w)blackwell::kernels::gemv_int8(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
+        for(int w=0;w<3;++w)blackwell::kernels::gemv_int8_warp(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
         cudaStreamSynchronize(st);
         cudaEventRecord(s,st);
-        for(int i=0;i<IT*100;++i)blackwell::kernels::gemv_int8(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
+        for(int i=0;i<IT*100;++i)blackwell::kernels::gemv_int8_warp(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
         cudaEventRecord(e,st);cudaEventSynchronize(e);
         float tot;cudaEventElapsedTime(&tot,s,e);
         double ms=tot/(IT*100);

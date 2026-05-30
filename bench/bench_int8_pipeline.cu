@@ -123,7 +123,7 @@ int main() {
         for (int j = 0; j < warm; ++j) {
             float *d_y;
             cudaMalloc(&d_y, ws[i].N*4);
-            blackwell::kernels::gemv_int8(d_y, d_i8_x, d_i8_xs,
+            blackwell::kernels::gemv_int8_warp(d_y, d_i8_x, d_i8_xs,
                 w[i].d_w, w[i].d_sc, ws[i].K, ws[i].N, 0);
             cudaFree(d_y);
         }
@@ -135,7 +135,7 @@ int main() {
         GpuTimer ti;
         ti.start();
         for (int j = 0; j < iter; ++j)
-            blackwell::kernels::gemv_int8(d_y, d_i8_x, d_i8_xs,
+            blackwell::kernels::gemv_int8_warp(d_y, d_i8_x, d_i8_xs,
                 w[i].d_w, w[i].d_sc, ws[i].K, ws[i].N, 0);
         float ms_i8 = ti.stop() / iter;
         cudaDeviceSynchronize();
