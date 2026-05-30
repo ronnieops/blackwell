@@ -6,8 +6,8 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 
 ## 1. Mission
 
-Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (114 t/s).
-Current: **173.7 t/s** CUDA Graph (warp-cooperative GEMV), **155.5 t/s** per-kernel. Text output correct. **92 library symbols**.
+Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**253.6 t/s**, re-measured 2026-05-30).
+Current: **173.8 t/s** CUDA Graph (warp-cooperative GEMV, 69% of baseline), **155.5 t/s** per-kernel. Text output correct. **92 library symbols**.
 
 ---
 

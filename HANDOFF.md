@@ -6,7 +6,9 @@ Continuity doc. Read before acting.
 
 ## 1. Current Objective
 
-**Maximize INT8 decode throughput vs llama.cpp (114 t/s Q4_K_M).** Current: **173.7 t/s** CUDA Graph (152% of target). All modes pass, all stubs implemented. 92 symbols.
+**Maximize INT8 decode throughput vs llama.cpp (253.6 t/s Q4_K_M).** Current: **173.8 t/s** CUDA Graph (69% of target). All modes pass, all stubs implemented. 92 symbols.
+
+**NOTE**: Old baseline was 114 t/s (stale, from Phase C 2026-05-26). Re-benchmarked 2026-05-30 with latest llama.cpp (build 9212, CUDA 12.8) — actual Q4_K_M decode is **253.6 t/s** (2.2× the old number). Our INT8 is now 31% behind, not 52% ahead.
 
 ---
 
@@ -28,14 +30,12 @@ Continuity doc. Read before acting.
 
 | Path | t/s | vs 114 target |
 |------|-----|---------------|
-| **INT8 CUDA Graph (warp)** | **173.7** | **152%** ✅ |
-| INT8 per-kernel (warp, 28L) | 155.5 | 136% |
-| INT8 per-kernel (old, 28L) | 98.8 | 87% |
-| INT8 CUDA Graph (old) | 106.2 | 93% |
-| Mode D prefill+decode | 87 | 76% |
-| Batched GEMV M=4 | 61 req/s | — |
-| Speculative (M=4) | 227 batch t/s | 2.24× |
-| NVF4 GEMV optimized | 122 GB/s | 1.24× |
+| **INT8 CUDA Graph (warp)** | **173.8** | **69%** |
+| INT8 per-kernel (warp, 28L) | 155.5 | 61% |
+| llama.cpp Q4_K_M (end-to-end) | **253.6** | **baseline** |
+| llama.cpp F16 (end-to-end) | 108.4 | 43% |
+| INT8 per-kernel (old, 28L) | 98.8 | 39% |
+| INT8 CUDA Graph (old) | 106.2 | 42% |
 
 ---
 
@@ -129,13 +129,12 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|--------|
 | Library build | ✅ 92 symbols |
 | Warp GEMV correctness | ✅ cosine=1.0 vs old kernel |
-| INT8 CUDA Graph 28L | ✅ **173.7 t/s** (152% of 114 target) |
+| INT8 CUDA Graph 28L | ✅ **173.8 t/s** (69% of 253.6 llama.cpp baseline) |
 | Per-kernel 28L | ✅ **155.5 t/s** |
+| llama.cpp Q4_K_M baseline | ✅ **253.6 t/s** (re-measured 2026-05-30, build 9212) |
+| llama.cpp F16 baseline | ✅ 108.4 t/s |
 | L2 cache hints | ✅ +0.3% (marginal) |
 | Modes A-D | ✅ All pass |
-| Speculative decode | ✅ 2.24× |
-| NVF4 opt | ✅ 1.24× |
-| Thread-safety | ✅ Atomic spin-locks |
 | Stubs | ✅ 8/8 implemented |
 
 ---
@@ -156,9 +155,11 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 **Boot sequence**: `AGENTS.md` → `HANDOFF.md` → `git status --short` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l`
 
-**Verified state**: 92 symbols. CUDA Graph **173.7 t/s** (152% of 114 target). Per-kernel **155.5 t/s**. Warp-cooperative GEMV (1 warp/row, shuffle reduce). L2 cache hints active. `gemv_int8_warp` is production path.
+**Verified state**: 92 symbols. CUDA Graph **173.8 t/s** (69% of 253.6 llama.cpp Q4_K_M baseline). Per-kernel **155.5 t/s**. Warp-cooperative GEMV (1 warp/row, shuffle reduce). L2 cache hints active. `gemv_int8_warp` is production path.
 
-**Next priorities**: Docker packaging > attention decode optimization > fix head_norm > speculative CUDA Graph
+**CRITICAL**: llama.cpp Q4_K_M achieves 253.6 t/s end-to-end (re-measured 2026-05-30). Old 114 t/s baseline was stale (llama.cpp improved ~2.2× since Phase C). Our synthetic kernel throughput is 31% behind llama.cpp's full inference. Q4_K_M reads 2× less bandwidth per weight (4.5 bits vs 8 bits).
+
+**Next priorities**: Understand llama.cpp 253 t/s kernel techniques → INT4 weight format → attention decode optimization > Docker packaging
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
@@ -173,40 +174,38 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 ---
 
-## 10. llama.cpp Benchmark Plan
+## 10. llama.cpp Benchmark Results
 
-### Current baseline
-- **114 t/s Q4_K_M** — measured 2026-05-26 (Phase C) via `llama-bench tg128`
-- Source: `bench/PHASE_C_RESULTS.md`
-- Model: Qwen3-1.7B, quantized Q4_K_M
-- **Issue**: No Q4_K_M GGUF file exists on disk. Only `model-f16.gguf` in `/mnt/data/ai/hf/qwen3-1.7b-base/`
+### Fresh baseline (2026-05-30)
 
-### Steps to re-benchmark (fair comparison)
+| Benchmark | t/s | Notes |
+|-----------|-----|-------|
+| **llama.cpp Q4_K_M** | **253.6 ± 0.4** | End-to-end inference, build 9212, CUDA 12.8, sm_120 |
+| **Our INT8 CUDA Graph** | **173.8** | Synthetic, pure kernel throughput, sm_120a |
+| llama.cpp F16 | 108.4 | End-to-end, full precision |
+
+### Reproduction
 ```bash
-# 1. Quantize to Q4_K_M
-/mnt/data/ai/llama.cpp/build-opt/bin/llama-quantize \
-  /mnt/data/ai/hf/qwen3-1.7b-base/model-f16.gguf \
-  /mnt/data/ai/hf/qwen3-1.7b-base/model-q4_k_m.gguf \
-  Q4_K_M
+# Q4_K_M quantization (already done)
+llama-quantize model-f16.gguf model-q4_k_m.gguf Q4_K_M
+# → 3.3 GB → 1.05 GB, 5.12 BPW
 
-# 2. Run llama-bench (decode only, matching our seq_pos=128 context)
-/mnt/data/ai/llama.cpp/build-opt/bin/llama-bench \
-  -m /mnt/data/ai/hf/qwen3-1.7b-base/model-q4_k_m.gguf \
-  -p 128 -n 128 \
-  -pg 0,1 \
-  -r 5
+# llama-bench decode
+llama-bench -m model-q4_k_m.gguf -p 128 -n 128 -r 5
+# → tg128 = 253.6 t/s
 
-# 3. Our benchmark (for comparison)
+# Our benchmark
 ./bench/decode_int8_cgraph 28
+# → CUDA Graph = 173.8 t/s
 ```
 
-### Important: apples-to-apples comparison
-- Our benchmark: **synthetic** (all-ones input, no real text, no tokenization, no sampling)
-- llama-bench: **real inference** (tokenizer, softmax, sampling, real KV cache management)
-- Our 173.7 t/s measures **pure kernel throughput** (7 GEMV + attention + norm per layer)
-- llama.cpp 114 t/s includes **all overhead** (token embedding, logits, sampling)
-- Fair comparison: either (a) measure our text_generate end-to-end, or (b) measure llama.cpp with `--no-warmup` and isolate just the decode step
+### Why llama.cpp is faster (253 vs 174)
+1. **Q4_K_M = 4.5 bits/weight** vs our INT8 = 8 bits/weight → **44% less bandwidth**
+2. **llama.cpp uses warp-cooperative MMVQ** — same technique we just implemented, but with 4-bit weights
+3. **llama.cpp uses newer CUDA 12.8** — possible compiler optimizations for sm_120
+4. **End-to-end vs synthetic gap** — llama.cpp includes tokenizer/sampling overhead and still wins, meaning their kernel throughput is even higher than 253 t/s
 
-### Our end-to-end throughput
-- `text_generate` uses `gemv_fp32_int8_per_row` (NOT `gemv_int8_warp`) — needs migration
-- No current end-to-end t/s number with warp kernel
+### Path to closing the gap
+- **INT4/FP4 weight format** — must reduce from 8 bits to 4-5 bits per weight to compete on bandwidth
+- **NVF4 with corrected layout** — existing `gemv_fp4_nv` gets 98 GB/s (not competitive), needs layout fix
+- **Or: accept INT8 as different tradeoff** — INT8 has higher numerical precision than Q4_K_M, useful for quality-sensitive tasks
