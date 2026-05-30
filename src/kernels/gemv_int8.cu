@@ -18,7 +18,7 @@ namespace blackwell {
 namespace kernels {
 namespace {
 
-constexpr int kINT8Block = 256;
+constexpr int kINT8Block = 64;
 
 // ---------------------------------------------------------------------------
 // INT8 GEMV kernel — per-thread dot products, transposed weights

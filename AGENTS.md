@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (114 t/s).
-Current: **92.5 t/s** (28L INT8 pipeline), **99 t/s** with CUDA Graph + RoPE, **87 t/s** Mode D prefill+decode. Text output correct. **82 library symbols**.
+Current: **89.6 t/s** (28L INT8 pipeline, block=64), **106.4 t/s** with CUDA Graph, **87 t/s** Mode D prefill+decode. Text output correct. **88 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ Current: **92.5 t/s** (28L INT8 pipeline), **99 t/s** with CUDA Graph + RoPE, **
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 82 symbols in `build/libblackwell_kernels.a`
+**Library**: 88 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8` — INT8 GEMV, `__dp4a` SIMD, 775 GB/s (kernel), 260 GB/s (effective)
@@ -58,7 +58,7 @@ cmake --build build --parallel
 ```bash
 ./bench/decode_full_int8 4                    # INT8 pipeline, 93.9 t/s (scaled 28L)
 ./bench/text_generate "The capital of France is" 30  # Text gen, "Paris" ✓
-./bench/inference_server 28 4 20 8            # CUDA Graph 99 t/s, batched 61 req/s
+./bench/inference_server 28 4 20 8            # CUDA Graph 106 t/s, batched 61 req/s
 ```
 
 ### Model
@@ -75,7 +75,7 @@ cmake --build build --parallel
 | NVF4 scalar BW | 98 GB/s | FP4→float conversion ceiling |
 | INT8 vs NVF4 | 2.65× | FP4 can't match INT8 for decode |
 | GEMM prefill | 78 GB/s | 3× faster than llama.cpp |
-| CUDA Graph speedup | ~14% | 87→99 t/s |
+| CUDA Graph speedup | ~14% | 80→106 t/s (block=64) |
 | Batched GEMV M=8 | 17344 batch t/s | 18.86× vs per-kernel |
 
 ---
