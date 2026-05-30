@@ -70,21 +70,27 @@ Continuity doc. Read before acting.
 
 ## 5. Known Issues
 
-1. **Attention decode is new bottleneck** — 16.1ms vs 23ms for MLP GEMV. 13.6% of pipeline time. Flash decode or fused attention+O-proj would help
-2. **text_generate head_norm bug** — Pre-existing. "FAIL head_norm l=0". Unrelated to kernel changes
+1. **Attention decode is 13.5% of pipeline** — 16.1ms/118.9ms. MLP GEMV is still dominant at 57.7%. Single largest non-GEMV component, not the overall bottleneck
+2. **text_generate head_norm bug** — Pre-existing. "FAIL head_norm l=0". In `text_generate.cu` which uses `gemv_fp32_int8_per_row` (not `gemv_int8_warp`)
 3. **FP32 text_generate** — Precision accumulation over 28 layers. BF16 format issue
 4. **Spec decode CUDA Graph** — Warmup crash from `decode.cu` static `cudaMalloc`
 5. **Docker/API packaging** — Not done
-6. **11 bench .cu → 2 won't build** — `phase_a` (dead), `decode_full` (CUDA 13.3 compat)
+6. **~20 bench files still use old `gemv_int8`** — Only `decode_int8_cgraph.cu` and `decode_full_int8.cu` were updated. `inference_server.cu`, `speculative_decode.cu`, `text_generate.cu` etc. still use old kernel
+7. **CUDA Graph correctness drift** — Per-kernel vs graph outputs diverge ~4.0 after 25 iterations. FP4 quantization sensitivity on synthetic input. Not a real bug
+8. **L2 cache hint set on stream 0, not graph_stream** — `cudaStreamSetAttribute(0, ...)` doesn't affect the captured graph. `cudaDeviceSetLimit` works globally but the access policy window on stream 0 is effectively a no-op for the graph path
+9. **llama.cpp 114 t/s baseline is stale** — Measured in Phase C (2026-05-26) with Q4_K_M quantization. No Q4_K_M GGUF for Qwen3-1.7B exists on disk (only f16). Needs re-quantization and re-benchmark for fair comparison
 
 ---
 
 ## 6. Pending Tasks
 
+- [ ] **Re-benchmark vs llama.cpp** — Quantize Qwen3-1.7B to Q4_K_M, run llama-bench tg128, get fresh baseline
+- [ ] **Migrate remaining bench files to gemv_int8_warp** — inference_server.cu, speculative_decode.cu, text_generate.cu, etc.
 - [ ] Package inference server (Docker, API wrapper)
 - [ ] Wire gemm_int8_dp4a + quantize_int8 into inference_server.cu batched path
 - [ ] Fix CUDA Graph capture for speculative decode (warm-up ordering)
 - [ ] Fix text_generate head_norm bug
+- [ ] Fix L2 cache hint to target graph_stream instead of stream 0
 - [ ] Write inline PTX mxf4 MMA for NVF4 GEMV (potential 2-4× gain)
 
 ---
@@ -140,7 +146,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-05-30 |
 | branch | master |
-| last_commit | `14657ca` feat: warp-cooperative INT8 GEMV — 173 t/s CUDA Graph |
+| last_commit | `1828e4c` docs: update HANDOFF.md for session 5 (warp-cooperative, 173 t/s) |
 | repo_state | 92 symbols, clean |
 | sessions_completed | 5 (scale fix → stubs → dp4a+spec+NVF4 → block_size_opt → warp_cooperative) |
 
@@ -164,3 +170,43 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 - Use `gemv_int8` in production path (use `gemv_int8_warp` instead)
 
 **Update discipline**: Only update HANDOFF.md when materially new. Keep AGENTS.md as architecture reference, HANDOFF.md as session continuity.
+
+---
+
+## 10. llama.cpp Benchmark Plan
+
+### Current baseline
+- **114 t/s Q4_K_M** — measured 2026-05-26 (Phase C) via `llama-bench tg128`
+- Source: `bench/PHASE_C_RESULTS.md`
+- Model: Qwen3-1.7B, quantized Q4_K_M
+- **Issue**: No Q4_K_M GGUF file exists on disk. Only `model-f16.gguf` in `/mnt/data/ai/hf/qwen3-1.7b-base/`
+
+### Steps to re-benchmark (fair comparison)
+```bash
+# 1. Quantize to Q4_K_M
+/mnt/data/ai/llama.cpp/build-opt/bin/llama-quantize \
+  /mnt/data/ai/hf/qwen3-1.7b-base/model-f16.gguf \
+  /mnt/data/ai/hf/qwen3-1.7b-base/model-q4_k_m.gguf \
+  Q4_K_M
+
+# 2. Run llama-bench (decode only, matching our seq_pos=128 context)
+/mnt/data/ai/llama.cpp/build-opt/bin/llama-bench \
+  -m /mnt/data/ai/hf/qwen3-1.7b-base/model-q4_k_m.gguf \
+  -p 128 -n 128 \
+  -pg 0,1 \
+  -r 5
+
+# 3. Our benchmark (for comparison)
+./bench/decode_int8_cgraph 28
+```
+
+### Important: apples-to-apples comparison
+- Our benchmark: **synthetic** (all-ones input, no real text, no tokenization, no sampling)
+- llama-bench: **real inference** (tokenizer, softmax, sampling, real KV cache management)
+- Our 173.7 t/s measures **pure kernel throughput** (7 GEMV + attention + norm per layer)
+- llama.cpp 114 t/s includes **all overhead** (token embedding, logits, sampling)
+- Fair comparison: either (a) measure our text_generate end-to-end, or (b) measure llama.cpp with `--no-warmup` and isolate just the decode step
+
+### Our end-to-end throughput
+- `text_generate` uses `gemv_fp32_int8_per_row` (NOT `gemv_int8_warp`) — needs migration
+- No current end-to-end t/s number with warp kernel
