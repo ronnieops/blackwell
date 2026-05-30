@@ -83,10 +83,10 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 CUDA Graph (warp) | **173.6 t/s** | 69% of 253 t/s llama.cpp baseline |
+| INT8 CUDA Graph (warp) | **173.4 t/s** | 69% of 253 t/s llama.cpp baseline |
 | INT8 per-kernel (warp) | **155.5 t/s** | |
-| FP4 CUDA Graph | **137.4 t/s** | 79% of INT8, 54% of llama.cpp |
-| FP4 vs INT8 single GEMV | **0.5×** (Q), **0.63×** (MLP) | E2M1 unpack overhead vs dp4a |
+| INT4 warp GEMV | **0.40× SLOWER** than INT8 | Nibble unpack overhead negates 2× BW savings |
+| FP4 warp GEMV | **0.50× SLOWER** than INT8 | E2M1→float overhead, can't use dp4a |
 | llama.cpp Q4_K_M | **253.0 t/s** | End-to-end, build 9212, CUDA 12.8 |
 | llama.cpp F16 | **108.3 t/s** | End-to-end |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
@@ -95,6 +95,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | L2 cache hints | ⚠️ Wrong stream | Targets stream 0, not graph_stream |
 | Attention decode | 13.5% of pipeline | Single largest non-GEMV kernel |
 | hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
+| INT4/FP4 sub-byte GEMV | ❌ Not competitive | ~35 inst/byte unpack vs 0.31 inst/byte dp4a |
 
 ---
 

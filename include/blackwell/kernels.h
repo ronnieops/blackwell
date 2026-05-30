@@ -532,6 +532,19 @@ cudaError_t gemv_fp32_fp4_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Packed INT4 warp GEMV — signed INT4 activations × signed INT4 weights.
+// 2× less bandwidth than INT8. Uses __dp4a after nibble→int8 unpack.
+// x_packed: [K/2] bytes, x_scale: [K/16] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32
+cudaError_t gemv_int4_warp(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
 // Fixes quality: per-row scales prevent 16-row quantization error accumulation.
