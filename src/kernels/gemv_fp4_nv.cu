@@ -74,7 +74,52 @@ __global__ void gemv_fp4_nv_kernel(
     y_out[n_out] = acc;
 }
 
-} // anon namespace
+// ===========================================================================
+// Optimized NVF4 GEMV kernel — FP32 scales (pre-computed) + FP16 accumulator
+// Uses float* scales instead of uint8_t* UE4M3, eliminating ue4m3_to_float().
+// Inner loop uses __hfma (FP16 FMA) for higher throughput.
+// ===========================================================================
+__launch_bounds__(256, 1)
+__global__ void gemv_fp4_nv_opt_kernel(
+    float* __restrict__ y_out,
+    const __nv_fp4_e2m1* __restrict__ x_fp4,
+    const float* __restrict__ x_scale,
+    const __nv_fp4_e2m1* __restrict__ W_t_fp4,
+    const float* __restrict__ W_t_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    int tid = threadIdx.x;
+    int n_out = blockIdx.x * 256 + tid;
+    if (n_out >= N) return;
+
+    int n_blk = n_out / B;
+    int num_K = K / B;
+    const __nv_fp4_e2m1* w_row = &W_t_fp4[n_out * K];
+    float acc = 0.0f;
+
+    for (int kb = 0; kb < num_K; kb++) {
+        // FP32 scales (pre-converted, no ue4m3_to_float call)
+        float prod_sc = x_scale[kb] * W_t_scale[n_blk * num_K + kb];
+
+        // Load 16 FP4 values from W_t (vectorized)
+        alignas(16) __nv_fp4_e2m1 w_buf[B];
+        *reinterpret_cast<uint4*>(w_buf) = *reinterpret_cast<const uint4*>(&w_row[kb * B]);
+
+        // FP16 dot product via __hfma (2× throughput vs FP32 FMA)
+        __half sum_h = __float2half(0.0f);
+        #pragma unroll
+        for (int j = 0; j < B; j++) {
+            __half x_h = __float2half(static_cast<float>(x_fp4[kb*B+j]));
+            __half w_h = __float2half(static_cast<float>(w_buf[j]));
+            sum_h = __hfma(x_h, w_h, sum_h);
+        }
+        acc += __half2float(sum_h) * prod_sc;
+    }
+    y_out[n_out] = acc;
+}
+
+} // anonymous namespace
 
 // ===========================================================================
 // Public API
@@ -92,6 +137,23 @@ cudaError_t gemv_fp4_nv(
     gemv_fp4_nv_kernel<<<nb, 256, 0, stream>>>(
         y_out, (const Fp4*)x_fp4, (const uint8_t*)x_scale,
         (const Fp4*)W_t_fp4, (const uint8_t*)W_t_scale,
+        in_features, out_features);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t gemv_fp4_nv_opt(
+    float* y_out, const void* x_fp4, const void* x_scale,
+    const void* W_t_fp4, const void* W_t_scale,
+    int in_features, int out_features, cudaStream_t stream)
+{
+    using Fp4 = __nv_fp4_e2m1;
+    if (in_features % 16 != 0 || out_features % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    int nb = (out_features + 255) / 256;
+    gemv_fp4_nv_opt_kernel<<<nb, 256, 0, stream>>>(
+        y_out, (const Fp4*)x_fp4, (const float*)x_scale,
+        (const Fp4*)W_t_fp4, (const float*)W_t_scale,
         in_features, out_features);
     return cudaPeekAtLastError();
 }

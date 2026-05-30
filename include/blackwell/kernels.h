@@ -64,6 +64,19 @@ cudaError_t gemv_fp4_nv(
     int            out_features,
     cudaStream_t   stream = 0);
 
+// FP4 GEMV with FP32 pre-computed scales + FP16 accumulator (optimized)
+// Same as gemv_fp4_nv but scales are FP32 (not UE4M3), inner loop uses __hfma.
+// Scale conversion must be done offline (UE4M3→FP32) before calling.
+cudaError_t gemv_fp4_nv_opt(
+    float*          y,
+    const void*     x_fp4,
+    const void*     x_scale,      // FP32 [K/16] (pre-converted)
+    const void*     W_t_fp4,      // Transposed FP4 [N × K]
+    const void*     W_t_scale,    // FP32 [N/16 × K/16] (pre-converted)
+    int            in_features,
+    int            out_features,
+    cudaStream_t   stream = 0);
+
 // ---------------------------------------------------------------------------
 // Memory ops
 // ---------------------------------------------------------------------------
