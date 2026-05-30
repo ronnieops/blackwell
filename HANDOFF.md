@@ -24,8 +24,8 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 
 | Path | t/s | vs 253 llama.cpp |
 |------|-----|-----------------|
-| **INT8 CUDA Graph** | **173.2** | **68%** |
-| INT8 per-kernel | 155.5 | 61% |
+| **INT8 CUDA Graph** | **183.9** | **73%** |
+| INT8 per-kernel | 163.1 | 64% |
 | **FP4 CUDA Graph** | **247.3** | **98% ⚠️** |
 | FP4 per-kernel | 220.4 | 87% |
 | llama.cpp Q4_K_M | 253.0 | 100% |
@@ -40,10 +40,11 @@ INT8: **173.2 t/s** CUDA Graph (68% of target). FP4: **247 t/s** CUDA Graph (98%
 - **FP4 packed rejected for M=1 decode**: E2M1 nibble→float overhead can't use __dp4a SIMD. 0.5× single-kernel vs INT8.
 - **INT4 packed rejected for M=1 decode**: Signed 4-bit nibble→float→dp4a overhead (~35 inst/byte) negates 2× bandwidth savings. 0.40× single-kernel vs INT8. Same root cause as FP4.
 - **Sub-byte GEMV conclusion**: Both FP4 and INT4 packed formats are NOT competitive for M=1 decode on SM_120a. The nibble unpack overhead dominates. Only INT8 (with dp4a SIMD) is viable for single-token decode.
+- **Attention decode optimized**: Reduced from 256→128 threads, added float4 vectorized K reads. Result: +5.9% CUDA Graph throughput (173.6→183.9 t/s). Register usage: 48 regs/thread.
 - **text_generate head_norm**: `cudaPeekAtLastError` → `cudaGetLastError` throughout. False positive from async error accumulation fixed.
 - **Spec decode CUDA Graph**: Changed old `gemv_int8` → `gemv_int8_warp`. Added `cudaDeviceSynchronize()` after warm-up to ensure static cudaMalloc resolves before graph capture.
 - **hashcat**: Persistently runs on GPU-0. Kills ~45% throughput. Must kill before measurement.
-- **Next: attention optimization**: attention_decode_gqa is 13.5% of pipeline. Research optimize.
+- **Next: migrate 22 stale bench files to gemv_int8_warp**
 
 ---
 

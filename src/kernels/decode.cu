@@ -46,24 +46,14 @@ __global__ void update_kv_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Decode attention kernel v2: warp-parallel QK dot products + smem-tiled
+// Decode attention kernel v3: float4 vectorized K/V reads + 128 threads
 //
-// 8 warps × 32 threads = 256 threads per head block.
-//
-// QK scores: all 8 warps participate in dot product.
-//   smem_Q[128] — Q loaded once by warp 0, broadcast to all via smem.
-//   For each position t, all 8 warps load K[t*128..t*128+127] via coalesced
-//   float4 reads (32 loads of 4 floats = 128 values), dot with Q in parallel.
-//
-//   Each warp: 128/32 = 4 elements per thread → dot += Q[d] * K[t][d] for 4 d's.
-//   Warp reduce: __shfl_xor_sum over 4 → 1 score per warp.
-//   First warp collects 8 scores → writes scores[t] = sum(8 warp scores) * scale.
-//
-// Softmax: sequential over npos (npos ≪ 32*128 = 4096, fine for typical decode).
-//
-// V weighted sum: parallel over d. Each thread handles d range.
+// Same algorithm as v2 (scores in smem, sequential softmax) but with:
+// - 128 threads (4 warps) instead of 256
+// - Float4 vectorized K cache reads for QK dot product
+// - Reduced smem: Q[128] + scores[4096] = 17 KB
 // ---------------------------------------------------------------------------
-__launch_bounds__(256, 1)
+__launch_bounds__(128, 2)
 __global__ void attention_decode_kernel(
     float* __restrict__ output,
     const float* __restrict__ Q,
@@ -80,7 +70,6 @@ __global__ void attention_decode_kernel(
     int head = blockIdx.x;
     if (head >= num_q_heads) return;
 
-    // GQA: map Q head to KV head
     int kv_head = head * num_kv_heads / num_q_heads;
 
     int tid = threadIdx.x;
@@ -92,67 +81,52 @@ __global__ void attention_decode_kernel(
     Q += head * head_dim;
     output += head * head_dim;
 
-    // Shared memory: Q[128] + scores[4096]
-    // 128 floats for Q (512 B) + 4096 floats for scores (16384 B) = 16896 B
     extern __shared__ float smem[];
     float* smem_Q = smem;
     float* scores = smem + head_dim;
 
-    // Step 0: Load Q into smem (warp 0 does it, broadcast)
-    if (warp_id == 0 && lane_id < head_dim) {
-        smem_Q[lane_id] = Q[lane_id];
+    // Load Q into smem (all 128 threads participate)
+    if (tid < head_dim) {
+        smem_Q[tid] = Q[tid];
     }
     __syncthreads();
 
-    // Each thread: load 4 consecutive Q elements into registers
-    // (head_dim=128 → 4 per thread × 32 threads = 128, all warps get same)
+    // Load Q into registers: each thread gets Q[lane_id*4 .. lane_id*4+3]
+    // 32 threads × 4 = 128 elements = full head_dim
     float Q_reg[4];
-    int q_base = (lane_id * 4) % head_dim;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int d = i * 32 + lane_id;
-        Q_reg[i] = (d < head_dim) ? Q[d] : 0.0f;
+    {
+        const float4* Q4 = reinterpret_cast<const float4*>(smem_Q);
+        float4 q4 = Q4[lane_id];
+        Q_reg[0] = q4.x; Q_reg[1] = q4.y; Q_reg[2] = q4.z; Q_reg[3] = q4.w;
     }
 
-    // Step 1: Compute scores[t] for all t using all 8 warps
-    // Each warp covers npos/8 positions, each thread in warp computes
-    // dot product for 4 K elements, warp-reduces.
-    int warp_stride = 8;  // 8 warps
-    for (int t_start = warp_id; t_start < npos; t_start += warp_stride) {
-        int t = t_start;
-        if (t > seq_pos) break;
+    // Compute scores: 4 warps, each handles npos/4 positions
+    int num_warps = 4;
+    for (int t = warp_id; t < npos; t += num_warps) {
+        // Float4 vectorized K read
+        const float4* K4 = reinterpret_cast<const float4*>(
+            K_cache + h_base + t * head_dim);
 
-        const float* K_t = K_cache + h_base + t * head_dim;
+        // Each thread computes partial dot for its 4 elements
+        // Q_reg[i] = Q[lane_id*4+i], K4[lane_id] = K[lane_id*4..lane_id*4+3]
+        float4 kv = K4[lane_id];
+        float dot = Q_reg[0] * kv.x + Q_reg[1] * kv.y
+                  + Q_reg[2] * kv.z + Q_reg[3] * kv.w;
 
-        // Load 4 K values (same positions as Q_reg), multiply-accumulate
-        float dot_local = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int d = i * 32 + lane_id;
-            float kv = (d < head_dim) ? K_t[d] : 0.0f;
-            dot_local += Q_reg[i] * kv;
-        }
-
-        // Warp reduction
+        // Warp reduce
         for (int off = 16; off > 0; off >>= 1)
-            dot_local += __shfl_xor_sync(0xffffffff, dot_local, off);
+            dot += __shfl_xor_sync(0xffffffff, dot, off);
 
-        // First lane of each warp holds partial score
         if (lane_id == 0) {
-            scores[t] = dot_local * scale;
+            scores[t] = dot * scale;
         }
     }
     __syncthreads();
 
-    // First warp: finalize scores by summing partial warp scores
-    // Only needed if multiple warps contribute to same position, but
-    // we assigned disjoint positions above, so scores[t] is already final.
-
-    // Step 2: Softmax over valid scores
+    // Softmax
     float maxv = -FLT_MAX;
-    for (int t = 0; t < npos; ++t) {
+    for (int t = 0; t < npos; ++t)
         if (scores[t] > maxv) maxv = scores[t];
-    }
 
     float sumexp = 0.0f;
     for (int t = 0; t < npos; ++t) {
@@ -162,16 +136,13 @@ __global__ void attention_decode_kernel(
     }
     float inv_sum = 1.0f / (sumexp + 1e-9f);
 
-    // Step 3: Weighted sum over V — each thread handles one d (strided)
-    // All scores in smem, V is global — sequential over t is fine.
-    // head_dim=128, strided over 32 lanes → each thread does 4 elements.
-    for (int d = lane_id; d < head_dim; d += 32) {
+    // V weighted sum: each thread handles elements strided by blockDim.x
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         float out_val = 0.0f;
         for (int t = 0; t < npos; ++t) {
-            float w = scores[t] * inv_sum;
-            out_val += w * V_cache[h_base + t * head_dim + d];
+            out_val += scores[t] * V_cache[h_base + t * head_dim + d];
         }
-        output[d] = out_val;
+        output[d] = out_val * inv_sum;
     }
 }
 
@@ -256,7 +227,7 @@ cudaError_t attention_decode(
 
     float scale = 1.0f / sqrtf((float)head_dim);
     attention_decode_kernel<<<
-        dim3(num_heads), dim3(256), smem_bytes, stream>>>(
+        dim3(num_heads), dim3(128), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
         d_seq_pos_global, num_heads, num_heads /* kv_heads = q_heads for non-GQA */,
         head_dim, max_seq_len, scale);
@@ -292,7 +263,7 @@ cudaError_t attention_decode_gqa(
 
     float scale = 1.0f / sqrtf((float)head_dim);
     attention_decode_kernel<<<
-        dim3(num_q_heads), dim3(256), smem_bytes, stream>>>(
+        dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
         d_seq_pos_global, num_q_heads, num_kv_heads,
         head_dim, max_seq_len, scale);
