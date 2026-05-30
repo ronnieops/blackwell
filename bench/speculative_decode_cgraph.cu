@@ -82,47 +82,52 @@ static void build_token_graph(LW& L, cudaGraphExec_t* ge,
     // Warm-up: call all kernels once BEFORE capture (triggers static allocation)
     // This avoids "operation not permitted when stream is capturing" errors
     // from cudaMalloc inside static guards.
-    blackwell::kernels::gemv_int8(d_Q,d_xi,d_xs,L.q.d,L.q.ds,H,QD,st);
-    blackwell::kernels::gemv_int8(d_K,d_xi,d_xs,L.k.d,L.k.ds,H,KV,st);
-    blackwell::kernels::gemv_int8(d_V,d_xi,d_xs,L.v.d,L.v.ds,H,KV,st);
+    blackwell::kernels::gemv_int8_warp(d_Q,d_xi,d_xs,L.q.d,L.q.ds,H,QD,st);
+    blackwell::kernels::gemv_int8_warp(d_K,d_xi,d_xs,L.k.d,L.k.ds,H,KV,st);
+    blackwell::kernels::gemv_int8_warp(d_V,d_xi,d_xs,L.v.d,L.v.ds,H,KV,st);
     blackwell::kernels::update_kv_cache(d_kc,d_vc,d_K,d_V,0,sq,8,128,H,st);
     blackwell::kernels::attention_decode_gqa(d_attn,d_Q,d_kc,d_vc,sq,16,8,128,H,st);
     blackwell::kernels::pack_int8(d_ai,d_attn,d_as,QD,st);
-    blackwell::kernels::gemv_int8(d_proj,d_ai,d_as,L.o.d,L.o.ds,QD,H,st);
+    blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,L.o.d,L.o.ds,QD,H,st);
     blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
     blackwell::kernels::fused_rmsnorm_quant_int8(d_xi,d_xs,d_proj,d_rn,H,eps,st);
-    blackwell::kernels::gemv_int8(d_gate,d_xi,d_xs,L.gate.d,L.gate.ds,H,ID,st);
-    blackwell::kernels::gemv_int8(d_up,d_xi,d_xs,L.up.d,L.up.ds,H,ID,st);
+    blackwell::kernels::gemv_int8_warp(d_gate,d_xi,d_xs,L.gate.d,L.gate.ds,H,ID,st);
+    blackwell::kernels::gemv_int8_warp(d_up,d_xi,d_xs,L.up.d,L.up.ds,H,ID,st);
     blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st);
     blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,ID,st);
-    blackwell::kernels::gemv_int8(d_proj,d_mi,d_ms,L.down.d,L.down.ds,ID,H,st);
-    cudaError_t we = cudaStreamSynchronize(st);
+    blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,L.down.d,L.down.ds,ID,H,st);
+    // Full device sync ensures all static allocations (cudaMalloc in decode.cu) complete
+    cudaDeviceSynchronize();
+    cudaError_t we = cudaGetLastError();
     if (we != cudaSuccess) { printf("Warm-up error: %s\n", cudaGetErrorString(we)); exit(1); }
 
     cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
 
-    // Copy kv_offset H2D (captured in graph, updated before each launch)
+    // Copy kv_offset H2D (captured in graph)
+    // NOTE: d_kv_offset[0] is read during capture and baked into kernel args.
+    // The H2D copy updates device memory but kernel argument pointers are fixed.
+    // Each layer gets its own graph with correct per-layer offset.
     cudaMemcpyAsync(d_kv_offset, h_kv_offset, sizeof(int), cudaMemcpyHostToDevice, st);
 
     // Attention
-    blackwell::kernels::gemv_int8(d_Q,d_xi,d_xs,L.q.d,L.q.ds,H,QD,st);
-    blackwell::kernels::gemv_int8(d_K,d_xi,d_xs,L.k.d,L.k.ds,H,KV,st);
-    blackwell::kernels::gemv_int8(d_V,d_xi,d_xs,L.v.d,L.v.ds,H,KV,st);
+    blackwell::kernels::gemv_int8_warp(d_Q,d_xi,d_xs,L.q.d,L.q.ds,H,QD,st);
+    blackwell::kernels::gemv_int8_warp(d_K,d_xi,d_xs,L.k.d,L.k.ds,H,KV,st);
+    blackwell::kernels::gemv_int8_warp(d_V,d_xi,d_xs,L.v.d,L.v.ds,H,KV,st);
     blackwell::kernels::update_kv_cache(d_kc+d_kv_offset[0],d_vc+d_kv_offset[0],
         d_K,d_V,0,sq,8,128,H,st);
     blackwell::kernels::attention_decode_gqa(d_attn,d_Q,
         d_kc+d_kv_offset[0],d_vc+d_kv_offset[0],sq,16,8,128,H,st);
     blackwell::kernels::pack_int8(d_ai,d_attn,d_as,QD,st);
-    blackwell::kernels::gemv_int8(d_proj,d_ai,d_as,L.o.d,L.o.ds,QD,H,st);
+    blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,L.o.d,L.o.ds,QD,H,st);
     blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
     cudaMemcpyAsync(d_res,d_proj,H*4,cudaMemcpyDeviceToDevice,st);
     blackwell::kernels::fused_rmsnorm_quant_int8(d_xi,d_xs,d_proj,d_rn,H,eps,st);
     // MLP
-    blackwell::kernels::gemv_int8(d_gate,d_xi,d_xs,L.gate.d,L.gate.ds,H,ID,st);
-    blackwell::kernels::gemv_int8(d_up,d_xi,d_xs,L.up.d,L.up.ds,H,ID,st);
+    blackwell::kernels::gemv_int8_warp(d_gate,d_xi,d_xs,L.gate.d,L.gate.ds,H,ID,st);
+    blackwell::kernels::gemv_int8_warp(d_up,d_xi,d_xs,L.up.d,L.up.ds,H,ID,st);
     blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st);
     blackwell::kernels::pack_int8(d_mi,d_mlp,d_ms,ID,st);
-    blackwell::kernels::gemv_int8(d_proj,d_mi,d_ms,L.down.d,L.down.ds,ID,H,st);
+    blackwell::kernels::gemv_int8_warp(d_proj,d_mi,d_ms,L.down.d,L.down.ds,ID,H,st);
     blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
     cudaMemcpyAsync(d_xi,d_proj,H,cudaMemcpyDeviceToDevice,st);
 

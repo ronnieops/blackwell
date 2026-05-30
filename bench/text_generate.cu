@@ -315,29 +315,31 @@ int main(int argc, char** argv) {
             {
                 cudaError_t e = blackwell::kernels::fused_rmsnorm(
                     d_xi_f,input,d_rn_in[l],H,eps,st);
-                if(e!=cudaSuccess){printf("FAIL rmsnorm_in l=%d: %s\n",l,cudaGetErrorString(e));exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL rmsnorm_in l=%d: %s\n",l,cudaGetErrorString(e));exit(1);}
             }
 
             // 2. QKV (FP32 × INT8 per-row)
             {
                 cudaError_t e;
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_Q,d_xi_f,W[l].q.d,W[l].q.sc,H,QD,st);
-                if(e!=cudaSuccess){printf("FAIL q l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL q l=%d\n",l);exit(1);}
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_K,d_xi_f,W[l].k.d,W[l].k.sc,H,KV,st);
-                if(e!=cudaSuccess){printf("FAIL k l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL k l=%d\n",l);exit(1);}
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_V,d_xi_f,W[l].v.d,W[l].v.sc,H,KV,st);
-                if(e!=cudaSuccess){printf("FAIL v l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL v l=%d\n",l);exit(1);}
             }
 
             // 3. Q/K head norms
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q,W[l].qn,nqh,hd,eps);
+            if(cudaGetLastError()!=cudaSuccess){printf("FAIL head_norm_Q l=%d\n",l);exit(1);}
             head_norm_kernel<<<nkv,128,0,st>>>(d_K,W[l].kn,nkv,hd,eps);
-            { cudaError_t e=cudaPeekAtLastError(); if(e!=cudaSuccess){printf("FAIL head_norm l=%d\n",l);exit(1);} }
+            if(cudaGetLastError()!=cudaSuccess){printf("FAIL head_norm_K l=%d\n",l);exit(1);}
 
             // 4. RoPE (fixed theta=1000000 for Qwen3)
             apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q,nqh,hd,step);
+            if(cudaGetLastError()!=cudaSuccess){printf("FAIL rope_Q l=%d\n",l);exit(1);}
             apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K,nkv,hd,step);
-            { cudaError_t e=cudaPeekAtLastError(); if(e!=cudaSuccess){printf("FAIL rope l=%d\n",l);exit(1);} }
+            if(cudaGetLastError()!=cudaSuccess){printf("FAIL rope_K l=%d\n",l);exit(1);}
 
             // Per-layer KV cache offset
             int kb = l * nkv * MAXSEQ * hd;
@@ -346,18 +348,18 @@ int main(int argc, char** argv) {
             {
                 cudaError_t e;
                 e=blackwell::kernels::update_kv_cache(d_kc+kb,d_vc+kb,d_K,d_V,0,step,nkv,hd,MAXSEQ,st);
-                if(e!=cudaSuccess){printf("FAIL kv l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL kv l=%d\n",l);exit(1);}
                 e=blackwell::kernels::attention_decode_gqa(d_attn,d_Q,d_kc+kb,d_vc+kb,step,nqh,nkv,hd,MAXSEQ,st);
-                if(e!=cudaSuccess){printf("FAIL attn l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL attn l=%d\n",l);exit(1);}
             }
 
             // 6. Wo GEMV + residual 1 (FP32 activations)
             {
                 cudaError_t e;
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_proj,d_attn,W[l].o.d,W[l].o.sc,QD,H,st);
-                if(e!=cudaSuccess){printf("FAIL o l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL o l=%d\n",l);exit(1);}
                 e=blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res_save,H,st);
-                if(e!=cudaSuccess){printf("FAIL res1 l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL res1 l=%d\n",l);exit(1);}
             }
             die(cudaMemcpyAsync(d_res_save2,d_proj,H*4,cudaMemcpyDeviceToDevice,st),"save_res2");
 
@@ -365,27 +367,27 @@ int main(int argc, char** argv) {
             {
                 cudaError_t e=blackwell::kernels::fused_rmsnorm(
                     d_xi_f,d_proj,d_rn_post[l],H,eps,st);
-                if(e!=cudaSuccess){printf("FAIL rmsnorm_post l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL rmsnorm_post l=%d\n",l);exit(1);}
             }
 
             // 8. Gate + Up GEMVs + SwiGLU (FP32 activations)
             {
                 cudaError_t e;
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_gate,d_xi_f,W[l].g.d,W[l].g.sc,H,ID,st);
-                if(e!=cudaSuccess){printf("FAIL gate l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL gate l=%d\n",l);exit(1);}
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_up,d_xi_f,W[l].u.d,W[l].u.sc,H,ID,st);
-                if(e!=cudaSuccess){printf("FAIL up l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL up l=%d\n",l);exit(1);}
                 e=blackwell::kernels::apply_swiglu(d_mlp,d_gate,d_up,ID,st);
-                if(e!=cudaSuccess){printf("FAIL swiglu l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL swiglu l=%d\n",l);exit(1);}
             }
 
             // 9. Down GEMV + residual 2 (FP32 activations)
             {
                 cudaError_t e;
                 e=blackwell::kernels::gemv_fp32_int8_per_row(d_proj,d_mlp,W[l].d.d,W[l].d.sc,ID,H,st);
-                if(e!=cudaSuccess){printf("FAIL down l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL down l=%d\n",l);exit(1);}
                 e=blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res_save2,H,st);
-                if(e!=cudaSuccess){printf("FAIL res2 l=%d\n",l);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL res2 l=%d\n",l);exit(1);}
             }
         } // end for(int l=0;l<NL;l++)
 
@@ -394,12 +396,12 @@ int main(int argc, char** argv) {
             {
                 cudaError_t e=blackwell::kernels::fused_rmsnorm(
                     d_xi_f,d_proj,d_fn,H,eps,st);
-                if(e!=cudaSuccess){printf("FAIL fn step=%d\n",step);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL fn step=%d\n",step);exit(1);}
             }
             {
                 cudaError_t e=blackwell::kernels::gemv_fp32_int8_per_row(d_logits,d_xi_f,
                     d_emb_d,d_emb_sc,H,V,st);
-                if(e!=cudaSuccess){printf("FAIL lm_head step=%d\n",step);exit(1);}
+                if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL lm_head step=%d\n",step);exit(1);}
             }
             die(cudaStreamSynchronize(st),"sync_final");
             die(cudaMemcpy(h_logits.data(),d_logits,V*4,cudaMemcpyDeviceToHost),"logits_cpy");
