@@ -21,7 +21,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 | CUDA | 13.3.33, driver 580.159.04 |
 | Library | 123 symbols `build/libblackwell_kernels.a` |
 | Branch | master @ `8cdac55` |
-| Session | 24 — Cleanup, decode_prefill rewrite, WMMA verified |
+| Session | 25 — Multi-model support: Qwen3-8B, multi-shard quantization |
 
 ### Benchmark Results
 
@@ -43,7 +43,8 @@ Custom FP4 E2M1 produces garbage (180% RMS diff vs INT8).
 
 ## 3. Recent Decisions
 
-- **Project complete**: INT8 decode beats llama.cpp by 12%
+- **Qwen3-8B supported**: INT8 decode 59.4 t/s (28L), 46.2 t/s (36L). 3.3× slower than 1.7B due to 4× larger weights.
+- **Qwen3.5-9B MoE next**: Different architecture, needs separate kernel path.
 - **Speculative decode**: Not beneficial (same total work, no speedup)
 - **FP16 scales**: Not beneficial (warp kernel already optimized)
 - **Loop unrolling**: +9-45% on block GEMV, no benefit on warp GEMV
@@ -82,8 +83,9 @@ Custom FP4 E2M1 produces garbage (180% RMS diff vs INT8).
 | ~~P1~~ | ~~CUDA Graph batched M=8~~ | ✅ Completed |
 | ~~P2~~ | ~~Batched attention fusion~~ | ✅ Completed |
 | ~~P3~~ | ~~Decode prefill rewrite~~ | ✅ Completed |
-| P4 | Docker packaging | Not started |
-| P5 | Megakernel | Not started (diminishing returns on 36 SMs) |
+| ~~P4~~ | ~~Multi-model support (Qwen3-8B)~~ | ✅ Completed |
+| P5 | Docker packaging | Not started |
+| P6 | Megakernel | Not started (diminishing returns on 36 SMs) |
 
 ---
 
@@ -92,7 +94,7 @@ Custom FP4 E2M1 produces garbage (180% RMS diff vs INT8).
 | Priority | Task | Notes |
 |----------|------|-------|
 | P1 | Docker packaging | Containerize for deployment |
-| P2 | New model support | Extend to Qwen3-4B/8B |
+| P2 | New model support | Extend to Qwen3-4B/8B (Qwen3.5-9B MoE next) |
 | Future | FP4 via llama.cpp NVFP4 | RTX 5090 only (GB100), not RTX 5060 Ti |
 
 ---
@@ -106,20 +108,27 @@ Custom FP4 E2M1 produces garbage (180% RMS diff vs INT8).
 - `include/blackwell/kernels.h` — Public API (123 symbols)
 - `bench/decode_int8_batched_cgraph_attn.cu` — INT8 batched attn + CUDA Graph (327.7 t/s)
 - `bench/decode_prefill.cu` — INT8 GEMM prefill benchmark with real weights
+- `bench/decode_int8_cgraph_qwen3_8b.cu` — Qwen3-8B benchmark (H=4096, I=12288)
 - `bench/verify_gemm` — GEMM correctness vs CPU reference
 - `bench/test_wmma` — WMMA vs dp4a correctness
+- `scripts/quantize_generic.py` — INT8 quantization (single + multi-shard safetensors)
 
 ### Commands
 ```bash
 export PATH=/usr/local/cuda-13.3/bin:$PATH
 killall hashcat 2>/dev/null
 CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
-./bench/decode_int8_batched_cgraph_attn 28 8  # 327 t/s (M=8, batched attn + Graph)
-./bench/decode_int8_cgraph 28              # 183 t/s (M=1)
+./bench/decode_int8_batched_cgraph_attn 28 8  # Qwen3-1.7B: 327 t/s (M=8, batched attn + Graph)
+./bench/decode_int8_cgraph 28              # Qwen3-1.7B: 183 t/s (M=1)
+./bench/decode_int8_cgraph_qwen3_8b 28     # Qwen3-8B: 59.4 t/s (28L), 46.2 t/s (36L)
 ./bench/decode_prefill 20                  # GEMM prefill GFLOPS (M=1-128 sweep)
 ./bench/verify_gemm                         # GEMM correctness check (all layers)
 ./bench/test_wmma                          # WMMA vs dp4a correctness
 nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
+
+# Quantize new model:
+python3 scripts/quantize_generic.py <model_path> <output_weights_dir>
+# Example: python3 scripts/quantize_generic.py /mnt/data/ai/hf/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 weights_int8_qwen3_8b
 ```
 
 ---
@@ -134,7 +143,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 | text_generate | ✅ "Paris" correct |
 | llama.cpp baseline | ✅ 292.52 t/s (b9442) |
 | WMMA correctness | ✅ test_wmma PASS, verify_gemm PASS |
-| GEMM prefill benchmark | ✅ decode_prefill rewrite committed |
+| Qwen3-8B decode | ✅ 59.4 t/s (28L), 46.2 t/s (36L) |
 
 ### Session 24 Cleanup Summary
 - Removed: 6 untracked bench files (FP4 research + bad MMA bench + debug artifacts)
@@ -142,6 +151,12 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 - Removed: src/kernels/gemm_int8_wmma.cu.bak
 - Kept: scripts/quantize_generic.py (INT8 quantizer for Qwen3)
 - Kept: weights_int8_bf16_06b/ (Qwen3-0.6B 6-bit weights)
+
+### Session 25 Multi-Model Support
+- Fixed quantize_generic.py for multi-shard safetensors (5 shards)
+- Added Qwen3-8B benchmark (H=4096, I=12288, 36 layers)
+- Qwen3-8B: 59.4 t/s (28 layers), 46.2 t/s (36 layers) — 3.3× slower than 1.7B
+- Added weights_*/ to .gitignore
 
 ---
 
@@ -151,9 +166,9 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 |-------|-------|
 | updated_at | 2026-05-31 |
 | branch | master |
-| last_commit | `8cdac55` feat: rewrite decode_prefill (WMMA benchmark with real weights) |
-| repo_state | 123 symbols, project complete, 112% of llama.cpp, WMMA verified |
-| sessions_completed | 24 |
+| last_commit | `4b66c63` feat: multi-model support (Qwen3-8B benchmark, multi-shard quantization) |
+| repo_state | 123 symbols, project complete, 112% of llama.cpp (Qwen3-1.7B), Qwen3-8B 59.4 t/s |
+| sessions_completed | 25 |
 
 ---
 
