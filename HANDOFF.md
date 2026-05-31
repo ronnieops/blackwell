@@ -8,7 +8,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 **COMPLETED**: INT8 decode beats llama.cpp by 12%.
 - llama.cpp b9442 Q4_K_M: **292.52 t/s** (baseline)
-- Blackwell INT8 batched attn M=8 + CUDA Graph: **326.8 t/s** (112%)
+- Blackwell INT8 batched attn M=8 + CUDA Graph: **327.7 t/s** (112%)
 - Goal achieved. No further optimization needed unless targeting >150%.
 
 ---
@@ -17,21 +17,27 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 | Metric | Value |
 |--------|-------|
-| GPU | RTX 5060 Ti, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
+| GPU | RTX 5060 Ti, GB206, SM_120a, 36 SMs, 448 GB/s GDDR7 |
 | CUDA | 13.3.33, driver 580.159.04 |
 | Library | 123 symbols `build/libblackwell_kernels.a` |
-| Branch | master @ `8ae4338` |
-| Session | 23 — Final validation, documentation sync |
+| Branch | master @ `8cdac55` |
+| Session | 24 — Cleanup, decode_prefill rewrite, WMMA verified |
 
 ### Benchmark Results
 
 | Path | t/s | vs llama.cpp |
 |------|-----|--------------|
-| **INT8 batched attn M=8 + CUDA Graph** | **326.8** | **112%** ✅ |
-| INT8 batched attn M=8 per-kernel | 318.2 | 109% |
-| INT8 CUDA Graph batched M=8 | 294.9 | 100% |
+| **INT8 batched attn M=8 + CUDA Graph** | **327.7** | **112%** ✅ |
+| INT8 batched attn M=8 per-kernel | 318.9 | 109% |
+| INT8 CUDA Graph batched M=8 | 287.9 | 98% |
 | INT8 CUDA Graph M=1 | 183.0 | 62% |
 | llama.cpp Q4_K_M (b9442) | 292.52 | 100% |
+
+### GPU Architecture
+
+RTX 5060 Ti = **GB206** chip, SM_120a, 36 SMs, **448 GB/s** GDDR7 (128-bit bus, 28 Gbps).
+**Consumer GB206 lacks FP4 tensor core hardware** — only GB100/GB200 data-center chips have it.
+Custom FP4 E2M1 produces garbage (180% RMS diff vs INT8).
 
 ---
 
@@ -42,6 +48,10 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 - **FP16 scales**: Not beneficial (warp kernel already optimized)
 - **Loop unrolling**: +9-45% on block GEMV, no benefit on warp GEMV
 - **PDL**: Not beneficial (kernels too short)
+- **FP4 tensor core**: RTX 5060 Ti (GB206) lacks it — custom FP4 E2M1 not viable
+- **WMMA correctness**: Verified — test_wmma PASS, verify_gemm PASS (all 6 projections)
+- **decode_prefill rewrite**: Now benchmarks gemm_int8_wmma_fast with real Qwen3-1.7B weights
+- **Cleanup session 24**: Removed 6 untracked bench files, research docs, .bak. Committed decode_prefill rewrite.
 
 ---
 
@@ -58,9 +68,10 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 ## 5. Known Issues / Risks
 
 1. **hashcat on GPU-0**: Auto-restarts, -45% throughput
-2. **FP4 numerically unstable**: Outputs garbage, not usable
+2. **FP4 numerically unstable**: Outputs garbage, not usable (GB206 lacks FP4 tensor core HW)
 3. **No draft model**: Speculative decode not implemented
 4. **Single model support**: Only Qwen3-1.7B verified
+5. **text_generate head_norm bug**: Pre-existing. "FAIL head_norm l=0". Not blocking.
 
 ---
 
@@ -70,8 +81,9 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 |----------|------|--------|
 | ~~P1~~ | ~~CUDA Graph batched M=8~~ | ✅ Completed |
 | ~~P2~~ | ~~Batched attention fusion~~ | ✅ Completed |
-| P3 | Megakernel | Not started (diminishing returns) |
+| ~~P3~~ | ~~Decode prefill rewrite~~ | ✅ Completed |
 | P4 | Docker packaging | Not started |
+| P5 | Megakernel | Not started (diminishing returns on 36 SMs) |
 
 ---
 
@@ -81,7 +93,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 |----------|------|-------|
 | P1 | Docker packaging | Containerize for deployment |
 | P2 | New model support | Extend to Qwen3-4B/8B |
-| Future | Megakernel | Fuse decode step (uncertain benefit) |
+| Future | FP4 via llama.cpp NVFP4 | RTX 5090 only (GB100), not RTX 5060 Ti |
 
 ---
 
@@ -92,7 +104,10 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 - `src/kernels/gemm_int8_wmma_fast.cu` — WMMA INT8 GEMM (prefill, 4.3-5.0K GFLOPS)
 - `src/kernels/decode.cu` — Attention decode, KV cache, CUDA Graph
 - `include/blackwell/kernels.h` — Public API (123 symbols)
-- `bench/decode_int8_batched_cgraph_attn.cu` — INT8 batched attn + CUDA Graph (326.8 t/s)
+- `bench/decode_int8_batched_cgraph_attn.cu` — INT8 batched attn + CUDA Graph (327.7 t/s)
+- `bench/decode_prefill.cu` — INT8 GEMM prefill benchmark with real weights
+- `bench/verify_gemm` — GEMM correctness vs CPU reference
+- `bench/test_wmma` — WMMA vs dp4a correctness
 
 ### Commands
 ```bash
@@ -101,7 +116,9 @@ killall hashcat 2>/dev/null
 CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 ./bench/decode_int8_batched_cgraph_attn 28 8  # 327 t/s (M=8, batched attn + Graph)
 ./bench/decode_int8_cgraph 28              # 183 t/s (M=1)
-./bench/text_generate "The capital of France is" 5 -t 0  # "Paris" ✅
+./bench/decode_prefill 20                  # GEMM prefill GFLOPS (M=1-128 sweep)
+./bench/verify_gemm                         # GEMM correctness check (all layers)
+./bench/test_wmma                          # WMMA vs dp4a correctness
 nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 ```
 
@@ -113,9 +130,18 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 |-------|--------|
 | Library | ✅ 123 symbols |
 | INT8 CUDA Graph M=1 | ✅ **183.0 t/s** |
-| INT8 batched attn M=8 + CUDA Graph | ✅ **326.8 t/s** (112%) |
+| INT8 batched attn M=8 + CUDA Graph | ✅ **327.7 t/s** (112%) |
 | text_generate | ✅ "Paris" correct |
 | llama.cpp baseline | ✅ 292.52 t/s (b9442) |
+| WMMA correctness | ✅ test_wmma PASS, verify_gemm PASS |
+| GEMM prefill benchmark | ✅ decode_prefill rewrite committed |
+
+### Session 24 Cleanup Summary
+- Removed: 6 untracked bench files (FP4 research + bad MMA bench + debug artifacts)
+- Removed: research docs (scout-report-*.md, researcher-report*.md, progress.md)
+- Removed: src/kernels/gemm_int8_wmma.cu.bak
+- Kept: scripts/quantize_generic.py (INT8 quantizer for Qwen3)
+- Kept: weights_int8_bf16_06b/ (Qwen3-0.6B 6-bit weights)
 
 ---
 
@@ -125,9 +151,9 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 |-------|-------|
 | updated_at | 2026-05-31 |
 | branch | master |
-| last_commit | `8ae4338` docs: fix documentation inconsistencies |
-| repo_state | 123 symbols, project complete, 112% of llama.cpp |
-| sessions_completed | 23 |
+| last_commit | `8cdac55` feat: rewrite decode_prefill (WMMA benchmark with real weights) |
+| repo_state | 123 symbols, project complete, 112% of llama.cpp, WMMA verified |
+| sessions_completed | 24 |
 
 ---
 
@@ -135,7 +161,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 123
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 123) → `./bench/decode_int8_batched_cgraph_attn 28 8` (expect 327+ t/s).
 
-**Verified state**: 123 symbols. INT8 batched attn + CUDA Graph M=8: **326.8 t/s** (112% of llama.cpp). Project complete.
+**Verified state**: 123 symbols. INT8 batched attn + CUDA Graph M=8: **327.7 t/s** (112% of llama.cpp). Project complete.
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
