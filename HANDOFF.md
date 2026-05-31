@@ -7,7 +7,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 ## 1. Current Objective
 
 Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**294.19 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
-INT8 batched attn + CUDA Graph M=8: **328.7 t/s** (119% of target — BEATEN!). INT8 CUDA Graph M=1: **183.3 t/s** (66%). **107 symbols**.
+INT8 batched attn + CUDA Graph M=8: **328.2 t/s** (112% of target — BEATEN!). INT8 CUDA Graph M=1: **183.0 t/s** (62%). **119 symbols**.
 
 ---
 
@@ -17,9 +17,9 @@ INT8 batched attn + CUDA Graph M=8: **328.7 t/s** (119% of target — BEATEN!). 
 |--------|-------|
 | GPU | RTX 5060 Ti, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3.33, driver 580.159.04 |
-| Library | 107 symbols `build/libblackwell_kernels.a` |
-| Branch | master @ `1eaf2db` |
-| Session | 21 — Fixed speculative decode segfault (2 bugs), batched attn M=8: 329 t/s |
+| Library | 119 symbols `build/libblackwell_kernels.a` |
+| Branch | master @ `5726131` |
+| Session | 22 — FP16 scales, loop unrolling, llama.cpp analysis, documentation |
 
 | Path | t/s | vs 276 llama.cpp |
 |------|-----|------------------|
@@ -129,7 +129,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 107
 
 | Check | Status |
 |-------|--------|
-| Library | ✅ 107 symbols |
+| Library | ✅ 119 symbols |
 | INT8 CUDA Graph 28L (M=1) | ✅ **183.3 t/s** (66% of 276) |
 | INT8 CUDA Graph batched M=4 | ✅ **291.2 t/s** (105% of 276) |
 | INT8 CUDA Graph batched M=8 | ✅ **294.9 t/s** (107% of 276) |
@@ -149,7 +149,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 107
 | updated_at | 2026-05-31 |
 | branch | master |
 | last_commit | `1eaf2db` feat: speculative decode with batched attention + CUDA Graph (fixed, 0% speedup) |
-| repo_state | 107 symbols, speculative decode fixed, batched attn M=8: 329 t/s |
+| repo_state | 119 symbols, FP16 scales, loop unrolling, llama.cpp analysis |
 | sessions_completed | 20 |
 
 ---
@@ -158,9 +158,9 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 107
 
 ## META PROMPT
 
-**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 107) → `./bench/decode_int8_cgraph 28` (expect 183+ t/s) → `./bench/decode_int8_batched_cgraph 28 8` (expect 294+ t/s).
+**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 119) → `./bench/decode_int8_cgraph 28` (expect 183+ t/s) → `./bench/decode_int8_batched_cgraph 28 8` (expect 294+ t/s).
 
-**Verified state**: 107 symbols. INT8 CUDA Graph (M=1) **183.3 t/s** (66%). INT8 batched attn + CUDA Graph M=8 **328.7 t/s** (119%, beats llama.cpp!). INT8 batched attn M=8 per-kernel **319.8 t/s** (116%). Speculative decode fixed but 0% speedup. llama.cpp Q4_K_M **276.0 t/s** (b9389).
+**Verified state**: 119 symbols. INT8 CUDA Graph (M=1) **183.0 t/s** (62%). INT8 batched attn + CUDA Graph M=8 **328.2 t/s** (112%, beats llama.cpp!). INT8 batched attn M=8 per-kernel **319.8 t/s** (109%). Speculative decode fixed but 0% speedup. llama.cpp Q4_K_M **292.93 t/s** (b9442).
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
