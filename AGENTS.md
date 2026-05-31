@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.52 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
-INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (107%). INT8 CUDA Graph (M=1): **183.3 t/s** (66%). **109 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (112% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (100%). INT8 CUDA Graph (M=1): **183.0 t/s** (62%). **123 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUD
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 109 symbols in `build/libblackwell_kernels.a`
+**Library**: 123 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -79,7 +79,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 ./bench/decode_int8_batched_cgraph 28 4   # CUDA Graph batched M=4: 287 t/s
 ./bench/decode_int8_batched_cgraph 28 8   # CUDA Graph batched M=8: 294 t/s
 ./bench/decode_int8_batched_cgraph_attn 28 4  # Batched attn + Graph M=4: 307 t/s (111%)
-./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 329 t/s (119%)
+./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 327 t/s (112%)
 ./bench/speculative_decode_cgraph 28 4          # Spec decode: 190 t/s (0% speedup, fixed)
 ./bench/bench_warp_gemv                    # Isolated warp vs old GEMV
 ./bench/decode_fp4_cgraph 28               # FP4 packed CUDA Graph 247 t/s (unstable)
@@ -100,7 +100,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | INT8 CUDA Graph (warp) | **183.0 t/s** | 62% of 294 t/s llama.cpp baseline |
 | INT8 per-kernel (warp) | **162.9 t/s** | |
 | INT8 batched attn M=4 CUDA Graph | **312.0 t/s** | **106%** of 294 (BEATEN!) |
-| INT8 batched attn M=8 CUDA Graph | **328.2 t/s** | **112%** of 294 (BEATEN!) |
+| INT8 batched attn M=8 CUDA Graph | **326.8 t/s** | **112%** of 292 (BEATEN!) |
 | INT8 batched attn M=8 per-kernel | 262.4 t/s | 89% of 294 |
 | INT8 CUDA Graph batched M=8 (old) | **294.9 t/s** | **100%** of 294 |
 | INT8 CUDA Graph batched M=4 (old) | **291.2 t/s** | **99%** of 294 |
