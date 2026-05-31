@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Generic per-row block-16 INT8 quantization for Qwen3 models.
+
+Supports any Qwen3 model by auto-detecting layer count from config.
+Handles single-file and multi-shard safetensors.
+
+Usage:
+    python3 scripts/quantize_generic.py <model_path> <output_dir>
+
+Example:
+    python3 scripts/quantize_generic.py /mnt/data/ai/hf/qwen3-0.6b weights_int8_bf16_06b
+    python3 scripts/quantize_generic.py /mnt/data/ai/hf/models--Qwen--Qwen3-8B/snapshots/... weights_int8_bf16_qwen3_8b
+"""
+import struct, json, os, sys
+import numpy as np
+
+BLOCK = 16
+
+def quantize_per_row(W_f32):
+    N, K = W_f32.shape
+    assert K % BLOCK == 0, f"K={K} not divisible by block={BLOCK}"
+    num_K_blks = K // BLOCK
+    W_blk = W_f32.reshape(N, num_K_blks, BLOCK)
+    scales = np.max(np.abs(W_blk), axis=2) / 127.0
+    scales = np.maximum(scales, 1e-10)
+    scale_broadcast = scales[:, :, np.newaxis]
+    scale_broadcast = np.repeat(scale_broadcast, BLOCK, axis=2)
+    scale_broadcast = scale_broadcast.reshape(N, K)
+    q = np.round(W_f32 / scale_broadcast)
+    q = np.clip(q, -127, 127).astype(np.int8)
+    return q, scales.astype(np.float32)
+
+def write_weight(prefix, int8_data, scales, K_in, N_out):
+    num_K_blks = K_in // BLOCK
+    header = np.array([K_in, N_out, BLOCK, num_K_blks, N_out], dtype=np.int32)
+    path = f"{prefix}.int8_t"
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(int8_data.tobytes())
+    path = f"{prefix}.scale_t"
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(scales.tobytes())
+    mb_data = int8_data.nbytes / (1024*1024)
+    mb_sc = scales.nbytes / (1024*1024)
+    print(f"  {prefix}: [{N_out}×{K_in}] data={mb_data:.1f}MB scales={mb_sc:.1f}MB")
+
+def find_model_shards(model_dir):
+    """Find all safetensor shards in model directory (handles single and multi-shard)."""
+    # Single-file case: model.safetensors
+    single = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(single):
+        return [single]
+
+    # Multi-shard case: model-00001-of-00005.safetensors
+    shard_files = sorted([
+        os.path.join(model_dir, f)
+        for f in os.listdir(model_dir)
+        if f.startswith("model-") and f.endswith(".safetensors")
+    ])
+    if shard_files:
+        return shard_files
+
+    # Recursive snapshot search
+    snapshot_dir = os.path.join(model_dir, "snapshots")
+    if os.path.isdir(snapshot_dir):
+        for snap in sorted(os.listdir(snapshot_dir)):
+            snap_path = os.path.join(snapshot_dir, snap)
+            if os.path.isdir(snap_path):
+                # Try single file
+                single = os.path.join(snap_path, "model.safetensors")
+                if os.path.exists(single):
+                    return [single]
+                # Try shards
+                shards = sorted([
+                    os.path.join(snap_path, f)
+                    for f in os.listdir(snap_path)
+                    if f.startswith("model-") and f.endswith(".safetensors")
+                ])
+                if shards:
+                    return shards
+
+    return []
+
+def load_safetensor_headers(shard_paths):
+    """Load headers from all shards. Returns dict: tensor_name -> (shard_idx, header_info)."""
+    # Single shard: load one header, done
+    if len(shard_paths) == 1:
+        with open(shard_paths[0], 'rb') as f:
+            hdr_len = struct.unpack('Q', f.read(8))[0]
+            hdr = json.loads(f.read(hdr_len))
+        tensor_map = {}
+        for name, info in hdr.items():
+            if name == '__metadata__':
+                continue
+            tensor_map[name] = (0, info)
+        return tensor_map
+
+    # Multi-shard: load all headers, map tensor names to shards
+    tensor_map = {}
+    for shard_idx, shard_path in enumerate(shard_paths):
+        with open(shard_path, 'rb') as f:
+            hdr_len = struct.unpack('Q', f.read(8))[0]
+            hdr = json.loads(f.read(hdr_len))
+        for name, info in hdr.items():
+            if name == '__metadata__':
+                continue
+            tensor_map[name] = (shard_idx, info)
+
+    return tensor_map
+
+def read_tensor(tensor_map, shard_paths, name):
+    shard_idx, info = tensor_map[name]
+    shard_path = shard_paths[shard_idx]
+    start, end = info['data_offsets']
+    with open(shard_path, 'rb') as f:
+        f.seek(8)  # skip header_len
+        # Need to skip past all headers to get to data
+        # Find the header length for this shard
+        f.seek(0)
+        hdr_len_shard = struct.unpack('Q', f.read(8))[0]
+        f.seek(8 + hdr_len_shard + start)
+        raw = f.read(end - start)
+
+    dtype_map = {
+        'BF16': (np.uint16, 2),
+        'F16':  (np.uint16, 2),
+        'F32':  (np.float32, 4),
+        'F64':  (np.float64, 8),
+        'U8':   (np.uint8, 1),
+        'I8':   (np.int8, 1),
+        'U16':  (np.uint16, 2),
+        'I16':  (np.int16, 2),
+        'U32':  (np.uint32, 2),
+        'I32':  (np.int32, 4),
+        'U64':  (np.uint64, 8),
+        'I64':  (np.int64, 8),
+    }
+    dtype_str = info.get('dtype', 'BF16')
+    elem_size = dtype_map.get(dtype_str, (np.uint16, 2))[1]
+    n_elems = (end - start) // elem_size
+    shape = info['shape']
+
+    if dtype_str == 'BF16':
+        u16 = np.frombuffer(raw, dtype=np.uint16).copy()
+        f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+        return f32.reshape(shape)
+    else:
+        dtype_np, _ = dtype_map.get(dtype_str, (np.float32, 4))
+        return np.frombuffer(raw, dtype=dtype_np).reshape(shape)
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python3 quantize_generic.py <model_path> <output_dir>")
+        print("Example: python3 quantize_generic.py /mnt/data/ai/hf/qwen3-1.7b-base weights_int8_bf16_qwen3_1b7")
+        sys.exit(1)
+
+    MODEL = sys.argv[1]
+    OUT = sys.argv[2]
+
+    # Load config
+    config_path = os.path.join(MODEL, "config.json")
+    if not os.path.exists(config_path):
+        # Try snapshot
+        snap = os.path.join(MODEL, "snapshots")
+        if os.path.isdir(snap):
+            for s in sorted(os.listdir(snap)):
+                cp = os.path.join(snap, s, "config.json")
+                if os.path.exists(cp):
+                    config_path = cp
+                    break
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    NL = config["num_hidden_layers"]
+    H = config["hidden_size"]
+    I = config.get("intermediate_size", H * 4)
+    V = config.get("vocab_size", 151936)
+
+    print(f"Model: {MODEL}")
+    print(f"Config: {NL} layers, H={H}, I={I}, V={V}")
+    print(f"Output: {OUT}/")
+
+    # Find shards
+    shard_paths = find_model_shards(MODEL)
+    if not shard_paths:
+        print("ERROR: No safetensor files found")
+        sys.exit(1)
+    print(f"Using {len(shard_paths)} safetensor shard(s)")
+
+    # Load headers
+    tensor_map = load_safetensor_headers(shard_paths)
+    print(f"Loaded {len(tensor_map)} tensors from headers")
+
+    WEIGHT_NAMES = [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ]
+
+    os.makedirs(OUT, exist_ok=True)
+
+    for layer in range(NL):
+        for wn in WEIGHT_NAMES:
+            tname = f"model.layers.{layer}.{wn}.weight"
+            if tname not in tensor_map:
+                print(f"  WARNING: {tname} not found, skipping")
+                continue
+            W = read_tensor(tensor_map, shard_paths, tname)
+            N_out, K_in = W.shape
+            int8_data, scales = quantize_per_row(W)
+            prefix = f"{OUT}/{layer}_{wn}"
+            write_weight(prefix, int8_data, scales, K_in, N_out)
+
+    print(f"\nProcessing embed_tokens...")
+    W_emb = read_tensor(tensor_map, shard_paths, "model.embed_tokens.weight")
+    N_out, K_in = W_emb.shape
+    int8_data, scales = quantize_per_row(W_emb)
+    write_weight(f"{OUT}/embed_tokens", int8_data, scales, K_in, N_out)
+
+    print(f"\nDone. {NL} layers × {len(WEIGHT_NAMES)} weights + embed_tokens")
+
+if __name__ == "__main__":
+    main()

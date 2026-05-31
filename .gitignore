@@ -3,6 +3,8 @@ build/
 bench/*
 !bench/*.cu
 !bench/*.h
+!bench/decode_int8_cgraph_qwen3_8b
+!bench/decode_int8_cgraph_qwen3_8b.cu
 *.egg-info/
 __pycache__/
 *.pyc
@@ -18,3 +20,7 @@ compile_commands.json
 .vscode/
 .idea/
 build_old_attempt/
+
+# Quantized weights (generated from HF models)
+weights_*/
+weights_*/
