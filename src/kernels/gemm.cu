@@ -366,14 +366,10 @@ cudaError_t dispatch_matmul(
     int M_arg, int N_arg, int K_arg, KernelMode mode, cudaStream_t stream) {
 
     if (mode == KernelMode::Prefill) {
-        // Route: small CTA for N<4096 (better SM util on small-N GEMMs),
-        // large CTA for N>=4096 (gate/up with N=6144 need more compute)
-        if (N_arg < 4096 || M_arg < 128)
-            return gemm_fp4_block_scaled_small(C, A, A_scale, B, B_scale,
-                                              M_arg, N_arg, K_arg, stream);
-        else
-            return gemm_fp4_block_scaled(C, A, A_scale, B, B_scale,
-                                        M_arg, N_arg, K_arg, stream);
+        // INT8 WMMA path: faster than FP4 for M≥16
+        // A: [M×K] INT8 activations, B: [N×K] INT8 transposed weights
+        return gemm_int8_wmma_fast(C, A, A_scale, B, B_scale,
+                                   M_arg, N_arg, K_arg, stream);
     } else {
         return gemv_fp4(C, A, A_scale, B, B_scale, K_arg, N_arg, stream);
     }

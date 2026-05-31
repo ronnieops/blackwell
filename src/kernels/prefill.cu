@@ -57,12 +57,12 @@ cudaError_t run_prefill_layer(
     e = quantize_int8(d_a_i8, d_a_sc, hidden_states, a_elems, stream);
     if (e != cudaSuccess) { cudaFree(d_a_sc); cudaFree(d_a_i8); cudaFree(d_proj); cudaFree(d_attn); cudaFree(d_V); cudaFree(d_K); cudaFree(d_Q); return e; }
 
-    // QKV projections via __dp4a (pre-quantized INT8 × INT8)
-    e = gemm_int8_dp4a(d_Q, d_a_i8, d_a_sc, W_q, W_q_sc, M, Q_dim, hidden_dim, stream);
+    // QKV projections via WMMA tensor cores (pre-quantized INT8 × INT8)
+    e = gemm_int8_wmma_fast(d_Q, d_a_i8, d_a_sc, W_q, W_q_sc, M, Q_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
-    e = gemm_int8_dp4a(d_K, d_a_i8, d_a_sc, W_k, W_k_sc, M, KV_dim, hidden_dim, stream);
+    e = gemm_int8_wmma_fast(d_K, d_a_i8, d_a_sc, W_k, W_k_sc, M, KV_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
-    e = gemm_int8_dp4a(d_V, d_a_i8, d_a_sc, W_v, W_v_sc, M, KV_dim, hidden_dim, stream);
+    e = gemm_int8_wmma_fast(d_V, d_a_i8, d_a_sc, W_v, W_v_sc, M, KV_dim, hidden_dim, stream);
     if (e != cudaSuccess) goto cleanup;
 
     // Update KV cache: write K/V for all seq positions
@@ -97,7 +97,7 @@ cudaError_t run_prefill_layer(
         e = cudaMalloc(&d_o_sc, o_nblks * sizeof(float)); if (e != cudaSuccess) { cudaFree(d_o_i8); goto cleanup; }
         e = quantize_int8(d_o_i8, d_o_sc, d_attn, o_elems, stream);
         if (e != cudaSuccess) { cudaFree(d_o_sc); cudaFree(d_o_i8); goto cleanup; }
-        e = gemm_int8_dp4a(d_proj, d_o_i8, d_o_sc, W_o, W_o_sc, M, hidden_dim, Q_dim, stream);
+        e = gemm_int8_wmma_fast(d_proj, d_o_i8, d_o_sc, W_o, W_o_sc, M, hidden_dim, Q_dim, stream);
         cudaFree(d_o_sc);
         cudaFree(d_o_i8);
     }

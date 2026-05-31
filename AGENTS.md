@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**276.0 t/s**, re-measured 2026-05-30, b9389).
-INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (107%). INT8 CUDA Graph (M=1): **183.3 t/s** (66%). **107 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (107%). INT8 CUDA Graph (M=1): **183.3 t/s** (66%). **109 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUD
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 107 symbols in `build/libblackwell_kernels.a`
+**Library**: 109 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -101,6 +101,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | FP4 batched (M=4) | 237.3 t/s | 86% ⚠️ 180% RMS diff vs INT8 |
 | FP4 batched (M=8) | 243.4 t/s | 88% ⚠️ 180% RMS diff vs INT8 |
 | WMMA GEMM (INT8) | **10,510 GFLOPS** | 3.81× over dp4a |
+| WMMA FAST GEMM (INT8) | **4.3-5.0K GFLOPS** | 1.2-1.4× over dp4a (real weights) |
 | INT4 warp GEMV | **0.40× SLOWER** than INT8 | Nibble unpack overhead negates 2× BW savings |
 | FP4 warp GEMV | **0.50× SLOWER** than INT8 | E2M1→float overhead, can't use dp4a |
 | llama.cpp Q4_K_M | **276.0 t/s** | End-to-end, build 9389, CUDA 13.3 |

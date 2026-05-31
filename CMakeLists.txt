@@ -49,6 +49,7 @@ set(KERNEL_SOURCES
     src/kernels/gemm.cu
     src/kernels/gemm_int8_mma.cu
     src/kernels/gemm_int8_wmma.cu
+    src/kernels/gemm_int8_wmma_fast.cu
     src/kernels/quantize.cu
     src/kernels/memory.cu
     src/kernels/norm.cu
