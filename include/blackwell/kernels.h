@@ -638,6 +638,18 @@ cudaError_t gemv_int8_unrolled(
     int             N,
     cudaStream_t    stream = 0);
 
+// Warp-cooperative INT8 GEMV with 4× loop unrolling (+9-45% speedup)
+// 1 warp (32 threads) per output row, processes 4 K-blocks per iteration.
+cudaError_t gemv_int8_warp_unrolled(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // Convert FP32 scales to FP16
 cudaError_t convert_scales_fp32_to_fp16(
     const float*    fp32_scales,
