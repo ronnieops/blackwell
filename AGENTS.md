@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**276.0 t/s**, re-measured 2026-05-30, b9389).
-INT8 batched attn + CUDA Graph (M=8): **322.5 t/s** (117% of baseline). INT8 CUDA Graph batched M=8: **294.4 t/s** (107%). INT8 CUDA Graph (M=1): **183.5 t/s** (66%). **105 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (107%). INT8 CUDA Graph (M=1): **183.3 t/s** (66%). **107 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ INT8 batched attn + CUDA Graph (M=8): **322.5 t/s** (117% of baseline). INT8 CUD
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 105 symbols in `build/libblackwell_kernels.a`
+**Library**: 107 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -72,7 +72,8 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 ./bench/decode_int8_batched_cgraph 28 4   # CUDA Graph batched M=4: 287 t/s
 ./bench/decode_int8_batched_cgraph 28 8   # CUDA Graph batched M=8: 294 t/s
 ./bench/decode_int8_batched_cgraph_attn 28 4  # Batched attn + Graph M=4: 307 t/s (111%)
-./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 323 t/s (117%)
+./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 329 t/s (119%)
+./bench/speculative_decode_cgraph 28 4          # Spec decode: 190 t/s (0% speedup, fixed)
 ./bench/bench_warp_gemv                    # Isolated warp vs old GEMV
 ./bench/decode_fp4_cgraph 28               # FP4 packed CUDA Graph 247 t/s (unstable)
 ./bench/bench_packed_fp4                   # FP4 vs INT8 single-kernel
@@ -91,11 +92,12 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
 | INT8 CUDA Graph (warp) | **183.5 t/s** | 66% of 276 t/s llama.cpp baseline |
 | INT8 per-kernel (warp) | **162.9 t/s** | |
-| INT8 batched attn M=4 CUDA Graph | **307.3 t/s** | **111%** of 276 (BEATEN!) |
-| INT8 batched attn M=8 CUDA Graph | **322.5 t/s** | **117%** of 276 (BEATEN!) |
+| INT8 batched attn M=4 CUDA Graph | **312.0 t/s** | **113%** of 276 (BEATEN!) |
+| INT8 batched attn M=8 CUDA Graph | **328.7 t/s** | **119%** of 276 (BEATEN!) |
 | INT8 batched attn M=8 per-kernel | 262.4 t/s | 95% of 276 |
-| INT8 CUDA Graph batched M=8 (old) | **294.4 t/s** | **107%** of 276 |
-| INT8 CUDA Graph batched M=4 (old) | **287.3 t/s** | **104%** of 276 |
+| INT8 CUDA Graph batched M=8 (old) | **294.9 t/s** | **107%** of 276 |
+| INT8 CUDA Graph batched M=4 (old) | **291.2 t/s** | **105%** of 276 |
+| Speculative decode (M=4) | **190 t/s** | 0% speedup — same total work as autoregressive |
 | FP4 batched (M=4) | 237.3 t/s | 86% ⚠️ 180% RMS diff vs INT8 |
 | FP4 batched (M=8) | 243.4 t/s | 88% ⚠️ 180% RMS diff vs INT8 |
 | WMMA GEMM (INT8) | **10,510 GFLOPS** | 3.81× over dp4a |

@@ -14,7 +14,6 @@
 #include "blackwell/kernels.h"
 
 struct GpuTimer { cudaEvent_t s,e; GpuTimer(){cudaEventCreate(&s);cudaEventCreate(&e);} ~GpuTimer(){cudaEventDestroy(s);cudaEventDestroy(e);} void start(){cudaEventRecord(s,0);} float stop(){cudaEventRecord(e,0);cudaEventSynchronize(e);float m=0;cudaEventElapsedTime(&m,s,e);return m;} };
-static void die(cudaError_t e, const char* m){if(e!=cudaSuccess){printf("FAIL %s: %s\n",m,cudaGetErrorString(e));exit(1);}}
 static void chk(cudaError_t e){if(e){printf("CUDA err %d\n",e);exit(1);}}
 
 struct IW { int K,N; int8_t*d; float*ds; };
@@ -70,7 +69,10 @@ static void build_token_graph(LW& L, cudaGraphExec_t* ge,
     int8_t* d_xi, float* d_xs, int8_t* d_ai, float* d_as, int8_t* d_mi, float* d_ms,
     float* d_res, float* d_kc, float* d_vc, int sq)
 {
-    cudaStream_t st = 0;
+    // Dedicated stream required — default stream (0) incompatible with
+    // cudaStreamCaptureModeGlobal
+    cudaStream_t st;
+    cudaStreamCreate(&st);
     // Init buffers with non-zero data (for warm-up kernel calls)
     std::vector<int8_t> init_xi(H, 1);
     cudaMemcpy(d_xi, init_xi.data(), H, cudaMemcpyHostToDevice);
@@ -104,19 +106,18 @@ static void build_token_graph(LW& L, cudaGraphExec_t* ge,
     cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
 
     // Copy kv_offset H2D (captured in graph)
-    // NOTE: d_kv_offset[0] is read during capture and baked into kernel args.
-    // The H2D copy updates device memory but kernel argument pointers are fixed.
-    // Each layer gets its own graph with correct per-layer offset.
+    // Use *h_kv_offset (pinned host) for pointer arithmetic — d_kv_offset is a
+    // device pointer and cannot be dereferenced from host code.
     cudaMemcpyAsync(d_kv_offset, h_kv_offset, sizeof(int), cudaMemcpyHostToDevice, st);
 
     // Attention
     blackwell::kernels::gemv_int8_warp(d_Q,d_xi,d_xs,L.q.d,L.q.ds,H,QD,st);
     blackwell::kernels::gemv_int8_warp(d_K,d_xi,d_xs,L.k.d,L.k.ds,H,KV,st);
     blackwell::kernels::gemv_int8_warp(d_V,d_xi,d_xs,L.v.d,L.v.ds,H,KV,st);
-    blackwell::kernels::update_kv_cache(d_kc+d_kv_offset[0],d_vc+d_kv_offset[0],
+    blackwell::kernels::update_kv_cache(d_kc+*h_kv_offset,d_vc+*h_kv_offset,
         d_K,d_V,0,sq,8,128,H,st);
     blackwell::kernels::attention_decode_gqa(d_attn,d_Q,
-        d_kc+d_kv_offset[0],d_vc+d_kv_offset[0],sq,16,8,128,H,st);
+        d_kc+*h_kv_offset,d_vc+*h_kv_offset,sq,16,8,128,H,st);
     blackwell::kernels::pack_int8(d_ai,d_attn,d_as,QD,st);
     blackwell::kernels::gemv_int8_warp(d_proj,d_ai,d_as,L.o.d,L.o.ds,QD,H,st);
     blackwell::kernels::vector_add_fp32(d_proj,d_proj,d_res,H,st);
@@ -137,6 +138,7 @@ static void build_token_graph(LW& L, cudaGraphExec_t* ge,
     ce=cudaGraphInstantiate(ge,gr,NULL,NULL,0);
     if(ce!=cudaSuccess){printf("FAIL instantiate: %s\n",cudaGetErrorString(ce));exit(1);}
     cudaGraphDestroy(gr);
+    cudaStreamDestroy(st);
 }
 
 int main(int argc, char** argv) {
@@ -205,7 +207,6 @@ int main(int argc, char** argv) {
     printf("Building per-layer CUDA Graphs...\n");
     std::vector<cudaGraphExec_t> graphs(NL);
     // Build graph for each layer
-    cudaStream_t gst=0;
     for(int l=0;l<NL;++l){
         // Set initial kv_offset = 0 (will be updated before each graph launch)
         *h_kv_offset = l * M * 8 * H * 128;  // base offset for this layer
