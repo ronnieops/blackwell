@@ -2,6 +2,19 @@
 
 Target: **RTX 5060 Ti 16 GB** (compute capability 12.0 / sm_120)
 
+## Performance
+
+| Method | t/s | vs llama.cpp b9442 |
+|--------|-----|-------------------|
+| llama.cpp Q4_K_M | 292.52 | 100% |
+| Blackwell INT8 batched attn M=8 + CUDA Graph | **326.8** | **112%** ✅ |
+
+**Key optimizations**:
+- INT8 WMMA FAST GEMM: 4.3-5.0K GFLOPS
+- Block GEMV unrolling: +9-45% speedup
+- Batched attention: +10% over serial
+- CUDA Graph: +3% over batched attention
+
 ## Key tuning priorities (per doc.md)
 
 1. **FP4 block-scaled GEMM** — weight quantized to FP4 E2M1, scale factors per block

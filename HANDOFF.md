@@ -6,8 +6,8 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**294.19 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
-INT8 batched attn + CUDA Graph M=8: **328.2 t/s** (112% of target — BEATEN!). INT8 CUDA Graph M=1: **183.0 t/s** (62%). **119 symbols**.
+Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**292.52 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
+INT8 batched attn + CUDA Graph M=8: **326.8 t/s** (112% of target — BEATEN!). INT8 CUDA Graph M=1: **183.0 t/s** (62%). **121 symbols**.
 
 ---
 
@@ -28,12 +28,12 @@ INT8 batched attn + CUDA Graph M=8: **328.2 t/s** (112% of target — BEATEN!). 
 | **INT8 CUDA Graph batched M=4** | **291.2** | **105%** ✅ BEATEN |
 | **INT8 CUDA Graph batched M=8** | **294.9** | **107%** ✅ BEATEN |
 | **INT8 batched attn M=4 CUDA Graph** | **312.0** | **113%** ✅ BEATEN |
-| **INT8 batched attn M=8 CUDA Graph** | **328.7** | **119%** ✅ BEATEN |
+| **INT8 batched attn M=8 CUDA Graph** | **326.8** | **112%** ✅ BEATEN |
 | INT8 batched (M=4) per-kernel | 237.3 | 86% |
 | INT8 batched (M=8) per-kernel | 243.4 | 88% |
 | FP4 batched (M=4) | 237.3 | 86% ⚠️ 180% RMS diff vs INT8 |
 | FP4 batched (M=8) | 243.4 | 88% ⚠️ 180% RMS diff vs INT8 |
-| llama.cpp Q4_K_M | **276.0** | 100% |
+| llama.cpp Q4_K_M | **292.52** | 100% |
 | llama.cpp F16 | **110.6** | 40% |
 | FP4 CUDA Graph (M=1) | 247.3 | 98% ⚠️ garbage output |
 
@@ -46,7 +46,7 @@ INT8 batched attn + CUDA Graph M=8: **328.2 t/s** (112% of target — BEATEN!). 
 
 ## 3. Recent Decisions
 
-- **Batched attention beats llama.cpp**: INT8 batched attn + CUDA Graph M=8: **328.7 t/s** (119%). Batched attn alone +10%, CUDA Graph +3%. Bit-exact correctness.
+- **Batched attention beats llama.cpp**: INT8 batched attn + CUDA Graph M=8: **326.8 t/s** (112%). Batched attn alone +10%, CUDA Graph +3%. Bit-exact correctness.
 - **Batched CUDA Graph beats llama.cpp**: INT8 batched M=8 CUDA Graph: **294.9 t/s** (107%).
 - **Speculative decode fixed**: Segfault from 2 bugs — (1) default stream incompatible with `cudaStreamCaptureModeGlobal`, (2) `d_kv_offset[0]` dereferences device pointer from host. Fixed with `cudaStreamCreate` and `*h_kv_offset`. Speedup = 0% (same total work).
 
@@ -134,7 +134,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 107
 | INT8 CUDA Graph batched M=4 | ✅ **291.2 t/s** (105% of 276) |
 | INT8 CUDA Graph batched M=8 | ✅ **294.9 t/s** (107% of 276) |
 | INT8 batched attn M=4 CUDA Graph | ✅ **312.0 t/s** (113% of 276) |
-| INT8 batched attn M=8 CUDA Graph | ✅ **328.7 t/s** (119% of 276) |
+| INT8 batched attn M=8 CUDA Graph | ✅ **326.8 t/s** (112% of 292) |
 | INT8 batched M=8 per-kernel | ✅ **243.4 t/s** (88% of 276) |
 | WMMA vs dp4a | ✅ **Exact match** (0.000 max diff) |
 | text_generate | ✅ "Paris" correct (greedy) |
@@ -148,19 +148,19 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # 107
 |-------|-------|
 | updated_at | 2026-05-31 |
 | branch | master |
-| last_commit | `1eaf2db` feat: speculative decode with batched attention + CUDA Graph (fixed, 0% speedup) |
-| repo_state | 119 symbols, FP16 scales, loop unrolling, llama.cpp analysis |
-| sessions_completed | 20 |
+| last_commit | `deace33` feat: FP16 scale cache (mixed results) |
+| repo_state | 121 symbols, FP16 scales, loop unrolling, llama.cpp analysis, final benchmark validated |
+| sessions_completed | 22 |
 
 ---
 
-- llama.cpp Q4_K_M: 276.0 (b9389)
+- llama.cpp Q4_K_M: 292.52 (b9442)
 
 ## META PROMPT
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git status --short` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 119) → `./bench/decode_int8_cgraph 28` (expect 183+ t/s) → `./bench/decode_int8_batched_cgraph 28 8` (expect 294+ t/s).
 
-**Verified state**: 119 symbols. INT8 CUDA Graph (M=1) **183.0 t/s** (62%). INT8 batched attn + CUDA Graph M=8 **328.2 t/s** (112%, beats llama.cpp!). INT8 batched attn M=8 per-kernel **319.8 t/s** (109%). Speculative decode fixed but 0% speedup. llama.cpp Q4_K_M **292.93 t/s** (b9442).
+**Verified state**: 121 symbols. INT8 CUDA Graph (M=1) **183.0 t/s** (62%). INT8 batched attn + CUDA Graph M=8 **326.8 t/s** (112%, beats llama.cpp!). INT8 batched attn M=8 per-kernel **318.2 t/s** (109%). Speculative decode fixed but 0% speedup. llama.cpp Q4_K_M **292.52 t/s** (b9442).
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)

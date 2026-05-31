@@ -6,7 +6,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 
 ## 1. Mission
 
-Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**294.19 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
+Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.52 t/s**, re-measured 2026-05-31, b9442, CUDA 13.3).
 INT8 batched attn + CUDA Graph (M=8): **328.7 t/s** (119% of baseline). INT8 CUDA Graph batched M=8: **294.9 t/s** (107%). INT8 CUDA Graph (M=1): **183.3 t/s** (66%). **109 library symbols**.
 
 ---
@@ -114,7 +114,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | FP16 scales | **+2-13%** | K-dependent, best at K=512 |
 | INT4 warp GEMV | **0.40× SLOWER** than INT8 | Nibble unpack overhead negates 2× BW savings |
 | FP4 warp GEMV | **0.50× SLOWER** than INT8 | E2M1→float overhead, can't use dp4a |
-| llama.cpp Q4_K_M | **292.93 t/s** | End-to-end, build b9442, CUDA 13.3 |
+| llama.cpp Q4_K_M | **292.52 t/s** | End-to-end, build b9442, CUDA 13.3 |
 | llama.cpp F16 | **111.26 t/s** | End-to-end |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
 | GEMM prefill | 78 GB/s | 3× faster than llama.cpp |
