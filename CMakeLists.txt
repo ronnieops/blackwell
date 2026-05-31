@@ -62,6 +62,8 @@ set(KERNEL_SOURCES
     src/kernels/fused_o_norm.cu
     src/kernels/gemv_v2.cu
     src/kernels/gemv_int8.cu
+    src/kernels/gemv_int8_pdl.cu
+    src/kernels/gemv_int8_fp16sc.cu
     src/kernels/gemv_bf16.cu
     src/kernels/gemv_fp4_nv.cu
     src/kernels/fused_mlp.cu
