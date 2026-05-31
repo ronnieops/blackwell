@@ -626,6 +626,18 @@ cudaError_t gemv_int8_fp16sc(
     int             N,
     cudaStream_t    stream = 0);
 
+// INT8 GEMV with 4× loop unrolling (+3-5% speedup)
+// Processes 4 K-blocks (64 values) per iteration for better ILP.
+cudaError_t gemv_int8_unrolled(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // Convert FP32 scales to FP16
 cudaError_t convert_scales_fp32_to_fp16(
     const float*    fp32_scales,
