@@ -6,7 +6,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**276.0 t/s**, re-measured 2026-05-30, b9389).
+Maximize INT8 decode throughput vs llama.cpp Q4_K_M (**274.96 t/s**, re-measured 2026-05-31, b95405ac65).
 INT8 batched attn + CUDA Graph M=8: **328.7 t/s** (119% of target — BEATEN!). INT8 CUDA Graph M=1: **183.3 t/s** (66%). **107 symbols**.
 
 ---
