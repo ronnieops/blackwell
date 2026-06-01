@@ -70,6 +70,7 @@ set(KERNEL_SOURCES
     src/kernels/gemv_bf16.cu
     src/kernels/gemv_fp4_nv.cu
     src/kernels/fused_mlp.cu
+    src/kernels/sample_gpu.cu
 )
 
 # ---------------------------------------------------------------------------

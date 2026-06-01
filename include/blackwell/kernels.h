@@ -820,6 +820,16 @@ cudaError_t get_seq_pos_device_ptr(int** ptr);
 // Get pinned host pointer to seq_pos (for graph-safe host writes)
 cudaError_t get_seq_pos_host_ptr(int** ptr);
 
+// ---------------------------------------------------------------------------
+// GPU-side logit sampling (eliminates 607 KB copy per token)
+// ---------------------------------------------------------------------------
+// argmax: deterministic, fastest
+cudaError_t sample_argmax_gpu(
+    const float*    logits,     // [VOCAB] on-device logits
+    int             vocab,      // vocabulary size
+    int*            out_id,     // device pointer to single int
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

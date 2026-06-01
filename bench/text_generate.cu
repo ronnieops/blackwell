@@ -216,6 +216,8 @@ int main(int argc, char** argv) {
     AL(d_proj,H*4); AL(d_res_save,H*4); AL(d_res_save2,H*4);
     AL(d_kc,NL*nkv*MAXSEQ*hd*4); AL(d_vc,NL*nkv*MAXSEQ*hd*4);
     AL(d_fn,H*4); AL(d_fn_sc,(H/16)*4); AL(d_logits,V*4);
+    int *d_next_id; AL(d_next_id, 4);
+    int h_next_id;
     #undef AL
 
     // Init scale buffers to 1/127
@@ -224,6 +226,10 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_as,&iv,4,cudaMemcpyHostToDevice);
     cudaMemcpy(d_ms,&iv,4,cudaMemcpyHostToDevice);
     cudaMemcpy(d_fn_sc,&iv,4,cudaMemcpyHostToDevice);
+    
+    // Init d_next_id (dummy value)
+    int dummy = 0;
+    cudaMemcpy(d_next_id, &dummy, 4, cudaMemcpyHostToDevice);
 
     // Load weights
     printf("Loading %d-layer model...\n", NL); fflush(stdout);
@@ -416,9 +422,17 @@ int main(int argc, char** argv) {
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL lm_head step=%d\n",step);exit(1);}
             }
             die(cudaStreamSynchronize(st),"sync_final");
-            die(cudaMemcpy(h_logits.data(),d_logits,V*4,cudaMemcpyDeviceToHost),"logits_cpy");
 
-            int next_id = sample(h_logits.data(), V, temperature, top_k);
+            int next_id;
+            if (temperature < 0.01f) {
+                // GPU argmax: 4-byte copy instead of 607 KB
+                die(blackwell::kernels::sample_argmax_gpu(d_logits, V, d_next_id, st), "sample_gpu");
+                die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy_id");
+            } else {
+                // Full sampling: fall back to host
+                die(cudaMemcpy(h_logits.data(),d_logits,V*4,cudaMemcpyDeviceToHost),"logits_cpy");
+                next_id = sample(h_logits.data(), V, temperature, top_k);
+            }
 
             all_ids.push_back(next_id);
             std::string txt = tokenizer.decode(next_id);
