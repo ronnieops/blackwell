@@ -30,7 +30,7 @@ Primary result: **M=8 batched decode at 324 t/s** (110% of llama.cpp Q4_K_M base
 ## 2. M=1 Decode Performance
 
 ### Baseline: llama.cpp
-- Q4_K_M: **292.9 t/s** (Qwen3-1.7B, CUDA 13.2)
+- Q4_K_M: **292.9 t/s** (Qwen3-1.7B, CUDA 13.3)
 - F16: **114.3 t/s**
 
 ### INT8 Fused Pipeline (14 kernels/layer)
@@ -181,14 +181,14 @@ Actual per-step:                 18.5 ms (CUDA Graph, measured)
 - `fused_swiglu_quant` — SwiGLU + INT8 quant
 - `transpose_int8_weights` — Weight matrix transpose + scale transpose
 - `sample_gpu` / `sample_argmax_gpu` — GPU sampling
+- `gemv_int8_qkv` — Fused Q/K/V GEMV (3→1 kernel, used in M=1 decode)
+- `gemv_int8_gate_up` — Fused gate+up GEMV (2→1 kernel, used in M=1 decode)
 
 ### Research Kernels
 - `gemv_fp4_warp` / `gemv_fp32_fp4_warp` — FP4 GEMV (not competitive)
 - `gemm_int8_wmma` / `gemm_int8_wmma_fast` — WMMA INT8 GEMM (prefill)
 - `fused_pack_gemv_o` — Fused pack+Wo GEMV (correct but slower)
 - `fused_swiglu_gemv` — Fused SwiGLU+down GEMV (correct but slower)
-- `gemv_int8_qkv` — Fused Q/K/V GEMV (3→1 kernel, used in M=1 path)
-- `gemv_int8_gate_up` — Fused gate+up GEMV (2→1 kernel, used in M=1 path)
 - `persistent_qkv_gemv` — Persistent QKV stub (abandoned)
 
 ---

@@ -21,7 +21,7 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 | GPU | RTX 5060 Ti, GB206, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3, C++17, CMake |
 | Library | **157 symbols** `build/libblackwell_kernels.a` |
-| Branch | master @ `1c3dd40` |
+| Branch | master @ `4219567` |
 | Session | **33** |
 
 ### Benchmark Results
@@ -128,7 +128,7 @@ CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 ### Docker
 ```bash
 docker build -t blackwell-inference .
-docker run --gpus all -v /mnt/data/ai/hf:/models -p 8080:8080 blackwell-inference
+docker run --gpus all -p 8080:8080 blackwell-inference
 curl -X POST http://localhost:8080/generate \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"The capital of France is","max_tokens":30}'
@@ -160,7 +160,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-01 |
 | branch | master |
-| last_commit | `1c3dd40` docs: fix REPORT.md — correct kernel names, counts, VRAM |
+| last_commit | `4219567` docs: session 33 — spec decode infeasibility analysis, update symbol count, mark server ready |
 | repo_state | 157 symbols. gemv_int8_batched M>8 fixed. M=8: 324 t/s (110% of Q4_K_M). Spec decode infeasible. Docker server ready. |
 | uncommitted | (none — clean) |
 

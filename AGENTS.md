@@ -43,10 +43,16 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 - `pack_int8` / `quantize_int8` — FP32 → INT8 quant with block scales
 - `transpose_int8_weights` — W (K×N) → W_t (N×K) + scales
 - `fused_rmsnorm_quant_int8` — RMSNorm + INT8 quant (1 kernel)
-- `fused_gate_up_gemv` — fused gate+up MLP projection
+- `gemv_int8_gate_up` — fused gate+up MLP projection
+- `gemv_int8_qkv` — fused Q/K/V projection (3 kernels → 1)
+- `fused_unpack_fp4_quant` — FP4 unpack + INT8 quant (fused pipeline)
+- `fused_residual_norm` — residual add + RMSNorm + INT8 quant (fused pipeline)
+- `fused_swiglu_quant` — SwiGLU + INT8 quant (fused pipeline)
+- `fused_rmsnorm_pack` — RMSNorm + FP4 pack (fused pipeline)
 - `fused_rmsnorm` — single-block warp-reduced RMSNorm
 - `apply_swiglu` — silu(gate) × up, elementwise
 - `fused_rope` / `fused_rope_decode` — in-place rotation, smem cos/sin cache
+- `attention_decode_gqa` — GQA decode attention (M=1 path)
 - `attention_decode_batched_gqa` — Batched GQA decode attention (M sequences in parallel)
 - `update_kv_cache` — KV cache write with per-layer offset
 - `gemm_int8_wmma` — WMMA INT8 GEMM (prefill, 3.8× dp4a)
@@ -75,7 +81,7 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 - `decode_fp4_cgraph.cu` — Full 28L FP4 pipeline benchmark (CUDA Graph, 247 t/s, numerically unstable)
 - `gemv_int4_warp` — INT4 warp GEMV (not competitive, 0.40× slower than INT8)
 
-**FP4 packed: numerically unstable** (247 vs 184 t/s INT8). Throughput competitive but outputs garbage. E2M1 nibble→float per-element conversion can't use __dp4a SIMD.
+**FP4 packed: numerically unstable** (247 vs 181 t/s INT8). Throughput competitive but outputs garbage. E2M1 nibble→float per-element conversion can't use __dp4a SIMD.
 
 **Deprecated / DO NOT USE**:
 - `gemv_int8_from_fp4` — 2.8× slower than baseline
@@ -190,14 +196,14 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 3. **text_generate repetition** — Greedy decode repeats (normal for argmax). Use -t 0.8 or -k 40 for better output.
 4. **GEMM prefill correctness verified** — test_wmma PASS, verify_gemm PASS, decode_prefill 3× speedup committed.
 5. **text_generate head_norm bug** — ✅ **FIXED**. No FAIL head_norm. Uses gemv_int8_warp (not old per_row).
-6. **FP4 packed numerically unstable** — 247 vs 184 t/s. Throughput competitive but outputs garbage (~10^8 values). E2M1 nibble→float overhead can't use __dp4a SIMD.
+6. **FP4 packed numerically unstable** — 247 vs 181 t/s. Throughput competitive but outputs garbage (~10^8 values). E2M1 nibble→float overhead can't use __dp4a SIMD.
 7. **L2 cache hint targets wrong stream** — FIXED (commit f55a705). Targets graph_stream.
 8. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
 9. **Docker/API packaging** — ✅ Done (session 26)
 10. **WMMA dequant correct** — `gemm_int8_wmma_fast` per-block dequant confirmed correct (advisor analysis). Per-iteration SMEM load correctly indexes K-block. AGENTS.md §10 note was wrong.
 11. **GPU sampling** — ✅ Done (session 28). `sample_gpu` handles argmax, temperature, and top-k on GPU. No host fallback needed.
 13. **CUDA Graph capture (M=1) abandoned** — `attention_decode_gqa` wrapper: `cudaFuncSetAttribute` (smem config) + H2D pinned `cudaMemcpyAsync` (seq_pos) conflict with capture on Blackwell. Illegal memory access during capture (kernel executes and crashes GPU). `cudaFuncSetAttribute` called before capture still poisons capture. Per-kernel fused path (181.4 t/s) is production target.
-14. **CUDA Graph (M=8 batched) works** — `decode_int8_batched_cgraph_attn` captures 28 layers × 8 sequences = 224 kernel launches successfully. 326.8 t/s (119% of Q4_K_M).
+14. **CUDA Graph (M=8 batched) works** — `decode_int8_batched_cgraph_attn` captures 28 layers × 8 sequences = 224 kernel launches successfully. 326.8 t/s (111% of Q4_K_M FA=on, 119% of FA=off).
 15. **Fused pack+GEMV kernels (session 31)** — `fused_pack_gemv_o` + `fused_swiglu_gemv` numerically correct but ~20% slower (144.6 t/s). Two-phase kernels (quant→sync→GEMV) add quantization overhead to GEMV critical path. Not used in production benchmark. Archives correct kernels (157 symbols).
 16. **gemv_int8_batched is SLOWER than gemv_int8_warp** (session 32) — Isolated test: serial warp GEMV is 1.5-2.7× faster than batched GEMV for all GEMV sizes (N=1024-6144). Reason: serial has higher occupancy (M×N blocks vs N blocks). However, in CUDA Graph context, batched MLP is faster (fewer graph nodes = less overhead). Production benchmark uses batched MLP (gate/up/down) + serial Q/K/V + batched attention. M=8 CUDA Graph: 323 t/s.
 17. **L2 persisting cache harmful for large weights** (session 32) — Pinning 12.6 MB gate weights in L2 persisting cache caused 28% regression. Evicts other cached data (up/down weights, attention data). d_rn (8 KB) persisting is neutral. Removed L2 persisting for MLP weights.
