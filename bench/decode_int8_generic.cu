@@ -195,15 +195,16 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "O");
 
-            // Residual add + RMSNorm → d_res (big elements, OK since big>=H)
+            // Residual add + fused RMSNorm+quant → d_x_int8 (saves d_res for MLP)
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            chk(blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0), "rn_attn");
+            chk(blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0), "rnq_attn");
+            chk(blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0), "rnp_attn");
 
-            // Quantize for next GEMV
-            chk(blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0), "pack_x");
-
-            // MLP: gate + up projections
-            chk(blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
+            // MLP: unpack new FP4 state, quantize to INT8
+            blackwell::kernels::unpack_fp4(b.d_res, b.d_x_fp4, b.d_xs, H, 0);
+            blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
                 lw[l].g.d, lw[l].g.sc, H, I, 0), "gate");
             chk(blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
                 lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
@@ -214,13 +215,12 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
 
-            // Residual add + RMSNorm → d_proj (H elements)
+            // MLP residual add + fused RMSNorm+quant + repack
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            chk(blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0), "rn_mlp");
-
-            // Repack state for next iteration (separate kernels, no 2048 limit)
-            chk(blackwell::kernels::fused_rmsnorm(b.d_proj, d_rn, b.d_res, H, 1e-6f, 0), "rnp");
-            chk(blackwell::kernels::pack_fp4(b.d_x_fp4, b.d_proj, b.d_xs, H, 0), "px4");
+            chk(blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0), "rnq_mlp");
+            chk(blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0), "rnp_mlp");
         }
     }
     cudaStreamSynchronize(0);
@@ -254,7 +254,12 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
+            // MLP: unpack new FP4 state
+            blackwell::kernels::unpack_fp4(b.d_res, b.d_x_fp4, b.d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
             blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s, lw[l].g.d, lw[l].g.sc, H, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s, lw[l].u.d, lw[l].u.sc, H, I, 0);
@@ -262,9 +267,10 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s, lw[l].d.d, lw[l].d.sc, I, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0);
-            blackwell::kernels::fused_rmsnorm(b.d_proj, d_rn, b.d_res, H, 1e-6f, 0);
-            blackwell::kernels::pack_fp4(b.d_x_fp4, b.d_proj, b.d_xs, H, 0);
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     cudaDeviceSynchronize();
@@ -284,7 +290,12 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s, lw[l].o.d, lw[l].o.sc, Q, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
+            // MLP: unpack new FP4 state
+            blackwell::kernels::unpack_fp4(b.d_res, b.d_x_fp4, b.d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
             blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s, lw[l].g.d, lw[l].g.sc, H, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s, lw[l].u.d, lw[l].u.sc, H, I, 0);
@@ -292,10 +303,10 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s, lw[l].d.d, lw[l].d.sc, I, H, 0);
             blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, 0);
-            // Repack: RMSNorm + pack_fp4 (separate kernels, no 2048 limit)
-            blackwell::kernels::fused_rmsnorm(b.d_proj, d_rn, b.d_res, H, 1e-6f, 0);
-            blackwell::kernels::pack_fp4(b.d_x_fp4, b.d_proj, b.d_xs, H, 0);
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_rmsnorm_pack(
+                b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
     float pk_ms = t0.stop() / ITERS;
@@ -351,7 +362,12 @@ int main(int argc, char** argv) {
         blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, gst);
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s, lw[l].o.d, lw[l].o.sc, Q, H, gst);
         blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, gst);
-        blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, gst);
+        blackwell::kernels::fused_rmsnorm_quant_int8(
+            b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, gst);
+        blackwell::kernels::fused_rmsnorm_pack(
+            b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, gst);
+        // MLP: unpack new FP4 state
+        blackwell::kernels::unpack_fp4(b.d_res, b.d_x_fp4, b.d_xs, H, gst);
         blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, gst);
         blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s, lw[l].g.d, lw[l].g.sc, H, I, gst);
         blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s, lw[l].u.d, lw[l].u.sc, H, I, gst);
@@ -359,10 +375,10 @@ int main(int argc, char** argv) {
         blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, gst);
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s, lw[l].d.d, lw[l].d.sc, I, H, gst);
         blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, gst);
-        blackwell::kernels::fused_rmsnorm(b.d_res, d_rn, b.d_proj, H, 1e-6f, gst);
-        // Repack: RMSNorm + pack_fp4 (separate kernels, no 2048 limit)
-        blackwell::kernels::fused_rmsnorm(b.d_proj, d_rn, b.d_res, H, 1e-6f, gst);
-        blackwell::kernels::pack_fp4(b.d_x_fp4, b.d_proj, b.d_xs, H, gst);
+        blackwell::kernels::fused_rmsnorm_quant_int8(
+            b.d_x_int8, b.d_x_int8_s, b.d_proj, d_rn, H, 1e-6f, gst);
+        blackwell::kernels::fused_rmsnorm_pack(
+            b.d_x_fp4, b.d_xs, b.d_proj, d_rn, H, 1e-6f, gst);
     }
     cudaStreamEndCapture(gst, &graph);
     cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);

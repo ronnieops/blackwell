@@ -24,7 +24,7 @@ namespace kernels {
 namespace {
 
 constexpr int kNormPackThreads = 256;
-constexpr int kElemsPerThread = 8; // 256 * 8 = 2048
+constexpr int kElemsPerThread = 16; // 256 * 16 = 4096
 
 __device__ __forceinline__ float warp_reduce_sum_f(float val) {
     #pragma unroll
