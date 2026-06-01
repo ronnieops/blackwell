@@ -124,6 +124,12 @@ int main(int argc, char** argv) {
     std::vector<float> ai8s(Q/16, ixv), mi8s(I/16, ixv);
     cudaMemcpy(b.d_attn_i8s, ai8s.data(), (Q/16)*4, cudaMemcpyHostToDevice);
     cudaMemcpy(b.d_mlp_i8s, mi8s.data(), (I/16)*4, cudaMemcpyHostToDevice);
+    // Save initial scale values for per-kernel / CUDA Graph comparison
+    // These buffers get overwritten by pack_int8 in each run — must restore
+    float *d_x_int8_s_init, *d_attn_i8s_init, *d_mlp_i8s_init;
+    cudaMalloc(&d_x_int8_s_init, (I/16)*4); cudaMemcpy(d_x_int8_s_init, b.d_x_int8_s, (I/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMalloc(&d_attn_i8s_init, (Q/16)*4); cudaMemcpy(d_attn_i8s_init, b.d_attn_i8s, (Q/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMalloc(&d_mlp_i8s_init, (I/16)*4); cudaMemcpy(d_mlp_i8s_init, b.d_mlp_i8s, (I/16)*4, cudaMemcpyDeviceToDevice);
 
     // KV cache
     float *d_kc, *d_vc;
@@ -299,6 +305,10 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_xs, d_xs_init, (H/16)*4, cudaMemcpyDeviceToDevice);
     cudaMemcpy(d_kc, d_kc_save, kv_sz, cudaMemcpyDeviceToDevice);
     cudaMemcpy(d_vc, d_vc_save, kv_sz, cudaMemcpyDeviceToDevice);
+    // Restore scale buffers too (overwritten by layer 27's pack_int8 during benchmark)
+    cudaMemcpy(b.d_x_int8_s, d_x_int8_s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(b.d_attn_i8s, d_attn_i8s_init, (Q/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(b.d_mlp_i8s, d_mlp_i8s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
     cudaFree(d_x_fp4_init); cudaFree(d_xs_init);
     cudaFree(d_kc_save); cudaFree(d_vc_save);
 

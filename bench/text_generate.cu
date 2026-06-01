@@ -424,7 +424,8 @@ int main(int argc, char** argv) {
             }
             die(cudaStreamSynchronize(st),"sync_final");
 
-            // GPU sampler: argmax path (temperature < 0.01)
+            // GPU sampler: argmax only (fastest path)
+            // Temperature + top-k: host fallback (GPU softmax not yet verified)
             int next_id;
             if (temperature < 0.01f) {
                 // GPU argmax: 4-byte copy instead of 607 KB
@@ -432,7 +433,7 @@ int main(int argc, char** argv) {
                     d_next_id, 0xdeadbeefLL, step, st), "sample_gpu");
                 die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy_id");
             } else {
-                // Full sampling: host path (GPU top-k pending fix)
+                // Full sampling: host fallback
                 die(cudaMemcpy(h_logits.data(), d_logits, V*4, cudaMemcpyDeviceToHost), "logits_cpy");
                 next_id = sample(h_logits.data(), V, temperature, top_k);
             }
