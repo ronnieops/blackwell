@@ -33,24 +33,37 @@ def load_int8_weight(prefix):
         data = np.frombuffer(f.read(K*N), dtype=np.int8).reshape(N, K)
     with open(f"{prefix}.scale_t", 'rb') as f:
         h = struct.unpack('5i', f.read(20))
-        nkb, nnb = h[3], h[4]
-        scales = np.frombuffer(f.read(nkb*nnb*4), dtype=np.float32).reshape(nnb, nkb)
-    return data, scales  # N×K, N/16)×(K/16)
+        # scale layout: [N][K/16] — per-row scales
+        num_k_blks = K // 16
+        scales = np.frombuffer(f.read(h[3]*h[4]*4), dtype=np.float32).reshape(N, num_k_blks)
+    return data, scales  # N×K, N×(K/16)
 
-def gemv_int8_cpu(x_raw, W_t, S_t, x_scale, K, N):
-    """CPU INT8 GEMV matching GPU gemv_int8.
+def gemv_int8_cpu(x, W_t, S_t, x_scale, K, N):
+    """CPU INT8 GEMV matching GPU gemv_int8_warp.
     
-    Mathematically: y[n] = Σ_k q_x[k] * x_sc[kb] * q_W[n,k] * W_sc[nb,kb]
-    = Σ_k x_raw[k] * W_dq[n,k] where W_dq = q_W * W_sc and x_sc cancels.
+    y[n] = Σ_k q_x[k] * x_sc[kb] * q_W[n,k] * W_sc[n, kb]
+    q_x[k] = int8(x[k] / x_sc[k//16])
     """
+    nb = K // 16
+    # Quantize x to INT8
+    q_x = np.zeros(K, dtype=np.int8)
+    for b in range(nb):
+        start, end = b*16, (b+1)*16
+        for k in range(start, end):
+            q_x[k] = max(-128, min(127, int(round(x[k] / x_scale[b]))))
+    
     y = np.zeros(N, dtype=np.float32)
+    wk = (K + 15) // 16
     for n in range(N):
         acc = 0.0
-        for k in range(K):
-            nb = n // 16
-            kb = k // 16
-            w_val = float(W_t[n, k]) * S_t[nb, kb]
-            acc += w_val * x_raw[k]
+        for b in range(nb):
+            s = b * 16
+            e = min(s + 16, K)
+            dot = 0
+            for k in range(s, e):
+                dot += int(q_x[k]) * int(W_t[n, k])
+            # dp4a SIMD dot product, then scale
+            acc += float(dot) * x_scale[b] * S_t[n, b]
         y[n] = acc
     return y
 
@@ -83,7 +96,12 @@ for tname, wname, K, N in tensors:
     assert i8_data.shape == (N, K), f"Expected ({N},{K}) got {i8_data.shape}"
     
     # Dequant for comparison
-    i8_scales_exp = np.repeat(np.repeat(i8_scales, 16, axis=0), 16, axis=1)
+    # Scale layout: [N][K/16] — per-row scales (not 2D block)
+    num_k_blks = K // 16
+    i8_scales_exp = np.zeros((N, K), dtype=np.float32)
+    for n in range(N):
+        for k in range(K):
+            i8_scales_exp[n, k] = i8_scales[n, k // 16]
     w_i8_dq = i8_data.astype(np.float32) * i8_scales_exp
     
     # Per-element error
