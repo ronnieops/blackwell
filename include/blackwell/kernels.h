@@ -920,6 +920,41 @@ cudaError_t fused_residual_norm(
     int N, float eps,
     cudaStream_t stream = 0);
 
+cudaError_t fused_unpack_fp4_quant(
+    int8_t* out_i8,
+    float* out_scale,
+    const void* in_fp4,
+    const float* fp4_scale,
+    const float* int8_scale,
+    int N,
+    cudaStream_t stream = 0);
+
+// Fused: SwiGLU activation + INT8 quant
+// Replaces: apply_swiglu → pack_int8 (2 kernels → 1 kernel)
+cudaError_t fused_swiglu_quant(
+    int8_t* out_i8,
+    float* out_scale,
+    const float* gate,
+    const float* up,
+    int N,
+    cudaStream_t stream = 0);
+
+// Persistent QKV GEMV kernel
+// Single grid launch: 16 blocks (one per Q head), 128 threads/block, 40KB smem.
+// Fuses QKV GEMV + KV cache update per layer. 4 launches/layer instead of 14.
+// Replaces separate gemv_int8_qkv calls. Uses existing proven attention_decode_gqa.
+cudaError_t persistent_qkv_gemv(
+    const void* W_q, const float* W_q_sc,
+    const void* W_k, const float* W_k_sc,
+    const void* W_v, const float* W_v_sc,
+    void* k_cache, void* v_cache,
+    const int* seq_pos_ptr,
+    const int8_t** layer_x_int8,
+    const float** layer_x_sc,
+    float* q_out, float* k_out, float* v_out,
+    int num_layers,
+    cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

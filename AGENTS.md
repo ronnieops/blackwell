@@ -1,13 +1,24 @@
 # AGENTS.md - blackwell
 
-Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_120a).
+Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 ---
 
 ## 1. Mission
 
-Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.9 t/s** FA=on, re-measured 2026-06-01, CUDA 13.3, build b9442).
-INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **141 library symbols**.
+Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.9 t/s** FA=on, CUDA 13.3).
+INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **155 library symbols**.
+
+**M=1 INT8 decode: 176.5 t/s (60% of Q4_K_M).** Bandwidth-limited: INT8 reads 1 byte/param vs Q4_K_M's 0.5 byte/param. Cannot close gap through fusion alone.
+
+**M=8 INT8 decode: 323.5 t/s (110% of Q4_K_M).** Batched attention + CUDA Graph is the competitive path.
+
+**Fused kernel launches (M=1)**: 14 kernels/layer (was 20). 30% reduction.
+- `fused_unpack_fp4_quant` — unpack FP4 + quantize INT8 (replaces 2 kernels)
+- `gemv_int8_qkv` — fused Q/K/V GEMV (replaces 3 kernels)
+- `gemv_int8_gate_up` — fused gate+up GEMV (replaces 2 kernels)
+- `fused_swiglu_quant` — SwiGLU + INT8 quant (replaces 2 kernels)
+- `fused_residual_norm` — residual add + RMSNorm + quant (replaces 3 kernels)
 
 ---
 
@@ -16,7 +27,7 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 141 symbols in `build/libblackwell_kernels.a`
+**Library**: 155 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -81,18 +92,13 @@ cmake --build build --parallel
 ### Benchmark
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
-./bench/decode_int8_cgraph 28              # CUDA Graph 183 t/s (M=1)
-./bench/decode_int8_batched_cgraph 28 4   # CUDA Graph batched M=4: 287 t/s
-./bench/decode_int8_batched_cgraph 28 8   # CUDA Graph batched M=8: 294 t/s
-./bench/decode_int8_batched_cgraph_attn 28 4  # Batched attn + Graph M=4: 307 t/s (111%)
-./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 326.8 t/s (119% of Q4_K_M, +65% vs F16)
-./bench/decode_int8_generic 28 weights_int8_bf16 2048 2048 1024 6144 16 8 "Qwen3-1.7B"  # 183.6 t/s
+./bench/decode_int8_cgraph 28              # Fused per-kernel 176.5 t/s (M=1, 14 kernels/layer)
+./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 323.5 t/s (110% of Q4_K_M)
+./bench/decode_int8_generic 28 weights_int8_bf16 2048 2048 1024 6144 16 8 "Qwen3-1.7B"  # 176.5 t/s
 ./bench/decode_int8_generic 28 weights_int8_qwen3_06b 1024 1024 512 3072 8 4 "Qwen3-0.6B"  # 447.4 t/s
 ./bench/decode_int8_generic 36 weights_int8_qwen3_8b 4096 4096 1024 12288 32 8 "Qwen3-8B"  # 44.5 t/s
-./bench/speculative_decode_cgraph 28 4          # Spec decode: 190 t/s (0% speedup, fixed)
+./bench/speculative_decode_cgraph 28 4          # Spec decode: 190 t/s
 ./bench/bench_warp_gemv                    # Isolated warp vs old GEMV
-./bench/decode_fp4_cgraph 28               # FP4 packed CUDA Graph 247 t/s (unstable)
-./bench/bench_packed_fp4                   # FP4 vs INT8 single-kernel
 ./bench/text_generate "The capital of France is" 30  # Text gen, "Paris" ✓
 ```
 
@@ -106,6 +112,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
+| INT8 fused (M=1) | **176.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
 | INT8 batched-attn M=8 CUDA Graph | **323.5 t/s** | **110%** of llama.cpp Q4_K_M (292.9) |
 | INT8 batched-attn M=8 vs llama.cpp F16 | **+183%** | 323.5 vs 114.3 t/s |
 | INT8 batched-attn M=4 CUDA Graph | **307.5 t/s** | **105%** of Q4_K_M |
