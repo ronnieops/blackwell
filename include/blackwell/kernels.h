@@ -830,6 +830,18 @@ cudaError_t sample_argmax_gpu(
     int*            out_id,     // device pointer to single int
     cudaStream_t    stream = 0);
 
+// Unified GPU sampler — handles argmax, temperature, and top-k
+// Replaces the 607 KB cudaMemcpy for temperature > 0.01 path
+cudaError_t sample_gpu(
+    const float*    logits,     // [VOCAB] on-device logits
+    int             vocab,       // vocabulary size
+    float           temperature,// <0.01 = greedy argmax, >0 = softmax sampling
+    int             top_k,      // 0 = disabled, >0 = keep top-k logits
+    int*            out_id,     // device pointer to single int
+    unsigned long long rng_seed,// curand seed
+    int             step,       // step counter (for rng state)
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

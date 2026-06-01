@@ -89,6 +89,7 @@ target_compile_options(blackwell_config INTERFACE
 add_library(blackwell_kernels STATIC ${KERNEL_SOURCES})
 target_link_libraries(blackwell_kernels PRIVATE
     CUDA::cudart
+    CUDA::curand
     blackwell_config
 )
 target_compile_options(blackwell_kernels PRIVATE
