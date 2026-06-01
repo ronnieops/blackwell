@@ -7,8 +7,8 @@ Primary result: **M=8 batched decode at 324 t/s** (110% of llama.cpp Q4_K_M base
 
 | Configuration | Total t/s | Per-seq t/s | vs Q4_K_M | VRAM |
 |--------------|-----------|-------------|-----------|------|
-| M=1 (decode) | 181 | 181 | 62% | 5 GB |
-| **M=8 (CUDA Graph)** | **324** | **40.5** | **110%** | **5 GB** |
+| M=1 (decode) | 181 | 181 | 62% | ~3.4 GB |
+| M=8 (CUDA Graph) | 324 | 40.5 | 110% | ~4.4 GB |
 | M=16 (CUDA Graph) | 335 | 20.9 | 114% | 9 GB |
 | llama.cpp Q4_K_M | 293 | 293 | 100% | 5 GB |
 | llama.cpp F16 | 114 | 114 | 39% | 5 GB |
@@ -35,11 +35,10 @@ Primary result: **M=8 batched decode at 324 t/s** (110% of llama.cpp Q4_K_M base
 
 ### INT8 Fused Pipeline (14 kernels/layer)
 ```
-unpack_fp4_pack_int8 → gemv_int8_warp(Q) → gemv_int8_warp(K) → gemv_int8_warp(V)
-→ update_kv_cache → attention_decode_gqa → pack_int8 → gemv_int8_warp(Wo)
-→ fused_residual_norm → fused_rmsnorm_pack
-→ unpack_fp4_pack_int8 → gemv_int8_warp(gate) → gemv_int8_warp(up)
-→ fused_swiglu_quant → gemv_int8_warp(down) → fused_residual_norm → fused_rmsnorm_pack
+fused_unpack_fp4_quant → gemv_int8_qkv → update_kv_cache → attention_decode_gqa
+→ pack_int8 → gemv_int8_warp(Wo) → fused_residual_norm → fused_rmsnorm_pack
+→ fused_unpack_fp4_quant → gemv_int8_gate_up → fused_swiglu_quant
+→ gemv_int8_warp(down) → fused_residual_norm → fused_rmsnorm_pack
 ```
 
 **Result: 181 t/s (62% of Q4_K_M)**
@@ -63,31 +62,37 @@ Bandwidth-limited: INT8 reads 1 byte/param vs Q4_K_M's 0.5 bytes/param. Even per
 
 ### Architecture
 - **Batched attention**: `attention_decode_batched_gqa` — processes M sequences in one kernel launch
-- **CUDA Graph**: 28 layers × 119 kernels = 3332 kernel launches captured as single graph
+- **CUDA Graph**: 28 layers × 140 kernel launches = 3920 nodes captured as single graph
 - **Mixed serial/batched**: Serial Q/K/V GEMVs + batched MLP GEMVs + batched attention
 
-### Pipeline Per Layer (119 kernels)
+### Pipeline Per Layer (140 kernel launches)
 ```
-unpack_fp4_pack_int8 × M (8)     — FP4→INT8 per sequence
-gemv_int8_warp(Q) × M (8)        — Q projection per sequence
-gemv_int8_warp(K) × M (8)        — K projection per sequence
-gemv_int8_warp(V) × M (8)        — V projection per sequence
-update_kv_cache × M (8)          — KV cache write per sequence
-attention_decode_batched_gqa × 1  — batched attention (replaces M serial calls)
-pack_int8 × M (8)                — attn FP32→INT8 per sequence
-gemv_int8_warp(Wo) × M (8)       — output projection per sequence
-unpack_fp4 × M (8)               — residual FP4→FP32 per sequence
-vector_add_fp32 × M (8)          — residual add per sequence
-fused_rmsnorm_quant_int8 × M (8) — RMSNorm + INT8 quant per sequence
-fused_rmsnorm_pack × M (8)       — RMSNorm + FP4 pack per sequence
-gemv_int8_warp(gate) × M (8)     — gate projection per sequence
-gemv_int8_warp(up) × M (8)       — up projection per sequence
-apply_swiglu × M (8)             — SwiGLU activation per sequence
-pack_int8 × M (8)                — MLP FP32→INT8 per sequence
-gemv_int8_warp(down) × M (8)     — down projection per sequence
+unpack_fp4_pack_int8 × M (8)         — FP4→INT8 per sequence
+gemv_int8_warp(Q) × M (8)            — Q projection per sequence
+gemv_int8_warp(K) × M (8)            — K projection per sequence
+gemv_int8_warp(V) × M (8)            — V projection per sequence
+update_kv_cache × M (8)              — KV cache write per sequence
+attention_decode_batched_gqa × 1      — batched attention (replaces M serial calls)
+pack_int8 × M (8)                    — attn FP32→INT8 per sequence
+gemv_int8_warp(Wo) × M (8)           — output projection per sequence
+unpack_fp4 × M (8)                   — residual FP4→FP32 per sequence
+vector_add_fp32 × M (8)              — residual add per sequence
+fused_rmsnorm_quant_int8 × M (8)     — RMSNorm + INT8 quant per sequence
+fused_rmsnorm_pack × M (8)           — RMSNorm + FP4 pack per sequence
+gemv_int8_batched(gate) × 1           — gate projection (batched across M)
+gemv_int8_batched(up) × 1             — up projection (batched across M)
+apply_swiglu × M (8)                 — SwiGLU activation per sequence
+pack_int8 × M (8)                    — MLP FP32→INT8 per sequence
+gemv_int8_batched(down) × 1           — down projection (batched across M)
+unpack_fp4 × M (8)                   — residual FP4→FP32 per sequence
+vector_add_fp32 × M (8)              — residual add per sequence
+fused_rmsnorm_quant_int8 × M (8)     — RMSNorm + INT8 quant per sequence
+fused_rmsnorm_pack × M (8)           — RMSNorm + FP4 pack per sequence
 ```
 
-**Result: 323 t/s (110% of Q4_K_M)**
+**Result: 324 t/s (110% of Q4_K_M)**
+
+Note: M=8 VRAM ~4.4 GB (KV cache 1 GB + weights 3.3 GB + buffers ~0.1 GB).
 
 ---
 
@@ -96,8 +101,8 @@ gemv_int8_warp(down) × M (8)     — down projection per sequence
 ### Scaling (corrected after fixing gemv_int8_batched M>8)
 | M | Total t/s | Per-seq t/s | Per-step | VRAM |
 |---|-----------|-------------|----------|------|
-| 1 | 181 | 181 | 5.5 ms | 5 GB |
-| **8** | **324** | **40.5** | **24.7 ms** | **5 GB** |
+| 1 | 181 | 181 | 5.5 ms | ~3.4 GB |
+| **8** | **324** | **40.5** | **24.7 ms** | **~4.4 GB** |
 | 16 | 335 | 20.9 | 47.8 ms | 9 GB |
 
 ### Why M=16 Doesn't Help (Corrected)
@@ -110,10 +115,6 @@ After fixing `gemv_int8_batched` to support M>8 (loop over groups of 8), the rea
 - Serial `gemv_int8_warp` (1 warp/row) has better occupancy but more kernel launches
 
 **M=8 is the practical limit for batched GEMV on this GPU.**
-1. **Weight reuse**: 16 sequences share same 12.6 MB weight matrices. L2 cache (32 MB) holds gate+up+down weights (37.8 MB ≈ L2 size).
-2. **KV cache**: 16 × 28 × 8 × 2048 × 128 × 4 = 4.48 GB (fits in DRAM with headroom)
-3. **GPU occupancy**: 16 sequences × 8 GEMV kernels = 128 blocks → fully saturates 36 SMs
-4. **Beyond M=16**: KV cache pressure (168 MB/seq) starts competing with weight data for DRAM bandwidth
 
 ### Bottleneck Profile (per layer, M=8)
 ```
@@ -140,7 +141,7 @@ Actual per-step:                 18.5 ms (CUDA Graph, measured)
 
 ### What Works
 1. **Batched attention** (`attention_decode_batched_gqa`): 9-22% speedup over serial attention for M≥8
-2. **CUDA Graph**: 2-8% speedup by eliminating kernel launch overhead (significant when 119+ kernels/layer)
+2. **CUDA Graph**: ~3% speedup by eliminating kernel launch overhead (140 kernels/layer × 28 layers = 3920 graph nodes)
 3. **Fused kernels**: `fused_residual_norm`, `fused_rmsnorm_pack`, `fused_swiglu_quant`, `fused_unpack_fp4_quant` — each saves 1 kernel launch per call
 4. **Warp-cooperative GEMV** (`gemv_int8_warp`): 1 warp/row, shuffle reduce, coalesced weight loads
 
@@ -186,6 +187,8 @@ Actual per-step:                 18.5 ms (CUDA Graph, measured)
 - `gemm_int8_wmma` / `gemm_int8_wmma_fast` — WMMA INT8 GEMM (prefill)
 - `fused_pack_gemv_o` — Fused pack+Wo GEMV (correct but slower)
 - `fused_swiglu_gemv` — Fused SwiGLU+down GEMV (correct but slower)
+- `gemv_int8_qkv` — Fused Q/K/V GEMV (3→1 kernel, used in M=1 path)
+- `gemv_int8_gate_up` — Fused gate+up GEMV (2→1 kernel, used in M=1 path)
 - `persistent_qkv_gemv` — Persistent QKV stub (abandoned)
 
 ---
@@ -212,17 +215,16 @@ killall hashcat 2>/dev/null  # MUST DO — uses 3.7 GB VRAM, -45% throughput
 
 ## 8. What's Next
 
-### Maximize M=16 throughput
-- Profile M=16 specific bottlenecks (may differ from M=8)
-- Try split-K GEMV for gate_up (N=6144, largest GEMV)
-- Experiment with L2 cache hints for weight prefetching
-- Try increasing batch size beyond 16 with FP16 KV cache (saves 50% KV memory)
-
 ### Close M=1 gap to Q4_K_M
 - Implement real Q4 quantization (GPTQ/AWQ from HuggingFace)
 - INT4 weights would halve memory reads → ~350+ t/s M=1
 
 ### Production deployment
 - Docker container with inference server
-- Speculative decoding with draft model
+- Speculative decoding with draft model (+30-50% M=8)
 - Continuous batching for variable-length sequences
+
+### M>8 batched GEMV (low priority)
+- `gemv_int8_batched` now supports M>8 (loop over groups of 8)
+- But batched GEMV is slower than serial for M>8 (register pressure)
+- Only beneficial in CUDA Graph context (fewer graph nodes)
