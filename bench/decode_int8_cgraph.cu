@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
 
     // ── L2 Cache Hints ───────────────────────────────────────────────────
     // Reserve 8 MB of L2 for persisting activation buffers (norm weights, etc)
-    // Weight matrices (4-12 MB each) stream through and evict naturally.
+    // Attention weights (15 MB/layer) fit in L2 naturally — hardware caches them.
     cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 8 * 1024 * 1024);
 
     // ── Fill KV cache (seq=0..128) on default stream ────────────────────────
