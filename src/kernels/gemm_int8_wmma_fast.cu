@@ -38,10 +38,9 @@ void gemm_int8_wmma_fast_kernel(
     int wm = cm + tile_row;
     int wn = cn + tile_col;
     
-    // Shared memory: 4 separate 16×16 tiles (each with stride 16)
+    // Shared memory: scales only (no INT32 SMEM buffer needed)
     __shared__ float smem_a_sc[32];
     __shared__ float smem_b_sc[32];
-    __shared__ int smem_int[4][16][16];  // 4 tiles, each 16×16 with stride 16
     
     // FP32 accumulators (8 per thread)
     float acc[8] = {0.0f};
@@ -73,26 +72,22 @@ void gemm_int8_wmma_fast_kernel(
             wmma::fill_fragment(c_frag, 0);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             
-            // Store INT32 to shared memory (stride 16 for each tile)
-            wmma::store_matrix_sync(&smem_int[warp_id][0][0], c_frag, 16, wmma::mem_row_major);
-        }
-        __syncthreads();
-        
-        // Apply scales and accumulate to FP32
-        // WMMA m16n16k16 accumulator layout: thread tid owns 8 elements at:
-        //   row = (tid/4)*2 + (i/4), col = (tid%4)*4 + (i%4)
-        for (int i = 0; i < 8; i++) {
-            int row_in_tile = (lane_id / 4) * 2 + (i / 4);
-            int col_in_tile = (lane_id % 4) * 4 + (i % 4);
-            int m = wm + row_in_tile;
-            int n = wn + col_in_tile;
-            if (m < M && n < N) {
+            // Direct dequant from c_frag.x[i] — NO SMEM round-trip
+            // WMMA m16n16k16 int accumulator layout:
+            // thread owns 8 values at:
+            //   row = (lane_id/4)*2 + (i/4), col = (lane_id%4)*4 + (i%4)
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int row_in_tile = (lane_id / 4) * 2 + (i / 4);
+                int col_in_tile = (lane_id % 4) * 4 + (i % 4);
+                int m_out = wm + row_in_tile;
+                int n_out = wn + col_in_tile;
                 float a_scale = smem_a_sc[tile_row + row_in_tile];
                 float b_scale = smem_b_sc[tile_col + col_in_tile];
-                acc[i] += (float)smem_int[warp_id][row_in_tile][col_in_tile] * a_scale * b_scale;
+                acc[i] += (float)c_frag.x[i] * a_scale * b_scale;
             }
         }
-        __syncthreads();
+        // No __syncthreads — no SMEM buffer between warps
     }
     
     // Write final result
