@@ -21,7 +21,7 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 | GPU | RTX 5060 Ti, GB206, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3, C++17, CMake |
 | Library | **157 symbols** `build/libblackwell_kernels.a` |
-| Branch | master @ `4219567` |
+| Branch | master @ `ed9d8f2` |
 | Session | **33** |
 
 ### Benchmark Results
@@ -168,8 +168,8 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-01 |
 | branch | master |
-| last_commit | `4219567` docs: session 33 — spec decode infeasibility analysis, update symbol count, mark server ready |
-| repo_state | 157 symbols. gemv_int8_batched M>8 fixed. M=8: 324 t/s (110% of Q4_K_M). Spec decode infeasible. Docker server ready. |
+| last_commit | `ed9d8f2` Phase 3: FP4 tensor core + PDL research — both dead ends for M=1 decode |
+| repo_state | 157 symbols. M=8 CUDA Graph: 324 t/s (110% of Q4_K_M). M=1: 181 t/s. FP4 tensor cores dead end. PDL dead end. Spec decode infeasible. Docker server built & tested. |
 | uncommitted | (none — clean) |
 
 ---

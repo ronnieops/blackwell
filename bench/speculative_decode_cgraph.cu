@@ -1,8 +1,22 @@
 // bench/speculative_decode_cgraph.cu — Speculative decode with CUDA Graph
 //
-// Optimizes batched speculative path using CUDA Graph for the per-token decode.
-// Captures one token's full layer pipeline into a graph, replays M times per step.
-// Saves ~15 kernel launches × NL layers per step for the batched path.
+// ⚠️ INFEAISBLE ON RTX 5060 Ti (session 33 analysis). Archived for reference.
+//
+// Root cause: batched verify path (24.7 ms/seq at M=8) is 4.5× slower per-seq
+// than sequential decode (5.52 ms/seq at M=1). Draft model would need 4.5×
+// speedup just to break even. Even tiny 50M draft (~18× speedup) yields only
+// ~92 t/s due to low acceptance rates — worse than 181 t/s sequential.
+//
+// Self-speculation (skip layers) won't work either: lm_head needs all 28
+// layers for meaningful logits. No early-exit head exists.
+//
+// This benchmark runs M+1 full passes per step (same cost as M+1 autoregressive
+// passes), confirming 0% speedup. The code is kept for reference only.
+//
+// Original intent: Optimizes batched speculative path using CUDA Graph for
+// the per-token decode. Captures one token's full layer pipeline into a graph,
+// replays M times per step. Saves ~15 kernel launches × NL layers per step
+// for the batched path.
 
 #include <cuda_runtime.h>
 #include <cstdio>
