@@ -71,6 +71,7 @@ set(KERNEL_SOURCES
     src/kernels/gemv_fp4_nv.cu
     src/kernels/fused_mlp.cu
     src/kernels/sample_gpu.cu
+    src/kernels/gated_delta_net.cu
 )
 
 # ---------------------------------------------------------------------------

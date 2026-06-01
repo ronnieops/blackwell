@@ -53,6 +53,93 @@ __global__ void update_kv_kernel(
 // - Float4 vectorized K cache reads for QK dot product
 // - Reduced smem: Q[128] + scores[4096] = 17 KB
 // ---------------------------------------------------------------------------
+// Decode attention kernel v4: supports arbitrary head_dim (128, 256, etc.)
+//
+// Same algorithm as v3 but loops over head_dim in chunks of 128.
+// ---------------------------------------------------------------------------
+__launch_bounds__(128, 2)
+__global__ void attention_decode_kernel_v4(
+    float* __restrict__ output,
+    const float* __restrict__ Q,
+    const float* __restrict__ K_cache,
+    const float* __restrict__ V_cache,
+    const int* seq_pos_ptr,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    float scale)
+{
+    int seq_pos = *seq_pos_ptr;
+    int head = blockIdx.x;
+    if (head >= num_q_heads) return;
+
+    int kv_head = head * num_kv_heads / num_q_heads;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid & 31;
+    int npos = seq_pos + 1;
+    int h_base = kv_head * max_seq_len * head_dim;
+
+    Q += head * head_dim;
+    output += head * head_dim;
+
+    extern __shared__ float smem[];
+    float* smem_Q = smem;
+    float* scores = smem + head_dim;
+
+    // Load Q into smem
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        smem_Q[i] = Q[i];
+    __syncthreads();
+
+    // Compute scores: 4 warps, each handles npos/4 positions
+    int num_warps = 4;
+    for (int t = warp_id; t < npos; t += num_warps) {
+        float dot = 0.f;
+        // Loop over head_dim in chunks of 128 (32 threads * 4 floats)
+        for (int d_base = 0; d_base < head_dim; d_base += 128) {
+            int d = d_base + lane_id * 4;
+            if (d + 3 < head_dim) {
+                float4 q4 = *reinterpret_cast<const float4*>(smem_Q + d);
+                float4 k4 = *reinterpret_cast<const float4*>(K_cache + h_base + t * head_dim + d);
+                dot += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+            } else {
+                // Scalar fallback for tail
+                for (int i = d_base + lane_id; i < head_dim && i < d_base + 128; i += 32)
+                    dot += smem_Q[i] * K_cache[h_base + t * head_dim + i];
+            }
+        }
+        // Warp reduce
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffff, dot, off);
+        if (lane_id == 0) scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // Softmax
+    float maxv = -FLT_MAX;
+    for (int t = 0; t < npos; ++t)
+        if (scores[t] > maxv) maxv = scores[t];
+    float sumexp = 0.f;
+    for (int t = 0; t < npos; ++t) {
+        float e = __expf(scores[t] - maxv);
+        scores[t] = e;
+        sumexp += e;
+    }
+    float inv_sum = 1.f / (sumexp + 1e-9f);
+
+    // V weighted sum
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float out_val = 0.f;
+        for (int t = 0; t < npos; ++t)
+            out_val += scores[t] * V_cache[h_base + t * head_dim + d];
+        output[d] = out_val * inv_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 __launch_bounds__(128, 2)
 __global__ void attention_decode_kernel(
     float* __restrict__ output,
@@ -262,11 +349,21 @@ cudaError_t attention_decode_gqa(
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    attention_decode_kernel<<<
-        dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
-        output, Q, K_cache, V_cache,
-        d_seq_pos_global, num_q_heads, num_kv_heads,
-        head_dim, max_seq_len, scale);
+
+    // Dispatch to v4 for head_dim > 128 (Qwen3.5-9B has head_dim=256)
+    if (head_dim > 128) {
+        attention_decode_kernel_v4<<<
+            dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
+            output, Q, K_cache, V_cache,
+            d_seq_pos_global, num_q_heads, num_kv_heads,
+            head_dim, max_seq_len, scale);
+    } else {
+        attention_decode_kernel<<<
+            dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
+            output, Q, K_cache, V_cache,
+            d_seq_pos_global, num_q_heads, num_kv_heads,
+            head_dim, max_seq_len, scale);
+    }
 
     return cudaPeekAtLastError();
 }

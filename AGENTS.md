@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**274.4 t/s**, re-measured 2026-05-31, CUDA 13.2).
-INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **125 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **141 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs 
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 125 symbols in `build/libblackwell_kernels.a`
+**Library**: 141 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -37,6 +37,12 @@ INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs 
 - `gemm_int8_wmma` — WMMA INT8 GEMM (prefill, 3.8× dp4a)
 - `gemm_int8_wmma_fast` — Optimized WMMA (32×32 tiles, 4 warps, 4.3-5.0K GFLOPS)
 - `gemm_int8_mma` — Stub (returns cudaErrorNotSupported)
+- `sample_gpu` — GPU softmax + top-k + cuRAND weighted sampling (replaces 607KB memcpy)
+- `sample_argmax_gpu` — GPU argmax (4-byte output, greedy decode)
+- `gated_delta_conv1d_update` — 1D depthwise conv + SiLU for GatedDeltaNet (Qwen3.5-9B)
+- `gated_delta_recurrent_step` — SSM recurrent step with QK broadcast (NK→NV heads)
+- `gated_delta_rmsnorm_gated` — Fused RMSNormGated (norm × silu gate)
+- `attention_decode_kernel_v4` — Decode attention for head_dim>128 (Qwen3.5-9B full attn)
 
 **Optimized GEMV kernels**:
 - `gemv_int8_unrolled` — Block-cooperative with 4× unrolling (+9-45%)
@@ -117,6 +123,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | llama.cpp F16 | **111.5 t/s** | Qwen3-1.7B |
 | llama.cpp Q4_K_M (3.5-4B) | 115.9 t/s | Qwen3.5-4B UD-IQ2_M |
 | llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
+| Qwen3.5-9B INT8 decode | **45.7 t/s** | 64% of Q4_K_M, weight-bound (INT8 reads 2× Q4) |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
 | GEMM prefill (before fix) | 4.3 TFLOPS | 8.7% utilization |
 | GEMM prefill (after c_frag fix) | **13.0 TFLOPS** | **3× speedup**, 26% utilization |
@@ -173,8 +180,9 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 6. **FP4 packed numerically unstable** — 247 vs 184 t/s. Throughput competitive but outputs garbage (~10^8 values). E2M1 nibble→float overhead can't use __dp4a SIMD.
 7. **L2 cache hint targets wrong stream** — FIXED (commit f55a705). Targets graph_stream.
 8. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
-9. **Docker/API packaging** — In progress (session 26)
+9. **Docker/API packaging** — ✅ Done (session 26)
 10. **WMMA dequant correct** — `gemm_int8_wmma_fast` per-block dequant confirmed correct (advisor analysis). Per-iteration SMEM load correctly indexes K-block. AGENTS.md §10 note was wrong.
+11. **GPU sampling** — ✅ Done (session 28). `sample_gpu` handles argmax, temperature, and top-k on GPU. No host fallback needed.
 
 ---
 
@@ -196,7 +204,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 125)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 141)
 
 ---
 

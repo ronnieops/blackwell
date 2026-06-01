@@ -842,6 +842,41 @@ cudaError_t sample_gpu(
     int             step,       // step counter (for rng state)
     cudaStream_t    stream = 0);
 
+// ---------------------------------------------------------------------------
+// GatedDeltaNet (linear attention) for Qwen3.5-9B
+// ---------------------------------------------------------------------------
+// Conv1d update: shift state, insert new QKV, depthwise conv + SiLU
+cudaError_t gated_delta_conv1d_update(
+    float*          conv_state, // [CONV_DIM * (CONV_K-1)] in-place
+    const float*    new_qkv,    // [CONV_DIM]
+    const float*    conv_w,     // [CONV_DIM * CONV_K]
+    float*          out,        // [CONV_DIM]
+    cudaStream_t    stream = 0);
+
+// Recurrent step: Q,K broadcast + SSM update
+cudaError_t gated_delta_recurrent_step(
+    const float*    q,          // [batch, NK, HD]
+    const float*    k,          // [batch, NK, HD]
+    const float*    v,          // [batch, NV, HD]
+    const float*    g,          // [batch, NV] decay
+    const float*    beta,       // [batch, NV] gate
+    float*          q_broadcast,// [batch, NV, HD] temp buffer
+    float*          k_broadcast,// [batch, NV, HD] temp buffer
+    float*          state,      // [batch, NV, HD, HD]
+    float*          out,        // [batch, NV, HD]
+    int             batch_size,
+    cudaStream_t    stream = 0);
+
+// RMSNormGated: norm(x) * silu(gate)
+cudaError_t gated_delta_rmsnorm_gated(
+    float*          out,        // [batch, NV, HD]
+    const float*    x,          // [batch, NV, HD]
+    const float*    gate,       // [batch, NV, HD]
+    const float*    norm_w,     // [HD]
+    int             batch_size,
+    float           eps = 1e-6f,
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

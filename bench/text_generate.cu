@@ -422,21 +422,12 @@ int main(int argc, char** argv) {
                     d_emb_d,d_emb_sc,H,V,st);
                 if(cudaGetLastError()!=cudaSuccess||e!=cudaSuccess){printf("FAIL lm_head step=%d\n",step);exit(1);}
             }
-            die(cudaStreamSynchronize(st),"sync_final");
-
-            // GPU sampler: argmax only (fastest path)
-            // Temperature + top-k: host fallback (GPU softmax not yet verified)
+            // GPU sampler — handles argmax, temperature, and top-k
+            // No sync needed: sample_gpu runs on same stream, auto-waits for lm_head
             int next_id;
-            if (temperature < 0.01f) {
-                // GPU argmax: 4-byte copy instead of 607 KB
-                die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k,
-                    d_next_id, 0xdeadbeefLL, step, st), "sample_gpu");
-                die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy_id");
-            } else {
-                // Full sampling: host fallback
-                die(cudaMemcpy(h_logits.data(), d_logits, V*4, cudaMemcpyDeviceToHost), "logits_cpy");
-                next_id = sample(h_logits.data(), V, temperature, top_k);
-            }
+            die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k,
+                d_next_id, 0xdeadbeefLL, step, st), "sample_gpu");
+            die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy_id");
 
             all_ids.push_back(next_id);
             std::string txt = tokenizer.decode(next_id);
