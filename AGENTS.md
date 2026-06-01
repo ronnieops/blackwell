@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**274.4 t/s**, re-measured 2026-05-31, CUDA 13.2).
-INT8 batched attn + CUDA Graph (M=8): **327.1 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **125 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **125 library symbols**.
 
 ---
 
@@ -34,7 +34,7 @@ INT8 batched attn + CUDA Graph (M=8): **327.1 t/s** (119% of Q4_K_M). **+65% vs 
 - `fused_rope` / `fused_rope_decode` — in-place rotation, smem cos/sin cache
 - `attention_decode_batched_gqa` — Batched GQA decode attention (M sequences in parallel)
 - `update_kv_cache` — KV cache write with per-layer offset
-- `gemm_int8_wmma` — WMMA INT8 GEMM (prefill, 3.8× dp4a, simplified dequant)
+- `gemm_int8_wmma` — WMMA INT8 GEMM (prefill, 3.8× dp4a)
 - `gemm_int8_wmma_fast` — Optimized WMMA (32×32 tiles, 4 warps, 4.3-5.0K GFLOPS)
 - `gemm_int8_mma` — Stub (returns cudaErrorNotSupported)
 
@@ -79,7 +79,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 ./bench/decode_int8_batched_cgraph 28 4   # CUDA Graph batched M=4: 287 t/s
 ./bench/decode_int8_batched_cgraph 28 8   # CUDA Graph batched M=8: 294 t/s
 ./bench/decode_int8_batched_cgraph_attn 28 4  # Batched attn + Graph M=4: 307 t/s (111%)
-./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 327.1 t/s (119% of Q4_K_M, +65% vs F16)
+./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 326.8 t/s (119% of Q4_K_M, +65% vs F16)
 ./bench/decode_int8_generic 28 weights_int8_bf16 2048 2048 1024 6144 16 8 "Qwen3-1.7B"  # 183.6 t/s
 ./bench/decode_int8_generic 28 weights_int8_qwen3_06b 1024 1024 512 3072 8 4 "Qwen3-0.6B"  # 447.4 t/s
 ./bench/decode_int8_generic 36 weights_int8_qwen3_8b 4096 4096 1024 12288 32 8 "Qwen3-8B"  # 44.5 t/s
@@ -100,8 +100,8 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 batched-attn M=8 CUDA Graph | **327.1 t/s** | **119%** of llama.cpp Q4_K_M (274.4) |
-| INT8 batched-attn M=8 vs llama.cpp F16 | **+65%** | 327.1 vs 111.5 t/s |
+| INT8 batched-attn M=8 CUDA Graph | **326.8 t/s** | **119%** of llama.cpp Q4_K_M (274.4) |
+| INT8 batched-attn M=8 vs llama.cpp F16 | **+65%** | 326.8 vs 111.5 t/s |
 | INT8 batched-attn M=4 CUDA Graph | ~312 t/s | **114%** of Q4_K_M |
 | INT8 batched-attn M=1 CUDA Graph | **118.8 t/s** | 43% of Q4_K_M |
 | INT8 generic CUDA Graph (1.7B) | **183.6 t/s** | 67% of Q4_K_M |
@@ -174,7 +174,7 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 7. **L2 cache hint targets wrong stream** — FIXED (commit f55a705). Targets graph_stream.
 8. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
 9. **Docker/API packaging** — In progress (session 26)
-10. **WMMA dequant simplified** — Uses first-block scale only (L1 diff=13.4 vs dp4a). Per-block scale pending.
+10. **WMMA dequant correct** — `gemm_int8_wmma_fast` per-block dequant confirmed correct (advisor analysis). Per-iteration SMEM load correctly indexes K-block. AGENTS.md §10 note was wrong.
 
 ---
 
