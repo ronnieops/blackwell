@@ -118,7 +118,9 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | llama.cpp Q4_K_M (3.5-4B) | 115.9 t/s | Qwen3.5-4B UD-IQ2_M |
 | llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
-| GEMM prefill | 78 GB/s | 3× faster than llama.cpp |
+| GEMM prefill (before fix) | 4.3 TFLOPS | 8.7% utilization |
+| GEMM prefill (after c_frag fix) | **13.0 TFLOPS** | **3× speedup**, 26% utilization |
+| Pipeline SNR | **13.9 dB** | Constant across 28 layers, no compounding |
 | CUDA Graph speedup | ~1-6% | Model-size dependent |
 | Batched attention speedup | **+9.8%** | M=8 vs serial-attn |
 | hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
