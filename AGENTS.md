@@ -6,8 +6,8 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 
 ## 1. Mission
 
-Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**274.4 t/s**, re-measured 2026-05-31, CUDA 13.2).
-INT8 batched attn + CUDA Graph (M=8): **326.8 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **141 library symbols**.
+Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.9 t/s** FA=on, re-measured 2026-06-01, CUDA 13.3, build b9442).
+INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **141 library symbols**.
 
 ---
 
@@ -106,24 +106,26 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 batched-attn M=8 CUDA Graph | **326.8 t/s** | **119%** of llama.cpp Q4_K_M (274.4) |
-| INT8 batched-attn M=8 vs llama.cpp F16 | **+65%** | 326.8 vs 111.5 t/s |
-| INT8 batched-attn M=4 CUDA Graph | ~312 t/s | **114%** of Q4_K_M |
-| INT8 batched-attn M=1 CUDA Graph | **118.8 t/s** | 43% of Q4_K_M |
-| INT8 generic CUDA Graph (1.7B) | **183.6 t/s** | 67% of Q4_K_M |
-| INT8 generic CUDA Graph (0.6B) | **447.4 t/s** | H=1024 |
-| INT8 generic CUDA Graph (8B, 28L) | **57.4 t/s** | H=4096 |
-| INT8 generic CUDA Graph (8B, 36L) | **44.5 t/s** | H=4096 |
+| INT8 batched-attn M=8 CUDA Graph | **323.5 t/s** | **110%** of llama.cpp Q4_K_M (292.9) |
+| INT8 batched-attn M=8 vs llama.cpp F16 | **+183%** | 323.5 vs 114.3 t/s |
+| INT8 batched-attn M=4 CUDA Graph | **307.5 t/s** | **105%** of Q4_K_M |
+| INT8 batched-attn M=1 CUDA Graph | **118.5 t/s** | 40% of Q4_K_M |
+| INT8 generic CUDA Graph (1.7B) | **181.7 t/s** | 62% of Q4_K_M |
+| INT8 generic CUDA Graph (0.6B) | **444.1 t/s** | H=1024 |
+| INT8 generic CUDA Graph (8B, 28L) | **57.3 t/s** | H=4096, 69% of Q4_K_M (82.5) |
+| INT8 generic CUDA Graph (8B, 36L) | **44.6 t/s** | H=4096 |
 | WMMA GEMM (INT8) | **10,510 GFLOPS** | 3.81× over dp4a |
 | WMMA FAST GEMM (INT8) | **4.3-5.0K GFLOPS** | 1.2-1.4× over dp4a (real weights) |
 | Block GEMV unrolling | **+9-45%** | 4× unroll, K-dependent |
 | Speculative decode (M=4) | **190 t/s** | 0% speedup — same total work as autoregressive |
 | FP4 batched (M=8) | 243.4 t/s | 83% ⚠️ 180% RMS diff vs INT8 |
-| llama.cpp Q4_K_M | **274.4 t/s** | Qwen3-1.7B, build 95405ac65, CUDA 13.2 |
-| llama.cpp F16 | **111.5 t/s** | Qwen3-1.7B |
-| llama.cpp Q4_K_M (3.5-4B) | 115.9 t/s | Qwen3.5-4B UD-IQ2_M |
+| llama.cpp Q4_K_M FA=on | **292.9 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
+| llama.cpp Q4_K_M FA=off | **274.3 t/s** | Qwen3-1.7B (old baseline path) |
+| llama.cpp F16 FA=on | **114.3 t/s** | Qwen3-1.7B |
+| llama.cpp F16 FA=off | **111.2 t/s** | Qwen3-1.7B (old baseline path) |
+| llama.cpp Q4_K_M FA=on (8B) | **82.5 t/s** | Qwen3-8B, build b9442 |
 | llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
-| Qwen3.5-9B INT8 decode | **45.7 t/s** | 64% of Q4_K_M, weight-bound (INT8 reads 2× Q4) |
+| Qwen3.5-9B INT8 decode | **45.6 t/s** | 64% of Q4_K_M, weight-bound (INT8 reads 2× Q4) |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
 | GEMM prefill (before fix) | 4.3 TFLOPS | 8.7% utilization |
 | GEMM prefill (after c_frag fix) | **13.0 TFLOPS** | **3× speedup**, 26% utilization |

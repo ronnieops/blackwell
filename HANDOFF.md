@@ -7,9 +7,9 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 ## 1. Current Objective
 
 INT8 inference engine for RTX 5060 Ti. Production-ready. **141 symbols**.
-- Qwen3-1.7B: 326.8 t/s batched M=8 (119% of Q4_K_M 274.4)
-- Qwen3-1.7B: 182.8 t/s M=1 (67% of Q4_K_M)
-- Qwen3.5-9B: 45.7 t/s (64% of Q4_K_M 71.4) — INT8 weight-bound, no fix possible
+- Qwen3-1.7B: 323.5 t/s batched M=8 (**110%** of Q4_K_M FA=on 292.9)
+- Qwen3-1.7B: 181.7 t/s M=1 (62% of Q4_K_M)
+- Qwen3.5-9B: 45.6 t/s (64% of Q4_K_M 71.4) — INT8 weight-bound, no fix possible
 - Bottleneck: INT8 reads 2× more data than Q4_K_M. INT4/FP4 dead end on GB206.
 
 ---
@@ -28,11 +28,11 @@ INT8 inference engine for RTX 5060 Ti. Production-ready. **141 symbols**.
 
 | Model | Config | Blackwell INT8 | llama.cpp Q4_K_M | Ratio |
 |-------|--------|----------------|-------------------|-------|
-| Qwen3-1.7B | Batched attn M=8 | **326.8 t/s** | 274.4 t/s | **119%** ✅ |
-| Qwen3-1.7B | CUDA Graph M=1 | 182.8 t/s | 274.4 t/s | 67% |
-| Qwen3-0.6B | CUDA Graph | 447.4 t/s | — | — |
-| Qwen3-8B | CUDA Graph 28L | 57.4 t/s | 78.7 t/s | 73% |
-| Qwen3.5-9B | Decode | 45.7 t/s | 71.4 t/s | 64% |
+| Qwen3-1.7B | Batched attn M=8 | **323.5 t/s** | 292.9 t/s | **110%** ✅ |
+| Qwen3-1.7B | CUDA Graph M=1 | 181.7 t/s | 292.9 t/s | 62% |
+| Qwen3-0.6B | CUDA Graph | 444.1 t/s | — | — |
+| Qwen3-8B | CUDA Graph 28L | 57.3 t/s | 82.5 t/s | 69% |
+| Qwen3.5-9B | Decode | 45.6 t/s | 71.4 t/s | 64% |
 | GEMM prefill | M=128 | **13.0 TFLOPS** | 4.3 TFLOPS old | 3× ✅ |
 
 ---
@@ -137,11 +137,11 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 | Check | Status | Notes |
 |-------|--------|-------|
 | Library | ✅ 141 symbols | +7 from GatedDeltaNet kernels |
-| INT8 batched attn M=8 | ✅ 326.8 t/s | 119% of Q4_K_M |
+| INT8 batched attn M=8 | ✅ 323.5 t/s | 110% of Q4_K_M FA=on (292.9) |
 | GEMM prefill | ✅ 13.0 TFLOPS | 3× vs old |
 | text_generate | ✅ 126 t/s | "Paris" correct, GPU sampling |
 | GEMM verify_gemm | ✅ 7/7 PASS | All layer-0 weights |
-| Qwen3.5-9B decode | ✅ 45.7 t/s | 64% of llama.cpp (weight-bound) |
+| Qwen3.5-9B decode | ✅ 45.6 t/s | 64% of Q4_K_M (weight-bound) |
 | Qwen3.5-9B quantization | ✅ 11GB | 250 INT8 + 105 raw params |
 
 ---
@@ -152,8 +152,8 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-01 |
 | branch | master |
-| last_commit | `2e64aee` HANDOFF.md refresh session 27 |
-| repo_state | 141 symbols. Qwen3.5-9B decode 45.7 t/s. GPU sampling. GatedDeltaNet. Docker. GEMM prefill 3×. |
+| last_commit | `52ae03a` session 28: Qwen3.5-9B GatedDeltaNet, GPU sampling, attention v4 |
+| repo_state | 141 symbols. Qwen3.5-9B decode 45.6 t/s. GPU sampling. GatedDeltaNet. GEMM prefill 3×. |
 | sessions_completed | 28 |
 
 ---
@@ -162,7 +162,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 141) → `./bench/text_generate "The capital of France is" 15 -t 0.001` (expect "Paris").
 
-**Verified state**: 141 symbols. 326.8 t/s batched attn (M=8). GEMM prefill 13.0 TFLOPS. Qwen3.5-9B: 45.7 t/s (64% of llama.cpp). GPU sampling. GatedDeltaNet kernels.
+**Verified state**: 141 symbols. 323.5 t/s batched attn (M=8), 110% of Q4_K_M FA=on (292.9). GEMM prefill 13.0 TFLOPS. Qwen3.5-9B: 45.6 t/s (64% of llama.cpp). GPU sampling. GatedDeltaNet kernels.
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
