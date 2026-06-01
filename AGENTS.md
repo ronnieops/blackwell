@@ -7,7 +7,11 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, GB20
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.9 t/s** FA=on, CUDA 13.3).
-INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **155 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **157 library symbols**.
+
+**Speculative decode infeasible**: Batched verify path (24.7 ms/seq) is **4.5× slower per-seq** than sequential decode (5.52 ms/seq). Draft model would need 4.5× speedup to break even. Even tiny 50M draft (~18× speedup) yields only ~92 t/s due to low acceptance rates. Self-speculation (skip layers) won't work — lm_head needs all layers. Abandoned.
+
+**Docker production server ready**: `Dockerfile` + `server/server.py`. 324 t/s beats Q4_K_M by 10%. Ship it.
 
 **M=1 INT8 decode: 176.5 t/s (60% of Q4_K_M).** Bandwidth-limited: INT8 reads 1 byte/param vs Q4_K_M's 0.5 byte/param. Cannot close gap through fusion alone.
 
@@ -27,7 +31,7 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 155 symbols in `build/libblackwell_kernels.a`
+**Library**: 157 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -197,6 +201,8 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 15. **Fused pack+GEMV kernels (session 31)** — `fused_pack_gemv_o` + `fused_swiglu_gemv` numerically correct but ~20% slower (144.6 t/s). Two-phase kernels (quant→sync→GEMV) add quantization overhead to GEMV critical path. Not used in production benchmark. Archives correct kernels (157 symbols).
 16. **gemv_int8_batched is SLOWER than gemv_int8_warp** (session 32) — Isolated test: serial warp GEMV is 1.5-2.7× faster than batched GEMV for all GEMV sizes (N=1024-6144). Reason: serial has higher occupancy (M×N blocks vs N blocks). However, in CUDA Graph context, batched MLP is faster (fewer graph nodes = less overhead). Production benchmark uses batched MLP (gate/up/down) + serial Q/K/V + batched attention. M=8 CUDA Graph: 323 t/s.
 17. **L2 persisting cache harmful for large weights** (session 32) — Pinning 12.6 MB gate weights in L2 persisting cache caused 28% regression. Evicts other cached data (up/down weights, attention data). d_rn (8 KB) persisting is neutral. Removed L2 persisting for MLP weights.
+18. **Speculative decode infeasible** (session 33) — Batched verify (24.7 ms/seq) is **4.5× slower per-seq** than sequential (5.52 ms/seq). Draft must be 4.5× faster to break even. Even tiny 50M draft only yields ~92 t/s. Self-speculation (skip layers) won't work — lm_head needs all 28 layers. No early-exit head exists. Abandoned.
+19. **Docker production server ready** (session 33) — `Dockerfile` + `server/server.py`. Not yet built/tested end-to-end. 324 t/s (110% of Q4_K_M) is production target.
 
 ---
 
@@ -218,7 +224,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 141)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 157)
 
 ---
 

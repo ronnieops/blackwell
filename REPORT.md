@@ -220,9 +220,17 @@ killall hashcat 2>/dev/null  # MUST DO — uses 3.7 GB VRAM, -45% throughput
 - INT4 weights would halve memory reads → ~350+ t/s M=1
 
 ### Production deployment
-- Docker container with inference server
-- Speculative decoding with draft model (+30-50% M=8)
+- Docker container with inference server (`Dockerfile` + `server/server.py`)
+- **Speculative decoding**: ❌ Infeasible on this hardware. Batched verify (24.7 ms/seq) is 4.5× slower per-seq than sequential (5.52 ms/seq). Draft needs 4.5× speedup to break even. Even tiny 50M draft only yields ~92 t/s due to low acceptance. Self-speculation (skip layers) won't work — lm_head needs all layers. No early-exit head. Abandoned.
 - Continuous batching for variable-length sequences
+
+### Key finding: Why spec decode fails on this hardware
+Sequential `gemv_int8_warp` = 5.52 ms/token. Batched `gemv_int8_batched` = 24.7 ms/seq (at M=8).
+Draft models (costing ~0.3 ms/token for 50M param) would need α > 0.95 acceptance just to break even.
+Realistic α ~ 0.4 gives ~92 t/s — worse than 181 t/s sequential.
+
+This is an architectural constraint of the GPU: batched GEMV register pressure limits occupancy,
+making batched verify slower per-sequence than sequential decode.
 
 ### M>8 batched GEMV (low priority)
 - `gemv_int8_batched` now supports M>8 (loop over groups of 8)
