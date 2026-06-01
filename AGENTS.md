@@ -165,15 +165,14 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 
 1. **hashcat runs persistently** on GPU-0 (PID 57393/64789, auto-restarts). Uses 3740MiB VRAM. Kills benchmark throughput ~45%. Must `killall hashcat` before any measurement — 60s window before respawn
 2. **22 bench files migrated to `gemv_int8_warp`** (164 call sites). Production path: decode_int8_cgraph and decode_full_int8.
-3. **FP32 text_generate broken** — `text_generate_fp32.cu` produces worse output than INT8. Separate issue (BF16 weight file convention or cuBLAS transpose)
-4. **GEMM prefill correctness unverified** — no reference comparison. Timing-only validation
-5. **text_generate head_norm bug** — Pre-existing. "FAIL head_norm l=0". In `text_generate.cu` (uses `gemv_fp32_int8_per_row`)
+3. **text_generate repetition** — Greedy decode repeats (normal for argmax). Use -t 0.8 or -k 40 for better output.
+4. **GEMM prefill correctness verified** — test_wmma PASS, verify_gemm PASS, decode_prefill 3× speedup committed.
+5. **text_generate head_norm bug** — ✅ **FIXED**. No FAIL head_norm. Uses gemv_int8_warp (not old per_row).
 6. **FP4 packed numerically unstable** — 247 vs 184 t/s. Throughput competitive but outputs garbage (~10^8 values). E2M1 nibble→float overhead can't use __dp4a SIMD.
 7. **L2 cache hint targets wrong stream** — FIXED (commit f55a705). Targets graph_stream.
-8. **CUDA Graph drift** — INT8: max diff ~3.1 (known, numerical drift). FP4: outputs garbage (~10^8 values).
-9. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
-10. **Docker/API packaging** — Not done
-11. **WMMA dequant simplified** — Uses first-block scale only (L1 diff=13.4 vs dp4a). Per-block scale pending.
+8. **Speculative decode CUDA Graph crash** — static cudaMalloc in decode.cu needs warm-up first
+9. **Docker/API packaging** — In progress (session 26)
+10. **WMMA dequant simplified** — Uses first-block scale only (L1 diff=13.4 vs dp4a). Per-block scale pending.
 
 ---
 
