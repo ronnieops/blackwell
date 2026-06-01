@@ -538,6 +538,23 @@ cudaError_t gemv_fp32_int8_per_row_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Fused Q/K/V GEMV — single kernel launch for all 3 projections.
+// Reads activation vector once, shared across Q/K/V.
+// Q_out: [N_q], K_out: [N_kv], V_out: [N_kv]
+cudaError_t gemv_int8_qkv(
+    float*          Q_out,
+    float*          K_out,
+    float*          V_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_q, const float* W_q_sc,
+    const void*     W_k, const float* W_k_sc,
+    const void*     W_v, const float* W_v_sc,
+    int             K,
+    int             N_q,
+    int             N_kv,
+    cudaStream_t   stream = 0);
+
 // Packed FP4 warp GEMV — 2 E2M1 values per byte, 2× less bandwidth than INT8.
 // Packed FP4 activations × packed FP4 weights, per-row scales.
 // x_packed: [K/2] bytes, x_scale: [K/16] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32

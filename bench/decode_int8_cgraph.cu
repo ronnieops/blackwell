@@ -151,12 +151,13 @@ int main(int argc, char** argv) {
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
             int kb = l * nkv * ms * hd;
-            chk(blackwell::kernels::gemv_int8_warp(b.d_Q, b.d_x_int8, b.d_x_int8_s,
-                lw[l].q.d, lw[l].q.sc, H, Q, 0), "Q");
-            chk(blackwell::kernels::gemv_int8_warp(b.d_K, b.d_x_int8, b.d_x_int8_s,
-                lw[l].k.d, lw[l].k.sc, H, KV, 0), "K");
-            chk(blackwell::kernels::gemv_int8_warp(b.d_V, b.d_x_int8, b.d_x_int8_s,
-                lw[l].v.d, lw[l].v.sc, H, KV, 0), "V");
+            chk(blackwell::kernels::gemv_int8_qkv(
+                b.d_Q, b.d_K, b.d_V,
+                b.d_x_int8, b.d_x_int8_s,
+                lw[l].q.d, lw[l].q.sc,
+                lw[l].k.d, lw[l].k.sc,
+                lw[l].v.d, lw[l].v.sc,
+                H, Q, KV, 0), "QKV");
             chk(blackwell::kernels::update_kv_cache(
                 d_kc+kb, d_vc+kb, b.d_K, b.d_V, 0, s, nkv, hd, ms, 0), "kv");
             chk(blackwell::kernels::attention_decode_gqa(
@@ -255,12 +256,13 @@ int main(int argc, char** argv) {
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
             int kb = l * nkv * ms * hd;
-            blackwell::kernels::gemv_int8_warp(b.d_Q, b.d_x_int8, b.d_x_int8_s,
-                lw[l].q.d, lw[l].q.sc, H, Q, 0);
-            blackwell::kernels::gemv_int8_warp(b.d_K, b.d_x_int8, b.d_x_int8_s,
-                lw[l].k.d, lw[l].k.sc, H, KV, 0);
-            blackwell::kernels::gemv_int8_warp(b.d_V, b.d_x_int8, b.d_x_int8_s,
-                lw[l].v.d, lw[l].v.sc, H, KV, 0);
+            blackwell::kernels::gemv_int8_qkv(
+                b.d_Q, b.d_K, b.d_V,
+                b.d_x_int8, b.d_x_int8_s,
+                lw[l].q.d, lw[l].q.sc,
+                lw[l].k.d, lw[l].k.sc,
+                lw[l].v.d, lw[l].v.sc,
+                H, Q, KV, 0);
             blackwell::kernels::update_kv_cache(
                 d_kc+kb, d_vc+kb, b.d_K, b.d_V, 0, sq, nkv, hd, ms, 0);
             blackwell::kernels::attention_decode_gqa(
@@ -353,12 +355,13 @@ int main(int argc, char** argv) {
         blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, graph_stream);
         blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, graph_stream);
 
-        blackwell::kernels::gemv_int8_warp(b.d_Q, b.d_x_int8, b.d_x_int8_s,
-            lw[l].q.d, lw[l].q.sc, H, Q, graph_stream);
-        blackwell::kernels::gemv_int8_warp(b.d_K, b.d_x_int8, b.d_x_int8_s,
-            lw[l].k.d, lw[l].k.sc, H, KV, graph_stream);
-        blackwell::kernels::gemv_int8_warp(b.d_V, b.d_x_int8, b.d_x_int8_s,
-            lw[l].v.d, lw[l].v.sc, H, KV, graph_stream);
+        blackwell::kernels::gemv_int8_qkv(
+            b.d_Q, b.d_K, b.d_V,
+            b.d_x_int8, b.d_x_int8_s,
+            lw[l].q.d, lw[l].q.sc,
+            lw[l].k.d, lw[l].k.sc,
+            lw[l].v.d, lw[l].v.sc,
+            H, Q, KV, graph_stream);
 
         blackwell::kernels::update_kv_cache(
             d_kc+kb, d_vc+kb, b.d_K, b.d_V, 0, sq, nkv, hd, ms, graph_stream);

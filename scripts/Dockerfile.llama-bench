@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake ninja-build curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone latest llama.cpp
+RUN cd /opt && git clone https://github.com/ggml-org/llama.cpp.git --depth 1
+
+# Build with CUDA 12.8 + MMQ, NO cuBLAS force, sm_120
+RUN cd /opt/llama.cpp && \
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=120 \
+        -DGGML_CUDA_FORCE_CUBLAS=OFF \
+        -DGGML_CUDA_FA=ON \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -G Ninja && \
+    cmake --build build --config Release -j$(nproc)
+
+WORKDIR /opt/llama.cpp
+
+# Verify build
+RUN grep FORCE_CUBLAS build/CMakeCache.txt && \
+    grep CUDAToolkit_VERSION build/CMakeCache.txt
+
+ENTRYPOINT ["/bin/bash"]
