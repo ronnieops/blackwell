@@ -1,8 +1,8 @@
 // bench/decode_int8_cgraph.cu — CUDA Graph benchmark for INT8 decode
 //
 // Measures INT8 decode with CUDA Graph capture vs per-kernel launch.
-// Captures all 18 kernels/layer into a single graph to eliminate
-// inter-kernel launch gaps.
+// Captures all 14 fused kernels/layer into a single graph to eliminate
+// inter-kernel launch gaps (was 20 before fusion).
 //
 // Build:
 //   CUDACXX=/usr/local/cuda-12.8/bin/nvcc nvcc -O3 -std=c++17 \

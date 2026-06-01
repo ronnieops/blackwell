@@ -85,8 +85,11 @@ class Handler(BaseHTTPRequestHandler):
         
         cmd = [bin_path, prompt, str(max_tokens), "-t", str(temperature), "-k", str(top_k)]
         
-        # Kill hashcat before generation
-        subprocess.run(["killall", "hashcat"], capture_output=True, timeout=5)
+        # Kill hashcat before generation (harmless if not running or not installed)
+        try:
+            subprocess.run(["killall", "hashcat"], capture_output=True, timeout=5)
+        except FileNotFoundError:
+            pass
         
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=min(120, max_tokens * 5))

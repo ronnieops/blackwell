@@ -29,10 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY bench/text_generate /app/bin/
+COPY tokenizer_data.bin /app/
 COPY weights_int8_bf16 /app/weights_int8_bf16
 COPY server/server.py /app/server.py
-
-RUN pip3 install --no-cache-dir flask gunicorn
 
 EXPOSE 8080
 
