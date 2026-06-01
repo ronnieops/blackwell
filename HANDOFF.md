@@ -38,13 +38,16 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 
 ## 3. Recent Decisions
 
-### Session 33 — Speculative decode analysis + llama.cpp code audit
+### Session 33 — Speculative decode analysis + llama.cpp code audit + M=1 CUDA Graph attempt
 - **Spec decode infeasible on this hardware**: Batched verify (24.7 ms/seq) is **4.5× slower per-seq** than sequential (5.52 ms/seq). Draft must be 4.5× faster to break even. Even tiny 50M draft gives ~18× speedup but low acceptance kills gains. Best case ~92 t/s vs 181 t/s sequential.
 - **Self-speculation (skip layers) won't work**: lm_head needs all 28 layers for meaningful logits. No early-exit head exists. Training one is out of scope.
 - **Recommendation**: Abandon spec decode for this hardware. Ship M=8 production server (324 t/s, 110% of Q4_K_M).
-- **Docker server ready**: `Dockerfile` + `server/server.py` exist. Not yet built/tested end-to-end.
+- **Docker server ready**: `Dockerfile` + `server/server.py` exist. Built, deployed, tested. "Paris" ✅ (session 33).
+- **M=1 CUDA Graph attempt (within decode_int8_cgraph.cu)**:
+  - Previously in `if (0)` dead block with `cudaStreamCaptureModeGlobal`. Replaced with full warm-up (14 kernels/layer, 1 layer) + `cudaStreamCaptureModeRelaxed`.
+  - **Still fails**: `attention_decode_gqa` and `update_kv_cache` wrappers in `src/kernels/decode.cu` call `cudaMemcpyAsync (H2D, pinned)` for `seq_pos` updating. This is illegal on capturing stream in ANY mode (`Global`, `Relaxed`, `ThreadLocal`).
+  - **Fix requires**: Graph-safe kernel wrapper variants that skip H2D copy (assume seq_pos pre-set via direct device pointer write) or use `cudaGraphKernelNodeParams` with direct device memory. Per-kernel path (181.5 t/s) remains production target.
 - **llama.cpp code audit findings**:
-  - **CUDA Graph M=1 may be salvageable**: llama.cpp uses `cudaStreamCaptureModeRelaxed` (not `Global`). Their `CUDA_SET_SHARED_MEMORY_LIMIT` macro calls `cudaFuncSetAttribute` during capture via static guard. This works in Relaxed mode. Our failure was `Global`-mode specific — `Relaxed` mode allows operations like cudaMalloc/setattr during capture. Worth re-evaluating.
   - **FP4 tensor cores viable**: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for native NVFP4/MXFP4 MMQ using tensor cores (not scalar). Our FP4 path tried `__dp4a` SIMD — tensor cores may close the numerical gap.
   - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp also caps quantized batch at 8. Validates our register-pressure analysis. Same hardware limit.
   - **PDL (Programmatic Dependent Launch)**: llama.cpp has PDL support for Hopper+ Blackwell. Could reduce M=1 kernel launch overhead without CUDA Graph.

@@ -316,8 +316,6 @@ int main(int argc, char** argv) {
     cudaMemcpy(b.d_x_int8_s, d_x_int8_s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
     cudaMemcpy(b.d_attn_i8s, d_attn_i8s_init, (Q/16)*4, cudaMemcpyDeviceToDevice);
     cudaMemcpy(b.d_mlp_i8s, d_mlp_i8s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
-    cudaFree(d_x_fp4_init); cudaFree(d_xs_init);
-    cudaFree(d_kc_save); cudaFree(d_vc_save);
 
     // ── CUDA Graph capture ──────────────────────────────────────────────────
     printf("\n=== CUDA Graph ===\n");
@@ -343,80 +341,78 @@ int main(int argc, char** argv) {
     norm_attr.accessPolicyWindow = norm_policy;
     cudaStreamSetAttribute(graph_stream, cudaStreamAttributeAccessPolicyWindow, &norm_attr);
 
-    // Pre-trigger attention_decode_gqa on graph_stream (sets smem config)
-    blackwell::kernels::attention_decode_gqa(
-        b.d_attn, b.d_Q, d_kc, d_vc,
-        sq, nqh, nkv, hd, ms, graph_stream);
-    cudaStreamSynchronize(graph_stream);
+    // Warm-up and re-init: need to ensure cudaMalloc in decode.cu is triggered.
+    // Then do H2D seq_pos copies on graph_stream before capture (so they're
+    // not needed during capture). The kernel wrappers try cudaMemcpyAsync H2D
+    // which is illegal even in Relaxed mode on the capturing stream.
+    printf("  Warm-up (1 layer)... "); fflush(stdout);
 
-    printf("  Capturing %d layers (%d kernels)... ", num_layers, num_layers * 14);
-    fflush(stdout);
-
-    // CUDA Graph disabled: seq_pos is dynamic (not baked into kernel params),
-    // making capture incompatible with custom quantized kernels.
-    // Per-kernel path uses all fused kernels — main benchmark target.
-    printf("SKIPPED (per-kernel fused path used for timing)\n");
-    cudaStreamDestroy(graph_stream);
-    graph_stream = 0;
-    goto skip_graph;
-
-    if (0) {  // Set to 1 to test CUDA Graph (requires all params fixed at capture time)
-    cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal);
-    for (int l = 0; l < num_layers; ++l) {
-        int kb = l * nkv * ms * hd;
-
-        // Attention block
-        // Fused: unpack FP4 → INT8 quant
+    // Step 1: warm-up all 14 kernels on graph_stream (triggers cudaMalloc, cudaFuncSetAttribute)
+    {
+        int k0 = 0 * nkv * ms * hd;
         blackwell::kernels::fused_unpack_fp4_quant(b.d_x_int8, b.d_x_int8_s,
             d_x_fp4, d_xs, b.d_x_int8_s, H);
-
         blackwell::kernels::gemv_int8_qkv(
             b.d_Q, b.d_K, b.d_V,
             b.d_x_int8, b.d_x_int8_s,
-            lw[l].q.d, lw[l].q.sc,
-            lw[l].k.d, lw[l].k.sc,
-            lw[l].v.d, lw[l].v.sc,
+            lw[0].q.d, lw[0].q.sc,
+            lw[0].k.d, lw[0].k.sc,
+            lw[0].v.d, lw[0].v.sc,
             H, Q, KV, graph_stream);
-
         blackwell::kernels::update_kv_cache(
-            d_kc+kb, d_vc+kb, b.d_K, b.d_V, 0, sq, nkv, hd, ms, graph_stream);
+            d_kc+k0, d_vc+k0, b.d_K, b.d_V, 0, sq, nkv, hd, ms, graph_stream);
         blackwell::kernels::attention_decode_gqa(
-            b.d_attn, b.d_Q, d_kc+kb, d_vc+kb,
+            b.d_attn, b.d_Q, d_kc+k0, d_vc+k0,
             sq, nqh, nkv, hd, ms, graph_stream);
-
         blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, graph_stream);
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
-            lw[l].o.d, lw[l].o.sc, Q, H, graph_stream);
-
+            lw[0].o.d, lw[0].o.sc, Q, H, graph_stream);
         blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
             b.d_proj, b.d_res, d_rn, H, 1e-6f, graph_stream);
         blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
-
-        // MLP block
-        // Fused: unpack FP4 → INT8 quant
         blackwell::kernels::fused_unpack_fp4_quant(b.d_x_int8, b.d_x_int8_s,
             d_x_fp4, d_xs, b.d_x_int8_s, H);
-
         blackwell::kernels::gemv_int8_gate_up(
             b.d_gate, b.d_up,
             b.d_x_int8, b.d_x_int8_s,
-            lw[l].g.d, lw[l].g.sc,
-            lw[l].u.d, lw[l].u.sc,
+            lw[0].g.d, lw[0].g.sc,
+            lw[0].u.d, lw[0].u.sc,
             H, I, graph_stream);
-        // Fused: SwiGLU + INT8 quant
         blackwell::kernels::fused_swiglu_quant(b.d_mlp_i8, b.d_mlp_i8s, b.d_gate, b.d_up, I);
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
-            lw[l].d.d, lw[l].d.sc, I, H, graph_stream);
-
+            lw[0].d.d, lw[0].d.sc, I, H, graph_stream);
         blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
             b.d_proj, b.d_res, d_rn, H, 1e-6f, graph_stream);
         blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
     }
-    }  // end if(0) capture
+    cudaStreamSynchronize(graph_stream);
+    cerr = cudaPeekAtLastError();
+    if (cerr != cudaSuccess) { printf("FAIL warm-up: %s\n", cudaGetErrorString(cerr)); cudaGetLastError(); goto skip_graph; }
+
+    // Step 2: reset state for clean capture
+    cudaMemset(d_kc, 0, kv_sz); cudaMemset(d_vc, 0, kv_sz);
+    cudaMemcpy(d_x_fp4, d_x_fp4_init, H, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_xs, d_xs_init, (H/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(b.d_x_int8_s, d_x_int8_s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(b.d_attn_i8s, d_attn_i8s_init, (Q/16)*4, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(b.d_mlp_i8s, d_mlp_i8s_init, (I/16)*4, cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();
+
+    printf("  Warm-up OK. Capturing %d layers (%d kernels)...\n", num_layers, num_layers * 14);
+
+    // The kernel wrappers (attention_decode_gqa, update_kv_cache) call
+    // cudaMemcpyAsync H2D for seq_pos — illegal on capturing stream in any mode.
+    // Must pre-set h_seq_pos_pinned before capture and use stream 0 copies.
+    // Use default stream for H2D copy, then cudaMemcpyAsync D2D on graph_stream.
+    // Alternative: use cudaLaunchCooperativeKernel or modify wrappers.
+    // For now, skip capture and use per-kernel path.
+    printf("  SKIP: cudaMemcpyAsync H2D inside kernel wrappers blocks capture\n");
+    printf("  (attention_decode_gqa, update_kv_cache use pinned H2D for seq_pos)\n");
+    goto skip_graph;
 
 skip_graph:
-    // CUDA Graph disabled (fused kernels not capture-safe with dynamic seq_pos).
-    // Per-kernel fused path used for all timing. graph_pt = baseline_pt.
+    cudaFree(d_x_fp4_init); cudaFree(d_xs_init);
+    cudaFree(d_kc_save); cudaFree(d_vc_save);
 
     // ── Correctness check ────────────────────────────────────────────────
     std::vector<float> graph_out(H);
