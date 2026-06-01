@@ -75,7 +75,6 @@ set(KERNEL_SOURCES
     src/kernels/gemv_int8_qkv.cu
     src/kernels/gemv_int8_gate_up.cu
     src/kernels/fused_residual_norm.cu
-    src/kernels/fused_attention_block.cu
     src/kernels/fused_unpack_quant.cu
     src/kernels/fused_swiglu_quant.cu
     src/kernels/persistent_attn_block.cu
