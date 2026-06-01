@@ -1162,53 +1162,28 @@ cudaError_t gemv_int8_batched(
     int             M,
     cudaStream_t    stream)
 {
-    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 8)
+    if (K % 16 != 0 || N % 16 != 0 || M < 1)
         return cudaErrorInvalidValue;
 
     int nb = (N + kINT8Block - 1) / kINT8Block;
-    dim3 grid(nb, M);
 
-    switch (M) {
-        case 1:
-            gemv_int8_batched_kernel<1><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 2:
-            gemv_int8_batched_kernel<2><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 3:
-            gemv_int8_batched_kernel<3><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 4:
-            gemv_int8_batched_kernel<4><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 5:
-            gemv_int8_batched_kernel<5><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 6:
-            gemv_int8_batched_kernel<6><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 7:
-            gemv_int8_batched_kernel<7><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
-        case 8:
-            gemv_int8_batched_kernel<8><<<grid, kINT8Block, 0, stream>>>(
-                y_out, static_cast<const int8_t*>(x_int8), x_scale,
-                static_cast<const int8_t*>(W_t_int8), W_t_scale, K, N);
-            break;
+    // For M>8, launch multiple kernels (each handles up to 8 sequences)
+    for (int base = 0; base < M; base += 8) {
+        int m = min(M - base, 8);
+        dim3 grid(nb, m);
+        size_t x_off = (size_t)base * K;
+        size_t y_off = (size_t)base * N;
+        const float* xs = x_scale + (size_t)base * (K / 16);
+        switch (m) {
+            case 1: gemv_int8_batched_kernel<1><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 2: gemv_int8_batched_kernel<2><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 3: gemv_int8_batched_kernel<3><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 4: gemv_int8_batched_kernel<4><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 5: gemv_int8_batched_kernel<5><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 6: gemv_int8_batched_kernel<6><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 7: gemv_int8_batched_kernel<7><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+            case 8: gemv_int8_batched_kernel<8><<<grid, kINT8Block, 0, stream>>>(y_out + y_off, (const int8_t*)(x_int8) + x_off, xs, (const int8_t*)(W_t_int8), W_t_scale, K, N); break;
+        }
     }
     return cudaPeekAtLastError();
 }

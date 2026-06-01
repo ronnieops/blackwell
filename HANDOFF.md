@@ -6,11 +6,10 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-INT8 inference engine for RTX 5060 Ti. Production-ready. **145 symbols**.
-- Qwen3-1.7B: 324.1 t/s batched M=8 (**111%** of Q4_K_M FA=on 292.9)
-- Qwen3-1.7B: 184.3 t/s M=1 (63% of Q4_K_M)
-- Qwen3.5-9B: 45.6 t/s (64% of Q4_K_M 71.4) — INT8 weight-bound, no fix possible
-- Bottleneck: INT8 reads 2× more data than Q4_K_M. INT4/FP4 dead end on GB206.
+INT8 inference engine for RTX 5060 Ti. Production-ready.
+- **M=8 batched: 324 t/s (110% of Q4_K_M)** — competitive path
+- M=1 decode: 181 t/s (62% of Q4_K_M) — bandwidth-limited
+- Bottleneck: INT8 reads 2× more data than Q4_K_M
 
 ---
 
@@ -19,39 +18,43 @@ INT8 inference engine for RTX 5060 Ti. Production-ready. **145 symbols**.
 | Metric | Value |
 |--------|-------|
 | GPU | RTX 5060 Ti, GB206, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
-| CUDA | 13.3.33, driver 580.159.04 |
-| Library | **145 symbols** `build/libblackwell_kernels.a` |
-| Branch | master @ `205de44` |
-| Session | **29** |
+| CUDA | 13.3, C++17, CMake |
+| Library | **157 symbols** `build/libblackwell_kernels.a` |
+| Branch | master @ `7b73034` |
+| Session | **32** |
 
 ### Benchmark Results
 
-| Model | Config | Blackwell INT8 | llama.cpp Q4_K_M | Ratio |
-|-------|--------|----------------|-------------------|-------|
-| Qwen3-1.7B | Batched attn M=8 | **324.1 t/s** | 292.9 t/s | **111%** ✅ |
-| Qwen3-1.7B | CUDA Graph M=1 | 184.3 t/s | 292.9 t/s | 63% |
-| Qwen3-0.6B | CUDA Graph | 444.1 t/s | — | — |
-| Qwen3-8B | CUDA Graph 28L | 57.3 t/s | 82.5 t/s | 69% |
-| Qwen3.5-9B | Decode | 45.6 t/s | 71.4 t/s | 64% |
-| GEMM prefill | M=128 | **13.0 TFLOPS** | 4.3 TFLOPS old | 3× ✅ |
+| Config | Total t/s | Per-seq | vs Q4_K_M | VRAM |
+|--------|-----------|---------|-----------|------|
+| M=1 decode | 181 | 181 | 62% | 5 GB |
+| **M=8 CUDA Graph** | **324** | **40.5** | **110%** | **5 GB** |
+| M=16 batched MLP | 335 | 20.9 | 114% | 9 GB |
+| llama.cpp Q4_K_M | 293 | 293 | 100% | 5 GB |
+| llama.cpp F16 | 114 | 114 | 39% | 5 GB |
 
 ---
 
 ## 3. Recent Decisions
 
-### Session 28 — Qwen3.5-9B + GPU Sampling
-- **GatedDeltaNet kernels**: `gated_delta_net.cu` — conv1d_update, recurrent_step, rmsnorm_gated
-- **Qwen3.5-9B decode**: 32 layers (24 linear_attn + 8 full_attn), 45.7 t/s
-- **Weight quantization**: `scripts/quantize_qwen35.py` — 11GB INT8 weights
-- **head_dim=256 attention**: `attention_decode_kernel_v4` — chunked dot product for 256-dim heads
-- **GPU sampling**: `sample_gpu.cu` — softmax + top-k + cuRAND, no host fallback
-- **CUDA Graph**: Attempted, slower (480+ kernels, graph overhead). Removed.
-- **INT4 mixed precision**: Tested, 0.36× slower (35 inst/byte unpack overhead). Dead end.
-- **rmsnorm_gated deadlock bug**: `__shfl_xor_sync` inside `if (tid < 8)` — fixed
-- **head_norm deadlock bug**: Same pattern — fixed in clean rewrite
+### Session 32 — M=8 optimization + M>8 discovery
+- **`gemv_int8_batched` M>8 bug**: Switch statement only had cases 1-8. M>8 silently returned zero (no kernel launch). All M=16+ measurements before fix were WRONG — MLP GEMVs weren't running.
+- **Fixed**: `gemv_int8_batched` now loops over groups of 8. Supports any M.
+- **M=16 NOT optimal**: Batched GEMV register pressure for M>8. Each block processes M sequences → 16× activation registers → occupancy drops. Real M=16: 335 t/s (barely better than M=8's 324).
+- **M=8 is practical limit**: Serial `gemv_int8_warp` faster than batched for M>8. CUDA Graph with serial MLP has too many nodes (7000+) → overhead exceeds benefit.
+- **`gemv_int8_batched` vs `gemv_int8_warp`**: Isolated test shows serial is 1.5-2.7× faster for all GEMV sizes. But in CUDA Graph context, batched is faster (fewer graph nodes).
+- **L2 persisting harmful for large weights**: Pinning 12.6 MB gate weights → 28% regression.
+- **Fused pack+GEMV kernels**: `fused_pack_gemv_o`, `fused_swiglu_gemv` — correct but 20% slower. Archived, not used.
+- **CUDA Graph M=1 abandoned**: `cudaFuncSetAttribute` in `attention_decode_gqa` incompatible with capture.
+- **Report**: `REPORT.md` created with full findings.
 
-### Session 27
-- GPU argmax working, WMMA dequant confirmed correct, Docker/API done
+### Session 31 — Fused kernel exploration
+- `fused_pack_gemv_o` + `fused_swiglu_gemv` — numerically correct, 20% slower
+- Root cause: two-phase kernels (quant→sync→GEMV) add overhead exceeding launch savings
+
+### Session 30 — CUDA Graph M=1 attempts
+- `attention_decode_gqa` wrapper: `cudaFuncSetAttribute` + H2D pinned memcpy poison capture
+- Abandoned — per-kernel path is production target for M=1
 
 ---
 
@@ -60,32 +63,30 @@ INT8 inference engine for RTX 5060 Ti. Production-ready. **145 symbols**.
 - `export PATH=/usr/local/cuda-13.3/bin:$PATH` before nvcc
 - `compute_120a` required (not `compute_120`)
 - `gemv_int8_warp` production GEMV — NOT `gemv_int8`
-- `gemm_int8_wmma_fast` production GEMM — NOT `gemm_int8_dp4a`
-- hashcat auto-restarts. `killall hashcat` before measurement.
-- INT8 weight-bound: ~7.9 GB/token for Qwen3.5-9B. Cannot match Q4_K_M (5 GB).
-- INT4/FP4 dead end on GB206 — 0.36× slower than INT8
+- `gemv_int8_batched` supports M>8 now (loop over groups of 8)
+- hashcat auto-restarts. `killall hashcat` before every measurement.
+- INT8 reads 2× data vs Q4_K_M — fundamental bandwidth limit for M=1
 
 ---
 
 ## 5. Known Issues / Risks
 
 1. **hashcat**: Auto-restarts, -45% throughput. `killall hashcat` before every measure.
-2. **INT8 vs Q4_K_M gap**: Hardware limitation. INT8 reads 2× more data. No fix without sub-byte quant (dead end on GB206).
-3. **text_generate repetition**: Greedy decode repeats. Use `-t 0.8 -k 40`.
-4. **decode_int8_cgraph mismatch**: Pre-existing (warmup stream inconsistency). 182 t/s works fine.
-5. **CUDA Graph not beneficial**: 480+ kernels per step, graph overhead exceeds launch savings.
+2. **INT8 vs Q4_K_M gap (M=1)**: Hardware limitation. INT8 reads 2× more data. No fix without sub-byte quant.
+3. **M=16+ not beneficial**: Batched GEMV register pressure. M=8 is practical limit.
+4. **CUDA Graph capture**: `attention_decode_gqa` incompatible with capture (cudaFuncSetAttribute).
+5. **Fused pack+GEMV slower**: Two-phase kernel overhead > launch savings. Not used.
 
 ---
 
 ## 6. Pending Tasks
 
-| Priority | Task | Status | Notes |
-|----------|------|--------|-------|
-| ~~All~~ | ~~Qwen3.5-9B Mamba hybrid~~ | ✅ Done | 45.7 t/s, 64% of llama.cpp |
-| ~~All~~ | ~~GPU softmax + top-k~~ | ✅ Done | sample_gpu.cu, all paths working |
-| ~~All~~ | ~~Embed scale fix~~ | ✅ Done | Verified correct |
-| — | Optimize linear attention kernels | Future | Current 45.7 t/s is weight-bound |
-| — | text_generate for Qwen3.5-9B | Future | Needs tokenizer integration |
+| Task | Status | Notes |
+|------|--------|-------|
+| Deploy production server | TODO | Docker/API packaging done |
+| Speculative decoding | TODO | +30-50% M=8, needs draft model |
+| Real Q4 quantization (GPTQ/AWQ) | TODO | +80-100% M=1, needs quantize pipeline |
+| text_generate for Qwen3.5-9B | TODO | Needs tokenizer integration |
 
 ---
 
@@ -93,29 +94,13 @@ INT8 inference engine for RTX 5060 Ti. Production-ready. **145 symbols**.
 
 | Priority | Task | Rationale |
 |----------|------|-----------|
-| — | Optimize linear attention | Marginal gains — weight-bound |
-| — | text_generate Qwen3.5-9B | End-to-end generation for new model |
+| High | Deploy production server | 324 t/s beats Q4_K_M by 10%. Ship it. |
+| Medium | Speculative decoding | Only path for meaningful M=8 boost |
+| Low | Real Q4 quantization | Closes M=1 gap but complex |
 
 ---
 
 ## 8. Important Files / Commands
-
-### Qwen3.5-9B
-```bash
-# Quantize weights
-python3 scripts/quantize_qwen35.py /mnt/data/ai/hf/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a weights_int8_qwen35_9b
-
-# Decode benchmark
-./bench/decode_qwen35_9b weights_int8_qwen35_9b 20
-```
-
-### Qwen3-1.7B
-```bash
-# Decode throughput
-./bench/decode_int8_batched_cgraph_attn 28 8   # 326.8 t/s (M=8)
-./bench/decode_int8_cgraph 28                   # 182.8 t/s (M=1)
-./bench/text_generate "The capital of France is" 15 -t 0.001  # "Paris" correct
-```
 
 ### Build
 ```bash
@@ -124,26 +109,29 @@ killall hashcat 2>/dev/null
 CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 ```
 
+### Benchmark
+```bash
+./bench/decode_int8_batched_cgraph_attn 28 8    # M=8: 324 t/s (optimal)
+./bench/decode_int8_cgraph 28                   # M=1: 181 t/s
+./bench/text_generate "The capital of France is" 30
+```
+
 ### Verify
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 141
-./bench/verify_gemm 128    # 7/7 PASS
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 157
 ```
 
 ---
 
 ## 9. Validation
 
-| Check | Status | Notes |
-|-------|--------|-------|
-| Library | ✅ 145 symbols | +4 from fused Q/K/V + gate/up kernels |
-| INT8 batched attn M=8 | ✅ 324.1 t/s | 111% of Q4_K_M FA=on (292.9) |
-| INT8 M=1 decode | ✅ 184.3 t/s | 63% of Q4_K_M (was 180.9, +1.9%) |
-| GEMM prefill | ✅ 13.0 TFLOPS | 3× vs old |
-| text_generate | ✅ 126 t/s | "Paris" correct, GPU sampling |
-| GEMM verify_gemm | ✅ 7/7 PASS | All layer-0 weights |
-| Qwen3.5-9B decode | ✅ 45.6 t/s | 64% of Q4_K_M (weight-bound) |
-| Qwen3.5-9B quantization | ✅ 11GB | 250 INT8 + 105 raw params |
+| Check | Status |
+|-------|--------|
+| Library | ✅ 157 symbols |
+| M=8 CUDA Graph | ✅ 324 t/s (110% of Q4_K_M) |
+| M=1 fused | ✅ 181 t/s (62% of Q4_K_M) |
+| gemv_int8_batched M>8 | ✅ Fixed (loop over groups of 8) |
+| Correctness | ✅ Max diff 0.000000 vs serial baseline |
 
 ---
 
@@ -153,25 +141,24 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-01 |
 | branch | master |
-| last_commit | `205de44` feat: fused gate+up GEMV kernel |
-| repo_state | 145 symbols. Fused Q/K/V + gate/up kernels. M=1: 184.3 t/s. M=8: 324.1 t/s. |
-| sessions_completed | 29 |
+| last_commit | `7b73034` build: remove fused_attention_block.cu |
+| repo_state | 157 symbols. gemv_int8_batched M>8 fixed. M=8: 324 t/s. Report written. |
+| uncommitted | `gemv_int8.cu` (M>8 fix), `kernels.h` (new declarations), `CMakeLists.txt` (new sources), `AGENTS.md`, `REPORT.md`, `fused_pack_gemv.cu`, `fused_swiglu_gemv.cu` |
 
 ---
 
 ## META PROMPT
 
-**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 145) → `./bench/text_generate "The capital of France is" 15 -t 0.001` (expect "Paris").
+**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 157) → `./bench/decode_int8_batched_cgraph_attn 28 8` (expect ~324 t/s).
 
-**Verified state**: 145 symbols. 324.1 t/s batched attn (M=8), 111% of Q4_K_M FA=on (292.9). M=1: 184.3 t/s (63% of Q4_K_M). GEMM prefill 13.0 TFLOPS. Qwen3.5-9B: 45.6 t/s (64% of llama.cpp). GPU sampling. GatedDeltaNet kernels. Fused Q/K/V + gate/up kernels.
+**Verified state**: 157 symbols. M=8 CUDA Graph: 324 t/s (110% of Q4_K_M). M=1: 181 t/s (62%). `gemv_int8_batched` supports M>8 (fixed session 32). M=16 NOT optimal (register pressure). M=8 is practical limit. Fused pack+GEMV kernels archived (correct but slower). CUDA Graph M=1 abandoned.
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
 - Use `gemv_int8` in production (use `gemv_int8_warp`)
-- Use `gemm_int8_dp4a` for M≥16 (use `gemm_int8_wmma_fast`)
 - Benchmark without `killall hashcat`
-- Attempt INT4/FP4 quantization (dead end on GB206 — 0.36× slower)
-- Run test scripts that overwrite `weights_int8_*/` files in-place (use temp dirs)
-- Trust the "simplified dequant" note in AGENTS.md — `gemm_int8_wmma_fast` is correct
+- Expect M>8 to help (batched GEMV register pressure)
+- Use fused pack+GEMV kernels (20% slower, archived)
+- Attempt CUDA Graph M=1 (attention_decode_gqa incompatible)
 
 **Update discipline**: Update HANDOFF.md only when materially new state. Keep deduplicated with AGENTS.md. Prefer bullets over prose.

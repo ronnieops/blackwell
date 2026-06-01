@@ -955,6 +955,31 @@ cudaError_t persistent_qkv_gemv(
     int num_layers,
     cudaStream_t stream = 0);
 
+// Fused: pack_int8 + gemv_int8_warp output projection
+// Replaces: pack_int8 → gemv_int8_warp (2 kernels → 1 kernel)
+cudaError_t fused_pack_gemv_o(
+    float* y_out,
+    int8_t* temp_i8,
+    float* temp_scale,
+    const float* x_fp32,
+    const void* W_t_int8,
+    const float* W_t_scale,
+    int K, int N,
+    cudaStream_t stream = 0);
+
+// Fused: SwiGLU activation + gemv_int8_warp down projection
+// Replaces: fused_swiglu_quant → gemv_int8_warp (2 kernels → 1 kernel)
+cudaError_t fused_swiglu_gemv(
+    float* y_out,
+    int8_t* temp_i8,
+    float* temp_scale,
+    const float* gate,
+    const float* up,
+    const void* W_t_int8,
+    const float* W_t_scale,
+    int K, int N,
+    cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

@@ -77,6 +77,8 @@ set(KERNEL_SOURCES
     src/kernels/fused_residual_norm.cu
     src/kernels/fused_unpack_quant.cu
     src/kernels/fused_swiglu_quant.cu
+    src/kernels/fused_pack_gemv.cu
+    src/kernels/fused_swiglu_gemv.cu
     src/kernels/persistent_attn_block.cu
 )
 
