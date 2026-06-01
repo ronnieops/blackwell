@@ -38,11 +38,16 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 
 ## 3. Recent Decisions
 
-### Session 33 — Speculative decode analysis (abandoned)
+### Session 33 — Speculative decode analysis + llama.cpp code audit
 - **Spec decode infeasible on this hardware**: Batched verify (24.7 ms/seq) is **4.5× slower per-seq** than sequential (5.52 ms/seq). Draft must be 4.5× faster to break even. Even tiny 50M draft gives ~18× speedup but low acceptance kills gains. Best case ~92 t/s vs 181 t/s sequential.
 - **Self-speculation (skip layers) won't work**: lm_head needs all 28 layers for meaningful logits. No early-exit head exists. Training one is out of scope.
 - **Recommendation**: Abandon spec decode for this hardware. Ship M=8 production server (324 t/s, 110% of Q4_K_M).
 - **Docker server ready**: `Dockerfile` + `server/server.py` exist. Not yet built/tested end-to-end.
+- **llama.cpp code audit findings**:
+  - **CUDA Graph M=1 may be salvageable**: llama.cpp uses `cudaStreamCaptureModeRelaxed` (not `Global`). Their `CUDA_SET_SHARED_MEMORY_LIMIT` macro calls `cudaFuncSetAttribute` during capture via static guard. This works in Relaxed mode. Our failure was `Global`-mode specific — `Relaxed` mode allows operations like cudaMalloc/setattr during capture. Worth re-evaluating.
+  - **FP4 tensor cores viable**: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for native NVFP4/MXFP4 MMQ using tensor cores (not scalar). Our FP4 path tried `__dp4a` SIMD — tensor cores may close the numerical gap.
+  - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp also caps quantized batch at 8. Validates our register-pressure analysis. Same hardware limit.
+  - **PDL (Programmatic Dependent Launch)**: llama.cpp has PDL support for Hopper+ Blackwell. Could reduce M=1 kernel launch overhead without CUDA Graph.
 
 ### Session 32 — M=8 optimization + M>8 discovery
 - **`gemv_int8_batched` M>8 bug**: Switch statement only had cases 1-8. M>8 silently returned zero (no kernel launch). All M=16+ measurements before fix were WRONG — MLP GEMVs weren't running.
@@ -178,7 +183,10 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 - Benchmark without `killall hashcat`
 - Expect M>8 to help (batched GEMV register pressure)
 - Use fused pack+GEMV kernels (20% slower, archived)
-- Attempt CUDA Graph M=1 (attention_decode_gqa incompatible)
 - Pursue speculative decoding (batched verify 4.5× slower per-seq than sequential. Infeasible.)
+
+**Revisitable**:
+- CUDA Graph M=1: Try `cudaStreamCaptureModeRelaxed` instead of `Global`. llama.cpp uses Relaxed and calls `cudaFuncSetAttribute` during capture successfully. May unblock M=1 CUDA Graph (session 33 finding).
+- FP4 tensor core GEMV: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for native NVFP4/MXFP4 MMQ on tensor cores. Our FP4 path tried scalar `__dp4a` — tensor core path may be viable. Re-evaluate with `nvcuda::wmma::mma` for FP4.
 
 **Update discipline**: Update HANDOFF.md only when materially new state. Keep deduplicated with AGENTS.md. Prefer bullets over prose.
