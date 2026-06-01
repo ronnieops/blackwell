@@ -7,7 +7,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, SM_1
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**274.4 t/s**, re-measured 2026-05-31, CUDA 13.2).
-INT8 batched attn + CUDA Graph (M=8): **327.1 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **123 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **327.1 t/s** (119% of Q4_K_M). **+65% vs llama.cpp F16** (111.5 t/s). **125 library symbols**.
 
 ---
 
@@ -16,7 +16,7 @@ INT8 batched attn + CUDA Graph (M=8): **327.1 t/s** (119% of Q4_K_M). **+65% vs 
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 123 symbols in `build/libblackwell_kernels.a`
+**Library**: 125 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -196,7 +196,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 103)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 125)
 
 ---
 
