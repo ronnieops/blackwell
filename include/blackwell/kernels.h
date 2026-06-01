@@ -908,6 +908,18 @@ cudaError_t gated_delta_rmsnorm_gated(
     float           eps = 1e-6f,
     cudaStream_t    stream = 0);
 
+// Fused residual add + RMSNorm + INT8 quant
+// Computes residual add + RMSNorm + quantize in single kernel
+// Saves 1 kernel launch per call (2 per layer)
+cudaError_t fused_residual_norm(
+    int8_t* x_out_i8,
+    float* x_out_scale,
+    float* proj,          // Modified in-place: proj += residual
+    const float* residual,
+    const float* norm_w,
+    int N, float eps,
+    cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

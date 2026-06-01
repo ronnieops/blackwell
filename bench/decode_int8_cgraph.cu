@@ -166,9 +166,9 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, 0), "pack_attn");
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            // Fused: vector_add + rmsnorm_quant (2→1 kernel)
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             // Maintain d_x_fp4 for residual next iter
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
 
@@ -184,9 +184,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0), "pack_mlp");
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
@@ -226,9 +225,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, 0), "pack_attn");
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0), "Wo");
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
             // MLP
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
@@ -241,9 +239,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0), "pack_mlp");
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0), "down");
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
@@ -273,9 +270,8 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_attn_i8, b.d_attn, b.d_attn_i8s, Q, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
                 lw[l].o.d, lw[l].o.sc, Q, H, 0);
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
             // MLP
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
@@ -290,9 +286,8 @@ int main(int argc, char** argv) {
             blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
                 lw[l].d.d, lw[l].d.sc, I, H, 0);
-            blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, 0);
-            blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-                b.d_proj, d_rn, H, 1e-6f, 0);
+            blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+                b.d_proj, b.d_res, d_rn, H, 1e-6f, 0);
             blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, 0);
         }
     }
@@ -377,9 +372,8 @@ int main(int argc, char** argv) {
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_attn_i8, b.d_attn_i8s,
             lw[l].o.d, lw[l].o.sc, Q, H, graph_stream);
 
-        blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, graph_stream);
-        blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-            b.d_proj, d_rn, H, 1e-6f, graph_stream);
+        blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+            b.d_proj, b.d_res, d_rn, H, 1e-6f, graph_stream);
         blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
 
         // MLP block
@@ -398,9 +392,8 @@ int main(int argc, char** argv) {
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
             lw[l].d.d, lw[l].d.sc, I, H, graph_stream);
 
-        blackwell::kernels::vector_add_fp32(b.d_proj, b.d_proj, b.d_res, H, graph_stream);
-        blackwell::kernels::fused_rmsnorm_quant_int8(b.d_x_int8, b.d_x_int8_s,
-            b.d_proj, d_rn, H, 1e-6f, graph_stream);
+        blackwell::kernels::fused_residual_norm(b.d_x_int8, b.d_x_int8_s,
+            b.d_proj, b.d_res, d_rn, H, 1e-6f, graph_stream);
         blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
     }
 

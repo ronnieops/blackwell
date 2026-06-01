@@ -74,6 +74,7 @@ set(KERNEL_SOURCES
     src/kernels/gated_delta_net.cu
     src/kernels/gemv_int8_qkv.cu
     src/kernels/gemv_int8_gate_up.cu
+    src/kernels/fused_residual_norm.cu
 )
 
 # ---------------------------------------------------------------------------
