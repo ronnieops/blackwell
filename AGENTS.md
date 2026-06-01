@@ -213,10 +213,10 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 17. **L2 persisting cache harmful for large weights** (session 32) — Pinning 12.6 MB gate weights in L2 persisting cache caused 28% regression. Evicts other cached data (up/down weights, attention data). d_rn (8 KB) persisting is neutral. Removed L2 persisting for MLP weights.
 18. **Speculative decode infeasible** (session 33) — Batched verify (24.7 ms/seq) is **4.5× slower per-seq** than sequential (5.52 ms/seq). Draft must be 4.5× faster to break even. Even tiny 50M draft only yields ~92 t/s. Self-speculation (skip layers) won't work — lm_head needs all 28 layers. No early-exit head exists. Abandoned.
 20. **llama.cpp code audit** (session 33) — Deep analysis of `ggml/src/ggml-cuda/` for opportunities:
-    - **M=1 CUDA Graph may be salvageable**: llama.cpp uses `cudaStreamCaptureModeRelaxed` (not `Global`). Their `CUDA_SET_SHARED_MEMORY_LIMIT` macro calls `cudaFuncSetAttribute` during capture via static guard. Works in Relaxed mode. Our failure was Global-mode specific — Relaxed mode allows operations like `cudaMalloc`/`cudaFuncSetAttribute` during capture. Try switching to `cudaStreamCaptureModeRelaxed`.
-    - **FP4 tensor cores viable**: llama.cpp has `BLACKWELL_MMA_AVAILABLE` for NVFP4/MXFP4 MMQ using tensor cores (not `__dp4a`). Our FP4 path tried scalar `__dp4a` and failed numerically. Tensor core MMQ may close the gap.
-    - **PDL (Programmatic Dependent Launch)**: llama.cpp supports PDL for Hopper+ Blackwell. Eliminates kernel launch overhead without CUDA Graph. Check SM_120a support.
-    - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp caps quantized batch at 8. Validates our M=8 register pressure limit. Same architecture.
+    - **M=1 CUDA Graph blocked by H2D copies**: `attention_decode_gqa`/`update_kv_cache` call `cudaMemcpyAsync (H2D, pinned)` for `seq_pos`. Illegal on capturing stream in ALL modes. Fix requires graph-safe wrappers.
+    - **FP4 tensor cores (BLACKWELL_MMA_AVAILABLE)**: llama.cpp `vec_dot_fp4_fp4_mma` uses `mma_block_scaled_fp4` with 16×8 tiles for MMQ (batched, M≥64). Useless for M=1 GEMV decode. Our `gemm_fp4_block_scaled` already implements FP4 tensor core GEMM for prefill.
+    - **PDL (Programmatic Dependent Launch)**: Hopper+ device-side primitives (`ggml_cuda_pdl_sync`/`ggml_cuda_pdl_lc`). Blackwell supports it but PDL eliminates inter-kernel gaps for dense kernel chains — our M=1 pipeline has 14 kernels/layer (trivial launch overhead, ~3% of total time). Not worth the complexity.
+    - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp caps quantized batch at 8. Validates our M=8 register pressure limit.
     - **All 34 kernel source files** in `ggml/src/ggml-cuda/` — well-organized, template-instance pattern for specialized kernels.
 
 ---

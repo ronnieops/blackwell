@@ -48,9 +48,9 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
   - **Still fails**: `attention_decode_gqa` and `update_kv_cache` wrappers in `src/kernels/decode.cu` call `cudaMemcpyAsync (H2D, pinned)` for `seq_pos` updating. This is illegal on capturing stream in ANY mode (`Global`, `Relaxed`, `ThreadLocal`).
   - **Fix requires**: Graph-safe kernel wrapper variants that skip H2D copy (assume seq_pos pre-set via direct device pointer write) or use `cudaGraphKernelNodeParams` with direct device memory. Per-kernel path (181.5 t/s) remains production target.
 - **llama.cpp code audit findings**:
-  - **FP4 tensor cores viable**: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for native NVFP4/MXFP4 MMQ using tensor cores (not scalar). Our FP4 path tried `__dp4a` SIMD — tensor cores may close the numerical gap.
-  - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp also caps quantized batch at 8. Validates our register-pressure analysis. Same hardware limit.
-  - **PDL (Programmatic Dependent Launch)**: llama.cpp has PDL support for Hopper+ Blackwell. Could reduce M=1 kernel launch overhead without CUDA Graph.
+  - **FP4 tensor cores (dead end for M=1)**: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for NVFP4/MXFP4 MMQ via `vec_dot_fp4_fp4_mma` with `mma_block_scaled_fp4` (16×8 tiles). This is for **batched MMQ only (M≥64)** — useless for M=1 GEMV decode. Our `gemm_fp4_block_scaled` already implements FP4 tensor core GEMM for prefill.
+  - **PDL (dead end)**: Hopper+ device-side primitives (`ggml_cuda_pdl_sync`/`ggml_cuda_pdl_lc`). Blackwell supports it but PDL eliminates inter-kernel launch gaps — our M=1 pipeline has 14 kernels/layer with <3% launch overhead. Not worth complexity.
+  - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp caps quantized batch at 8. Validates our M=8 register-pressure analysis.
 
 ### Session 32 — M=8 optimization + M>8 discovery
 - **`gemv_int8_batched` M>8 bug**: Switch statement only had cases 1-8. M>8 silently returned zero (no kernel launch). All M=16+ measurements before fix were WRONG — MLP GEMVs weren't running.
@@ -189,7 +189,10 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 - Pursue speculative decoding (batched verify 4.5× slower per-seq than sequential. Infeasible.)
 
 **Revisitable**:
-- CUDA Graph M=1: Try `cudaStreamCaptureModeRelaxed` instead of `Global`. llama.cpp uses Relaxed and calls `cudaFuncSetAttribute` during capture successfully. May unblock M=1 CUDA Graph (session 33 finding).
-- FP4 tensor core GEMV: llama.cpp uses `BLACKWELL_MMA_AVAILABLE` for native NVFP4/MXFP4 MMQ on tensor cores. Our FP4 path tried scalar `__dp4a` — tensor core path may be viable. Re-evaluate with `nvcuda::wmma::mma` for FP4.
+- M=1 CUDA Graph: Requires graph-safe wrapper variants of `attention_decode_gqa`/`update_kv_cache` that skip `cudaMemcpyAsync` H2D for `seq_pos`. Pre-set seq_pos via direct device pointer write before capture and use kernel params with device memory. Low priority — per-kernel 181.5 t/s is within 3% of theoretical graph max.
+
+**Dead ends (confirmed by deep analysis)**:
+- FP4 tensor core GEMV for M=1: llama.cpp `BLACKWELL_MMA_AVAILABLE` uses `mma_block_scaled_fp4` for batched MMQ only (M≥64). Useless for M=1 decode.
+- PDL for M=1: Hopper+ feature, ours M=1 pipeline has <3% launch overhead. Not worth complexity.
 
 **Update discipline**: Update HANDOFF.md only when materially new state. Keep deduplicated with AGENTS.md. Prefer bullets over prose.
