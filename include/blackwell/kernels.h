@@ -555,6 +555,20 @@ cudaError_t gemv_int8_qkv(
     int             N_kv,
     cudaStream_t   stream = 0);
 
+// Fused gate+up GEMV — single kernel for both MLP input projections.
+// Reads activation vector once, shared across gate/up.
+// gate_out: [N], up_out: [N]
+cudaError_t gemv_int8_gate_up(
+    float*          gate_out,
+    float*          up_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_gate, const float* W_gate_sc,
+    const void*     W_up, const float* W_up_sc,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // Packed FP4 warp GEMV — 2 E2M1 values per byte, 2× less bandwidth than INT8.
 // Packed FP4 activations × packed FP4 weights, per-row scales.
 // x_packed: [K/2] bytes, x_scale: [K/16] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32

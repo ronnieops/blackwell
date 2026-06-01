@@ -73,6 +73,7 @@ set(KERNEL_SOURCES
     src/kernels/sample_gpu.cu
     src/kernels/gated_delta_net.cu
     src/kernels/gemv_int8_qkv.cu
+    src/kernels/gemv_int8_gate_up.cu
 )
 
 # ---------------------------------------------------------------------------

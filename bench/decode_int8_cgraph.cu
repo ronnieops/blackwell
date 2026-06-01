@@ -174,10 +174,12 @@ int main(int argc, char** argv) {
 
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
-            chk(blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
-                lw[l].g.d, lw[l].g.sc, H, I, 0), "gate");
-            chk(blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
-                lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
+            chk(blackwell::kernels::gemv_int8_gate_up(
+                b.d_gate, b.d_up,
+                b.d_x_int8, b.d_x_int8_s,
+                lw[l].g.d, lw[l].g.sc,
+                lw[l].u.d, lw[l].u.sc,
+                H, I, 0), "gate_up");
             chk(blackwell::kernels::apply_swiglu(b.d_mlp, b.d_gate, b.d_up, I, 0), "swiglu");
             chk(blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0), "pack_mlp");
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
@@ -278,10 +280,12 @@ int main(int argc, char** argv) {
             // MLP
             blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, 0);
             blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, 0);
-            blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
-                lw[l].g.d, lw[l].g.sc, H, I, 0);
-            blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
-                lw[l].u.d, lw[l].u.sc, H, I, 0);
+            blackwell::kernels::gemv_int8_gate_up(
+                b.d_gate, b.d_up,
+                b.d_x_int8, b.d_x_int8_s,
+                lw[l].g.d, lw[l].g.sc,
+                lw[l].u.d, lw[l].u.sc,
+                H, I, 0);
             blackwell::kernels::apply_swiglu(b.d_mlp, b.d_gate, b.d_up, I, 0);
             blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, 0);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
@@ -382,10 +386,12 @@ int main(int argc, char** argv) {
         blackwell::kernels::unpack_fp4(b.d_res, d_x_fp4, d_xs, H, graph_stream);
         blackwell::kernels::pack_int8(b.d_x_int8, b.d_res, b.d_x_int8_s, H, graph_stream);
 
-        blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
-            lw[l].g.d, lw[l].g.sc, H, I, graph_stream);
-        blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
-            lw[l].u.d, lw[l].u.sc, H, I, graph_stream);
+        blackwell::kernels::gemv_int8_gate_up(
+            b.d_gate, b.d_up,
+            b.d_x_int8, b.d_x_int8_s,
+            lw[l].g.d, lw[l].g.sc,
+            lw[l].u.d, lw[l].u.sc,
+            H, I, graph_stream);
         blackwell::kernels::apply_swiglu(b.d_mlp, b.d_gate, b.d_up, I, graph_stream);
 
         blackwell::kernels::pack_int8(b.d_mlp_i8, b.d_mlp, b.d_mlp_i8s, I, graph_stream);
