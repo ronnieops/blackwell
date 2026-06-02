@@ -540,6 +540,27 @@ cudaError_t update_kv_cache(
     return cudaPeekAtLastError();
 }
 
+// Graph-safe: skip H2D copy, pass device pointer directly (no cudaMemcpy in path)
+cudaError_t update_kv_cache_device(
+    float* k_cache, float* v_cache,
+    const float* k_new, const float* v_new,
+    int batch_idx, const int* d_seq_pos,
+    int num_heads, int head_dim, int max_seq_len, cudaStream_t stream) {
+
+    if (batch_idx != 0) return cudaErrorInvalidValue;
+
+    int total = num_heads * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    update_kv_kernel<<<blocks, threads, 0, stream>>>(
+        k_cache, v_cache,
+        k_new, v_new,
+        d_seq_pos, num_heads, head_dim, max_seq_len);
+
+    return cudaPeekAtLastError();
+}
+
 cudaError_t update_decode_seq_pos(int seq_pos, cudaStream_t stream) {
     cudaError_t e = alloc_seq_pos();
     if (e != cudaSuccess) return e;

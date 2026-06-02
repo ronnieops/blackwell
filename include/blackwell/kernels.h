@@ -267,6 +267,19 @@ cudaError_t update_kv_cache(
     int             max_seq_len,
     cudaStream_t    stream = 0);
 
+// Graph-safe variant: no H2D copy, uses device pointer for seq_pos
+cudaError_t update_kv_cache_device(
+    float*          k_cache,
+    float*          v_cache,
+    const float*    k_new,
+    const float*    v_new,
+    int             batch_idx,
+    const int*      d_seq_pos,   // device pointer (skip H2D copy)
+    int             num_heads,
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
 cudaError_t load_kv_cache_qkgv(
     float*          Q,
     float*          K_val,
