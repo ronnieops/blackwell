@@ -6,10 +6,10 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-**Q4 quantization (INT4) — session 35 active**.
-- INT4 decode: **230.6 t/s** (79% of Q4_K_M), **128% of INT8** (181.5 t/s).
-- Target: ~250-290 t/s (85-99% of Q4_K_M). Gap: scalar unpack (no __dp4a) + simplified pipeline (no residuals).
-- Next: fused quant+GEMV, residual path, fused swiglu.
+**Q4 quantization (INT4) — session 36 active**.
+- INT4 decode: **238.7 t/s** (81% of Q4_K_M), **131% of INT8** (181.5 t/s).
+- Target: ~250-290 t/s (85-99% of Q4_K_M). Gap: scalar unpack (no __dp4a) + residuals via fused_residual_norm_int4.
+- Next: fused QKV+quant, batched INT4 GEMV.
 
 ---
 
@@ -28,7 +28,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 | Config | Total t/s | Per-seq | vs Q4_K_M | Notes |
 |--------|-----------|---------|-----------|-------|
 | INT8 M=1 fused (per-kernel) | 181.5 | 181.5 | 62% | 14 kernels/layer |
-| **INT4 M=1** | **231.5** | **231.5** | **79%** | Scalar unpack, 128% of INT8 |
+| **INT4 M=1** | **231.5** | **231.5** | **79%** | Scalar unpack, 131% of INT8 |
 | INT8 M=4 batched-attn + Graph | 308.3 | 77.1 | **105%** | |
 | **INT8 M=8 batched-attn + Graph** | **324.3** | **40.6** | **111%** | Production path |
 | llama.cpp Q4_K_M FA=on | 293.4 | 293.4 | 100% | |
@@ -55,7 +55,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 | `transpose_scales_int4_kernel` | ✅ Built | Scale transpose kernel |
 | `quantize_int4` | ✅ Built | FP32 → packed INT4 (block-16, absmax/7, nibble-pack) |
 | `unpack_int4_fp32` | ✅ Built | packed INT4 → FP32 |
-| `bench/decode_int4_cgraph` | ✅ Built | **230.6 t/s** (79% of Q4_K_M) |
+| `bench/decode_int4_cgraph` | ✅ Built | **238.7 t/s** (81% of Q4_K_M) |
 
 ### Benchmark results
 
@@ -65,7 +65,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 | **INT4 (per-kernel, simplified)** | **231.5** | **128%** | **79%** |
 | llama.cpp Q4_K_M FA=on | 293.4 | — | 100% |
 
-### Why INT4 is 128% of INT8 (not faster than Q4_K_M)
+### Why INT4 is 131% of INT8 (not faster than Q4_K_M)
 
 - **2× less DRAM reads**: 0.5 bytes/val vs 1.0 → bandwidth wins
 - **Scalar unpack**: `int4_byte_to_floats` calls, no `__dp4a` SIMD → compute overhead
@@ -89,7 +89,7 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 ## 4. Recent Decisions
 
 ### Session 34 — INT4 quantization
-- **INT4 230.6 t/s**: 2× bandwidth advantage overcomes scalar unpack overhead. 128% of INT8.
+- **INT4 238.7 t/s**: 2× bandwidth advantage overcomes scalar unpack overhead. 131% of INT8.
 - **gemv_int4_warp**: Uses existing scalar unpack in `gemv_int8.cu`. Not using __dp4a because nibbles need separate dequant before SIMD dot (unlike INT8 where bytes are already signed int8).
 - **Weight conversion**: Vectorized nibble-pack (3.4s for full model). Dropped slow nested loop.
 - **INT4 is not Q4_K_M**: Uses block=16 (same as INT8) vs Q4_K_M's block=256. Uses symmetric scales vs asymmetric. This limits quality and throughput.
@@ -148,7 +148,7 @@ CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 ```bash
 ./bench/decode_int8_cgraph 28                   # INT8: 181.5 t/s
 ./bench/decode_int8_batched_cgraph_attn 28 8    # INT8 M=8: 324.3 t/s (111% of Q4_K_M)
-./bench/decode_int4_cgraph 28                   # INT4: 230.6 t/s (79% of Q4_K_M, 128% of INT8)
+./bench/decode_int4_cgraph 28                   # INT4: 238.7 t/s (81% of Q4_K_M, 131% of INT8)
 ./bench/text_generate "The capital of France is" 30  # Correctness
 ```
 
@@ -171,7 +171,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|--------|
 | Library | ✅ 159 symbols |
 | M=8 CUDA Graph (1.7B) | ✅ 324.3 t/s (111% of Q4_K_M) |
-| INT4 decode (1.7B) | ✅ 230.6 t/s (79% of Q4_K_M, 128% of INT8) |
+| INT4 decode (1.7B) | ✅ 238.7 t/s (81% of Q4_K_M, 131% of INT8) |
 | M=1 INT8 fused (1.7B) | ✅ 181.5 t/s (62% of Q4_K_M) |
 | INT4 weight conversion | ✅ 1.3 GB, 394 files, 3.4s |
 | Correctness | ⏳ Not validated (simplified pipeline) |
@@ -185,7 +185,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 | updated_at | 2026-06-02 |
 | branch | master |
 | last_commit | `1b96f50` docs: update HANDOFF.md with Q4 plan as active objective |
-| repo_state | 159 symbols. INT4: 230.6 t/s (79% of Q4_K_M, 128% of INT8). INT8 M=8: 324.3 t/s (111%). Q4_PLAN.md in progress. |
+| repo_state | 159 symbols. INT4: 238.7 t/s (81% of Q4_K_M, 131% of INT8). INT8 M=8: 324.3 t/s (111%). Q4_PLAN.md in progress. |
 | uncommitted | AGENTS.md, HANDOFF.md (session 34 updates pending) |
 
 ---
@@ -194,7 +194,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 **Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 164) → `./bench/decode_int8_batched_cgraph_attn 28 8` (expect ~324 t/s) → `./bench/decode_int4_cgraph 28` (expect ~232 t/s) → `echo '{"prompts":["The capital of France is"],"max_tokens":10}' | ./server/inference_server` (expect JSON with tokens).
 
-**Verified state**: 159 symbols. INT4: 230.6 t/s (79% of Q4_K_M, 128% of INT8). INT8 M=8: 324.3 t/s (111% of Q4_K_M). M=1 INT8 fused: 181.5 t/s (62%). INT4 weights: 1.3 GB (weights_int4_qwen3_1.7b/). Simplified pipeline (no residuals).
+**Verified state**: 159 symbols. INT4: 238.7 t/s (81% of Q4_K_M, 131% of INT8). INT8 M=8: 324.3 t/s (111% of Q4_K_M). M=1 INT8 fused: 181.5 t/s (62%). INT4 weights: 1.3 GB (weights_int4_qwen3_1.7b/). Simplified pipeline (no residuals).
 
 **DO NOT**:
 - Use `compute_120` (must be `compute_120a`)
