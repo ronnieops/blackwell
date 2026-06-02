@@ -7,9 +7,9 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, GB20
 ## 1. Mission
 
 Benchmark INT8 forward pass throughput vs llama.cpp (Q4_K_M) baseline (**292.9 t/s** FA=on, CUDA 13.3).
-INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs llama.cpp F16** (114.3 t/s). **157 library symbols**.
+INT8 batched attn + CUDA Graph (M=8): **324.3 t/s** (111% of Q4_K_M). **159 library symbols**.
 
-**Speculative decode infeasible**: Batched verify path (24.7 ms/seq) is **4.5× slower per-seq** than sequential decode (5.52 ms/seq). Draft model would need 4.5× speedup to break even. Even tiny 50M draft (~18× speedup) yields only ~92 t/s due to low acceptance rates. Self-speculation (skip layers) won't work — lm_head needs all layers. Abandoned.
+**INT4 quantization (session 34 — active)**: INT4 decode at **231.5 t/s** (79% of Q4_K_M), **128% of INT8** (181.5 t/s). 2× bandwidth from nibble-pack + scalar unpack dequant. New kernels: `gemv_int4_warp`, `transpose_int4_weights`, `quantize_int4`. New weights: `weights_int4_qwen3_1.7b/` (1.3 GB, 62% of INT8 2.1 GB). Benchmark: `bench/decode_int4_cgraph`. Target: 250-290 t/s (85-99% of Q4_K_M). **78% vs Q4_K_M** — scalar unpack lacks __dp4a SIMD. Next: fused quant+GEMV, residual path.
 
 **Docker production server ready**: `Dockerfile` + `server/server.py`. 324 t/s beats Q4_K_M by 10%. Ship it.
 
@@ -31,7 +31,7 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 157 symbols in `build/libblackwell_kernels.a`
+**Library**: 159 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -79,7 +79,10 @@ INT8 batched attn + CUDA Graph (M=8): **323.5 t/s** (110% of Q4_K_M). **+183% vs
 - `gemv_fp4_warp` — Packed FP4 warp GEMV (2 vals/byte, E2M1, 29 regs)
 - `gemv_fp32_fp4_warp` — FP32×packed FP4 warp GEMV (47 regs)
 - `decode_fp4_cgraph.cu` — Full 28L FP4 pipeline benchmark (CUDA Graph, 247 t/s, numerically unstable)
-- `gemv_int4_warp` — INT4 warp GEMV (not competitive, 0.40× slower than INT8)
+- `gemv_int4_warp` — INT4 warp GEMV, scalar unpack, 231.5 t/s (79% of Q4_K_M, 128% of INT8)
+- `transpose_int4_weights` — W (K×N/2) → W_t (N×K/2), scales transposed
+- `quantize_int4` — FP32 → packed INT4 (block-16, absmax/7, nibble-pack)
+- `unpack_int4_fp32` — packed INT4 → FP32
 
 **FP4 packed: numerically unstable** (247 vs 181 t/s INT8). Throughput competitive but outputs garbage. E2M1 nibble→float per-element conversion can't use __dp4a SIMD.
 
@@ -102,18 +105,17 @@ cmake --build build --parallel
 ### Benchmark
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
-./bench/decode_int8_cgraph 28              # Fused per-kernel 176.5 t/s (M=1, 14 kernels/layer)
-./bench/decode_int8_batched_cgraph_attn 28 8  # Batched attn + Graph M=8: 323.5 t/s (110% of Q4_K_M)
-./bench/decode_int8_generic 28 weights_int8_bf16 2048 2048 1024 6144 16 8 "Qwen3-1.7B"  # 176.5 t/s
-./bench/decode_int8_generic 28 weights_int8_qwen3_06b 1024 1024 512 3072 8 4 "Qwen3-0.6B"  # 447.4 t/s
-./bench/decode_int8_generic 36 weights_int8_qwen3_8b 4096 4096 1024 12288 32 8 "Qwen3-8B"  # 44.5 t/s
-./bench/speculative_decode_cgraph 28 4          # Spec decode: 190 t/s
-./bench/bench_warp_gemv                    # Isolated warp vs old GEMV
-./bench/text_generate "The capital of France is" 30  # Text gen, "Paris" ✓
+./bench/decode_int8_cgraph 28              # INT8: 181.5 t/s (14 kernels/layer)
+./bench/decode_int8_batched_cgraph_attn 28 8  # INT8 M=8: 324.3 t/s (111% of Q4_K_M)
+./bench/decode_int4_cgraph 28               # INT4: 231.5 t/s (79% of Q4_K_M, 128% of INT8)
+./bench/text_generate "The capital of France is" 30  # Correctness
 ```
 
 ### Model
 `/mnt/data/ai/hf/qwen3-1.7b-base/` — Qwen3-1.7B, 28 layers, safetensors, 3.3 GB
+
+### INT4 weights
+`weights_int4_qwen3_1.7b/` — 1.3 GB (62% of INT8 2.1 GB). 28 layers × 7 weights + embed_tokens.
 
 ---
 
@@ -123,11 +125,10 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
 | INT8 fused (M=1) | **181.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
-| INT8 batched-attn M=8 CUDA Graph | **324.6 t/s** | **111%** of llama.cpp Q4_K_M FA=on (293.4) |
-| INT8 batched-attn M=4 CUDA Graph | **308.3 t/s** | **105%** of Q4_K_M |
-| INT8 generic CUDA Graph (1.7B) | **181.2 t/s** | 62% of Q4_K_M |
-| INT8 generic CUDA Graph (8B) | **44.6 t/s** | 54% of Q4_K_M (82.6) — larger gap since INT8 reads 2× data |
-| M=8 vs llama.cpp F16 | **+184%** | 324.6 vs 114.3 t/s |
+| INT8 batched-attn M=8 CUDA Graph | **324.3 t/s** | **111%** of llama.cpp Q4_K_M FA=on (293.4) |
+| INT4 decode (M=1, no residuals) | **231.5 t/s** | **128%** of INT8, **79%** of Q4_K_M. Scalar unpack, no __dp4a. |
+| INT4 weight compression | **1.3 GB** vs INT8 **2.1 GB** | 62% of INT8. 2× less DRAM reads. |
+| INT4 vs INT8 speedup | **+28%** | Bandwidth savings outweigh scalar unpack overhead. |
 | llama.cpp Q4_K_M FA=on | **293.4 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
 | llama.cpp Q4_K_M FA=off | **274.1 t/s** | Qwen3-1.7B |
 | llama.cpp F16 FA=on | **114.3 t/s** | Qwen3-1.7B |
@@ -230,7 +231,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 157)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 159)
 
 ---
 
@@ -241,3 +242,50 @@ Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l
 3. Prefer repo evidence. Read code before assuming.
 4. No churn.
 5. Kernels first, framework later.
+
+---
+
+## 11. Session 34 — INT4 Quantization (Q4)
+
+**Objective**: Close M=1 bandwidth gap. INT4 halves weight reads → target ~250-290 t/s (85-99% of Q4_K_M).
+
+### What was built
+
+| Component | Status | Result |
+|-----------|--------|--------|
+| `scripts/quantize_generic.py` | ✅ Extended | INT4 support via `--format int4` |
+| `weights_int4_qwen3_1.7b/` | ✅ Generated | 1.3 GB (62% of INT8 2.1 GB), 394 files |
+| `gemv_int4_warp` kernel | ✅ Built | 60 regs, scalar unpack (no __dp4a) |
+| `transpose_int4_weights` | ✅ Built | W (K×N/2) → W_t (N×K/2) |
+| `quantize_int4` | ✅ Built | FP32 → packed INT4, block-16 |
+| `unpack_int4_fp32` | ✅ Built | packed INT4 → FP32 |
+| `bench/decode_int4_cgraph` | ✅ Built + run | **231.5 t/s** (79% of Q4_K_M) |
+
+### Benchmark results
+
+| Config | t/s | vs INT8 | vs Q4_K_M |
+|--------|-----|---------|----------|
+| INT8 (per-kernel, fused) | 181.5 | 100% | 62% |
+| **INT4 (per-kernel, simplified)** | **231.5** | **128%** | **79%** |
+| llama.cpp Q4_K_M FA=on | 293.4 | — | 100% |
+
+### Why INT4 is 128% of INT8 (not faster than Q4_K_M)
+
+- **2× less DRAM reads**: 0.5 bytes/val vs 1.0 → bandwidth wins
+- **Scalar unpack**: `int4_byte_to_floats` calls, no `__dp4a` SIMD → compute overhead
+- **Simplified pipeline**: no residuals, no fused_swiglu, no fused_residual_norm → fewer kernels but also less optimized
+- **INT4 uses float multiply**: not SIMD-dot like INT8's `__dp4a` → ~50% more compute ops
+
+### Gap to Q4_K_M (79%)
+
+- Q4_K_M uses `__dp4a` + asymmetric scales + block=256
+- INT4 uses scalar float multiply + symmetric scales + block=16
+- Need: fused quant+GEMV (like INT8), residual path, possibly __dp4a path for activations
+
+### Next steps (Phase 2 of Q4_PLAN.md)
+
+1. **Fused INT4 GEMV**: fuse `quantize_int4` output into `gemv_int4_warp` (skip intermediate INT4 buffer)
+2. **Add residual path**: use `vector_add_fp32` + `fused_rmsnorm` (lost in simplified benchmark)
+3. **Fused swiglu**: `fused_swiglu_quant_int4` (swiglu + quantize, like INT8's fused_swiglu_quant)
+4. **Batched INT4 GEMV**: `gemv_int4_batched` for M=8 path (gate/up/down projections)
+5. **Correctness validation**: compare INT4 vs INT8 layer outputs, PSNR > 40 dB

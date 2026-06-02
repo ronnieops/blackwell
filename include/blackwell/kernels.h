@@ -606,6 +606,35 @@ cudaError_t gemv_int4_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Transpose INT4 weights: W (K×N/2) → W_t (N×K/2), scales transposed
+cudaError_t transpose_int4_weights(
+    void*           dst,
+    float*          dst_scale,
+    const void*     src,
+    const float*    src_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// Unpack packed INT4 to FP32 (for non-GEMV usage)
+cudaError_t unpack_int4_fp32(
+    float*          x_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    int             K,
+    cudaStream_t    stream = 0);
+
+// Quantize FP32 → packed INT4 (with per-block scales)
+// x_out_packed: [K/2] bytes (packed INT4), x_out_sc: [K/16] FP32 scales
+// in_fp32: [K] FP32 input
+// Block size = 16. Each 16-element block: absmax scale, quantize to [-7..7], pack.
+cudaError_t quantize_int4(
+    void*           x_out_packed,
+    float*          x_out_sc,
+    const float*    in_fp32,
+    int             K,
+    cudaStream_t    stream = 0);
+
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
 // Fixes quality: per-row scales prevent 16-row quantization error accumulation.

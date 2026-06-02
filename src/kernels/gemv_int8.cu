@@ -1407,5 +1407,146 @@ cudaError_t gemm_int8_dp4a(
         C, A_int8, A_scale, B_int8, B_scale, M, N, K);
     return cudaPeekAtLastError();
 }
+
+// ===========================================================================
+// INT4 support functions (defined alongside INT4 warp GEMV)
+// ===========================================================================
+
+// Transpose INT4 weights: W (K×N/2) → W_t (N×K/2), scales transposed
+__global__ void transpose_int4_kernel(
+    uint8_t* __restrict__ dst,
+    const uint8_t* __restrict__ src,
+    int K, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int packed_elements = K * (N / 2);  // K × N/2 bytes
+    if (idx >= packed_elements) return;
+    int k = idx / (N / 2);
+    int n_byte = idx % (N / 2);
+    dst[n_byte * K + k] = src[k * (N / 2) + n_byte];
+}
+
+__global__ void transpose_scales_int4_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int num_K_blks, int num_N_blks)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_K_blks * num_N_blks;
+    if (idx >= total) return;
+    int kb = idx / num_N_blks;
+    int nb = idx % num_N_blks;
+    dst[nb * num_K_blks + kb] = src[kb * num_N_blks + nb];
+}
+
+cudaError_t transpose_int4_weights(
+    void*           dst,
+    float*          dst_scale,
+    const void*     src,
+    const float*    src_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    int packed_elements = K * (N / 2);
+    int threads = 256;
+    int blocks = (packed_elements + threads - 1) / threads;
+    transpose_int4_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), K, N);
+
+    int num_K_blks = K / 16;
+    int num_N_blks = N / 16;
+    int total_scales = num_K_blks * num_N_blks;
+    blocks = (total_scales + threads - 1) / threads;
+    transpose_scales_int4_kernel<<<blocks, threads, 0, stream>>>(
+        dst_scale, src_scale, num_K_blks, num_N_blks);
+
+    return cudaPeekAtLastError();
+}
+
+// Unpack packed INT4 → FP32
+__global__ void unpack_int4_fp32_kernel(
+    float* __restrict__ x_out,
+    const uint8_t* __restrict__ x_packed,
+    const float* __restrict__ x_scale,
+    int K)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= K) return;
+    int kb = idx / 16;
+    int off = idx % 16;
+    int byte_idx = idx / 2;
+    uint8_t byte = x_packed[byte_idx];
+    uint8_t nibble = (off % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+    int8_t val = static_cast<int8_t>(nibble - 8);  // [0..15] → [-8..7]
+    x_out[idx] = static_cast<float>(val) * x_scale[kb];
+}
+
+cudaError_t unpack_int4_fp32(
+    float*          x_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    int             K,
+    cudaStream_t    stream)
+{
+    int threads = 256;
+    int blocks = (K + threads - 1) / threads;
+    unpack_int4_fp32_kernel<<<blocks, threads, 0, stream>>>(
+        x_out, static_cast<const uint8_t*>(x_packed), x_scale, K);
+    return cudaPeekAtLastError();
+}
+
+// Quantize FP32 → packed INT4 (with per-block scales)
+// x_out_packed: [K/2] bytes, x_out_sc: [K/16] FP32
+// Block size = 16. Per-block: absmax / 7 → quantize [-7..7] → nibble-pack.
+__global__ void quantize_int4_kernel(
+    uint8_t* __restrict__ x_out,
+    float* __restrict__ x_sc,
+    const float* __restrict__ in_fp32,
+    int K)
+{
+    constexpr int B = 16;
+    int kb = blockIdx.x;
+    int num_kb = K / B;
+    if (kb >= num_kb) return;
+
+    int off = kb * B;
+    float absmax = 0.f;
+    for (int i = 0; i < B; ++i) {
+        float v = fabsf(in_fp32[off + i]);
+        if (v > absmax) absmax = v;
+    }
+    float sc = (absmax > 1e-10f) ? (absmax / 7.f) : (1.f / 7.f);
+    x_sc[kb] = sc;
+
+    for (int i = 0; i < B / 2; ++i) {
+        float v0 = in_fp32[off + i * 2];
+        float v1 = in_fp32[off + i * 2 + 1];
+        int q0 = (int)roundf(v0 / sc);
+        int q1 = (int)roundf(v1 / sc);
+        q0 = max(-8, min(7, q0));
+        q1 = max(-8, min(7, q1));
+        uint8_t nib0 = (uint8_t)((q0 + 8) & 0x0F);
+        uint8_t nib1 = (uint8_t)((q1 + 8) & 0x0F);
+        x_out[kb * (B / 2) + i] = nib0 | (nib1 << 4);
+    }
+}
+
+cudaError_t quantize_int4(
+    void*           x_out_packed,
+    float*          x_out_sc,
+    const float*    in_fp32,
+    int             K,
+    cudaStream_t    stream)
+{
+    int num_kb = K / 16;
+    quantize_int4_kernel<<<num_kb, 1, 0, stream>>>(
+        static_cast<uint8_t*>(x_out_packed),
+        x_out_sc,
+        in_fp32,
+        K);
+    return cudaPeekAtLastError();
+}
+
 } // namespace kernels
 } // namespace blackwell
