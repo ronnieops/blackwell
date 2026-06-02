@@ -8,7 +8,7 @@ Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, GB20
 
 INT4 decode throughput vs llama.cpp Q4_K_M baseline (**293.4 t/s** FA=on, CUDA 13.3).
 
-**INT4 batched attention (M=1): 612.8 t/s (209% of Q4_K_M).** Correct residual path with per-layer quantization. Fixes `fused_residual_norm_int4_fp32out` INT4-aliasing-FP32 buffer bug (INT4 output corrupted first 256 FP32 elements = 33% of hidden state). Fixes stale residual bug (d_res from layer 0 reused for layers 1-27). 159 library symbols.
+**INT4 batched attention (M=1): 612.8 total t/s (209% of Q4_K_M).** Correct residual path with per-layer quantization. Fixes `fused_residual_norm_int4_fp32out` INT4-aliasing-FP32 buffer bug (INT4 output corrupted first 256 FP32 elements = 12.5% of hidden state). Fixes stale residual bug (d_res from layer 0 reused for layers 1-27). 177 library symbols.
 
 **INT4 batched attention (M=8): 11285 t/s (3845% of Q4_K_M).** Near-perfect linear scaling: M=1→613, M=2→1882, M=4→4923, M=8→11285.
 
@@ -32,7 +32,7 @@ INT4 decode throughput vs llama.cpp Q4_K_M baseline (**293.4 t/s** FA=on, CUDA 1
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 159 symbols in `build/libblackwell_kernels.a`
+**Library**: 177 symbols in `build/libblackwell_kernels.a`
 
 **WARNING**: `hashcat` runs persistently on this GPU (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `kill all hashcat` before any measurement.
 
@@ -111,9 +111,9 @@ cmake --build build --parallel
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 ./bench/decode_int8_cgraph 28                       # INT8: 181.5 t/s (14 kernels/layer)
-./bench/decode_int8_batched_cgraph_attn 28 8        # INT8 M=8: 324.3 t/s (111% of Q4_K_M)
-./bench/decode_int4_batched_attn 28 1               # INT4: 612.8 t/s (209% of Q4_K_M)
-./bench/decode_int4_batched_attn 28 8               # INT4 M=8: 11285 t/s (3845% of Q4_K_M)
+./bench/decode_int8_batched_cgraph_attn 28 8        # INT8 M=8: 324.3 total t/s (111% of Q4_K_M)
+./bench/decode_int4_batched_attn 28 1               # INT4: 612.8 total t/s (209% of Q4_K_M)
+./bench/decode_int4_batched_attn 28 8               # INT4 M=8: 11285 total t/s (3845% of Q4_K_M)
 ./bench/text_generate "The capital of France is" 30 # Correctness
 ```
 
@@ -127,12 +127,12 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 
 | Finding | Value | Notes |
 |---------|-------|-------|
-| **INT4 batched-attn M=1** | **612.8 t/s** | **209%** of Q4_K_M (293.4). Correct residual + per-layer quant |
-| **INT4 batched-attn M=8** | **11285 t/s** | **3845%** of Q4_K_M. Near-perfect linear scaling |
-| INT4 per-layer time | 0.058 ms | 28 layers = 1.63 ms total |
+| **INT4 batched-attn M=1** | **612.8 total t/s** | **209%** of Q4_K_M (293.4). Correct residual + per-layer quant |
+| **INT4 batched-attn M=8** | **11285 total t/s** | **3845%** of Q4_K_M. Super-linear scaling vs M |
+| INT4 per-layer time | 0.058 ms | 28 layers = 1.63 ms total. 14 kernels/layer |
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
 | INT8 fused (M=1) | **181.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
-| INT8 batched-attn M=8 CUDA Graph | **324.3 t/s** | **111%** of Q4_K_M |
+| INT8 batched-attn M=8 CUDA Graph | **324.3 total t/s** | **111%** of Q4_K_M |
 | INT4 weight compression | **1.3 GB** vs INT8 **2.1 GB** | 62% of INT8 |
 | llama.cpp Q4_K_M FA=on | **293.4 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
 | llama.cpp Q4_K_M FA=off | **274.1 t/s** | Qwen3-1.7B |
@@ -145,33 +145,7 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | CUDA Graph speedup | ~1-6% | Model-size dependent |
 | hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
 | INT4/FP4 sub-byte GEMV | ❌ Not competitive | ~35 inst/byte unpack vs 0.31 inst/byte dp4a |
-
 ---
-
-## 4. Key Findings
-
-| Finding | Value | Notes |
-|---------|-------|-------|
-| Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 fused (M=1) | **181.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
-| INT8 batched-attn M=8 CUDA Graph | **324.3 t/s** | **111%** of llama.cpp Q4_K_M FA=on (293.4) |
-| INT4 decode (M=1, fused residuals) | **238.7 t/s** | **131%** of INT8, **81%** of Q4_K_M. Scalar unpack, no __dp4a, 11 kernels/layer. |
-| INT4 weight compression | **1.3 GB** vs INT8 **2.1 GB** | 62% of INT8. 2× less DRAM reads. |
-| INT4 vs INT8 speedup | **+28%** | Bandwidth savings outweigh scalar unpack overhead. |
-| llama.cpp Q4_K_M FA=on | **293.4 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
-| llama.cpp Q4_K_M FA=off | **274.1 t/s** | Qwen3-1.7B |
-| llama.cpp F16 FA=on | **114.3 t/s** | Qwen3-1.7B |
-| llama.cpp Q4_K_M FA=on (8B) | **82.56 t/s** | Qwen3-8B, build b9442 |
-| llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
-| Qwen3.5-9B INT8 decode | **45.6 t/s** | 64% of Q4_K_M, weight-bound (INT8 reads 2× Q4) |
-| INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
-| GEMM prefill (before fix) | 4.3 TFLOPS | 8.7% utilization |
-| GEMM prefill (after c_frag fix) | **13.0 TFLOPS** | **3× speedup**, 26% utilization |
-| Pipeline SNR | **13.9 dB** | Constant across 28 layers, no compounding |
-| CUDA Graph speedup | ~1-6% | Model-size dependent |
-| Batched attention speedup | **+9.8%** | M=8 vs serial-attn |
-| hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
-| INT4/FP4 sub-byte GEMV | ❌ Not competitive | ~35 inst/byte unpack vs 0.31 inst/byte dp4a |
 
 ---
 
@@ -210,7 +184,7 @@ Stray `}` after head_norm_kernel closing brace. Deleted.
 
 ### INT4 fused_residual_norm_int4_fp32out buffer aliasing (2026-06-02) — FIXED
 `fused_residual_norm_int4_fp32out` wrote INT4 packed output + FP32 normalized output
-to the same buffer (`d_x32`). INT4 output (bytes 0-1023 = 33% of buffer) corrupted the
+to the same buffer (`d_x32`). INT4 output (bytes 0-1023 = 12.5% of buffer) corrupted the
 first 256 FP32 elements used as next layer's input. Fix: INT4 output → `d_x_i4`, FP32 → `d_x32`.
 Affected: `decode_int4_cgraph.cu`, `decode_int4_batched.cu`, `bench/decode_int4_batched_attn.cu`.
 
@@ -274,7 +248,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (CUDA Graph production path), `./bench/text_generate ...` (correctness)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 164)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 177)
 
 ---
 
@@ -323,7 +297,7 @@ Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l
 
 1. **INT4-FP32 buffer aliasing**: `fused_residual_norm_int4_fp32out` wrote both INT4 packed output
 and FP32 normalized output to the same buffer (`d_x32`). INT4 output (bytes 0-1023 = 2048 nibbles)
-corrupted the first 256 float32 elements of the FP32 hidden state (33% of H). 
+corrupted the first 256 float32 elements of the FP32 hidden state (12.5% of H). 
 Fix: separate buffers — INT4 → `d_x_i4`, FP32 → `d_x32`.
 
 2. **Stale residual**: All old benchmarks copied `d_res = d_x32` once at layer 0, then reused
@@ -337,13 +311,18 @@ layer loop.
 
 - Per-layer: 0.058 ms = 58μs
 - 28 layers: 1.63 ms total
-- 13 kernels/layer × 8.5μs launch = 110μs (79%) + 29μs compute (21%)
+- 14 kernels/layer: 7× gemv_int4_batched (Q,K,V,O,gate,up,down), 1× quantize_int4,
+  1× attention_decode_batched_gqa, 1× fused_residual_norm_int4,
+  1× fused_swiglu_quant_int4, 1× fused_residual_norm_int4_fp32out,
+  8 M× update_kv_cache (serial per-seq)
+- Launch overhead ~2/3 of total time at M=1
 
 ### Why INT4 is 209% of Q4_K_M
 
-- **2× less DRAM reads** vs INT8: 0.5 bytes/val packed → 0.625 bytes/val with scales
-- **Batched GEMV** (`gemv_int4_batched`) reduces kernel launch count: 7 serial GEMV calls
-  becomes 6 batched calls + 1 quantize
-- **Batched attention** (`attention_decode_batched_gqa`) processes M sequences in one kernel
-- **Fused kernels** save 2-3 kernel launches each per layer
-- **Correct residual path** with per-layer quantization ensures no data corruption
+- **2× less DRAM reads** vs INT8: 0.5 bytes/val packed + 0.25 bytes/val scales = 0.75 bytes/val total
+  (Q4_K_M: 0.50 bytes/val with super-block 256 and FP16 dual scales = 0.515)
+- **Batched GEMM** (`gemv_int4_batched`) amortizes weight loads across M sequences: 1× DRAM read
+  used for all M tokens
+- **Batched attention** (`attention_decode_batched_gqa`) processes M sequences in one kernel call
+  instead of M serial calls — saves (M-1)×kernel launch overhead
+- **Fused kernels** save 2-3 kernel launches each per layer (residual+norm+quant = 1 kernel vs 3)
