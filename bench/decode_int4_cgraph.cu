@@ -249,9 +249,7 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int4_warp(d_up, d_x_i4, d_x_i4_sc,
                 lw[l].u.d, lw[l].u.sc, H, I), "up");
 
-            chk(blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, 0), "swiglu");
-
-            chk(blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I), "quantize_mlp");
+            chk(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, d_up, I), "fused_swiglu_quant");
 
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc,
                 lw[l].d.d, lw[l].d.sc, I, H), "down");
@@ -293,9 +291,7 @@ int main(int argc, char** argv) {
         chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_attn");
         chk(blackwell::kernels::gemv_int4_warp(d_gate, d_x_i4, d_x_i4_sc, lw[l].g.d, lw[l].g.sc, H, I), "gate");
         chk(blackwell::kernels::gemv_int4_warp(d_up, d_x_i4, d_x_i4_sc, lw[l].u.d, lw[l].u.sc, H, I), "up");
-        chk(blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, 0), "swiglu");
-        // Note: fused_swiglu_quant_int4 writes its own scales — skip scale restoration after this
-        chk(blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I), "quantize_mlp");
+        chk(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, d_up, I), "fused_swiglu_quant");
         chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc, lw[l].d.d, lw[l].d.sc, I, H), "down");
         chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x32, d_x_i4_sc, d_x32, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_mlp");
 
@@ -324,8 +320,7 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_attn");
             chk(blackwell::kernels::gemv_int4_warp(d_gate, d_x_i4, d_x_i4_sc, lw[l].g.d, lw[l].g.sc, H, I), "gate");
             chk(blackwell::kernels::gemv_int4_warp(d_up, d_x_i4, d_x_i4_sc, lw[l].u.d, lw[l].u.sc, H, I), "up");
-            chk(blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, 0), "swiglu");
-            chk(blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I), "quantize_mlp");
+            chk(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, d_up, I), "fused_swiglu_quant");
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc, lw[l].d.d, lw[l].d.sc, I, H), "down");
             chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x32, d_x_i4_sc, d_x32, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_mlp");
             cudaMemcpy(d_x_i4_sc, d_x_i4_sc_init, (H / 16) * 4, cudaMemcpyDeviceToDevice);
