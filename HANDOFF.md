@@ -160,7 +160,7 @@ python3 scripts/quantize_generic.py /mnt/data/ai/hf/qwen3-1.7b-base weights_int4
 
 ### Verify
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 159
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 164
 ```
 
 ---
@@ -192,7 +192,7 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 ## META PROMPT
 
-**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 159) → `./bench/decode_int8_batched_cgraph_attn 28 8` (expect ~324 t/s) → `./bench/decode_int4_cgraph 28` (expect ~232 t/s) → `echo '{"prompts":["The capital of France is"],"max_tokens":10}' | ./server/inference_server` (expect JSON with tokens).
+**Boot sequence**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 164) → `./bench/decode_int8_batched_cgraph_attn 28 8` (expect ~324 t/s) → `./bench/decode_int4_cgraph 28` (expect ~232 t/s) → `echo '{"prompts":["The capital of France is"],"max_tokens":10}' | ./server/inference_server` (expect JSON with tokens).
 
 **Verified state**: 159 symbols. INT4: 231.5 t/s (79% of Q4_K_M, 128% of INT8). INT8 M=8: 324.3 t/s (111% of Q4_K_M). M=1 INT8 fused: 181.5 t/s (62%). INT4 weights: 1.3 GB (weights_int4_qwen3_1.7b/). Simplified pipeline (no residuals).
 
