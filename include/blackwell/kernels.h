@@ -4,6 +4,7 @@
 #define BLACKWELL_KERNELS_H
 
 #include <cuda_runtime.h>
+#include <cstdint>
 
 namespace blackwell {
 namespace kernels {
@@ -606,6 +607,19 @@ cudaError_t gemv_int4_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Fused Q/K/V GEMV with inline INT4 quantization
+// Loads FP32 x once, computes scales, quantizes to INT4 in registers,
+// then does Q/K/V GEMV using shared quantized activation.
+// Saves: 1× INT4 write + 3× INT4 read + sync vs separate quantize+3×GEMV.
+cudaError_t fused_qkv_int4(
+    float* Q_out, float* K_out, float* V_out,
+    const float* x_fp32, float* x_scale_out,
+    const uint8_t* W_q_packed, const float* W_q_scale,
+    const uint8_t* W_k_packed, const float* W_k_scale,
+    const uint8_t* W_v_packed, const float* W_v_scale,
+    int K, int N_q, int N_kv,
+    cudaStream_t stream = 0);
+
 // Transpose INT4 weights: W (K×N/2) → W_t (N×K/2), scales transposed
 cudaError_t transpose_int4_weights(
     void*           dst,
@@ -634,6 +648,15 @@ cudaError_t quantize_int4(
     const float*    in_fp32,
     int             K,
     cudaStream_t    stream = 0);
+
+// Fused SwiGLU + INT4 quant — replaces apply_swiglu + quantize_int4 (2→1 kernel)
+cudaError_t fused_swiglu_quant_int4(
+    uint8_t* out_packed,
+    float* out_scale,
+    const float* gate,
+    const float* up,
+    int N,
+    cudaStream_t stream = 0);
 
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).

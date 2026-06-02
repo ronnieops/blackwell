@@ -69,6 +69,8 @@ set(KERNEL_SOURCES
     src/kernels/fp16_scale_cache.cu
     src/kernels/gemv_bf16.cu
     src/kernels/gemv_fp4_nv.cu
+    src/kernels/gemv_int4_qkv.cu
+    src/kernels/fused_swiglu_quant_int4.cu
     src/kernels/fused_mlp.cu
     src/kernels/sample_gpu.cu
     src/kernels/gated_delta_net.cu
