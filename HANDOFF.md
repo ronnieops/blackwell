@@ -6,12 +6,12 @@ Continuity doc. Read before acting. Keep current with AGENTS.md.
 
 ## 1. Current Objective
 
-INT8 inference engine for RTX 5060 Ti. Production-ready.
-- M=8 batched + CUDA Graph: **324.6 t/s (111% of Q4_K_M)** — competitive path, production target
-- M=1 fused decode: **181.5 t/s (62% of Q4_K_M)** — bandwidth-limited (INT8 reads 2× data vs Q4_K_M)
-- Persistent C++ inference server running: `server/inference_server` handles string prompts via JSON IPC
-- Docker server built, weights + tokenizer bundled, "Paris" ✅
-- Spec decode infeasible, CUDA Graph M=1 blocked, FP4 tensor cores/PDL dead ends
+**Q4 quantization** to close M=1 bandwidth gap.
+- INT8 M=1 is 181.5 t/s (62% of Q4_K_M). INT4 halves DRAM reads → target **~250-290 t/s (~85-99% of Q4_K_M)**.
+- Plan: `Q4_PLAN.md` — 4 phases: weight format, `gemv_int4_warp` kernel, pipeline integration, bench.
+- INT8 production pipeline (324.6 t/s M=8, 111% of Q4_K_M) is stable and shipped.
+- Docker + C++ batch server built and tested.
+- Spec decode, M=1 CUDA Graph, FP4 tensor cores, PDL — all analyzed and documented as dead ends.
 
 ---
 
@@ -22,7 +22,7 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 | GPU | RTX 5060 Ti, GB206, SM_120a, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3, C++17, CMake |
 | Library | **157 symbols** `build/libblackwell_kernels.a` |
-| Branch | master @ `95684c6` |
+| Branch | master @ `7b37ae0` |
 | Session | **33** |
 
 ### Qwen3-1.7B
@@ -95,9 +95,9 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 
 | Task | Status | Notes |
 |------|--------|-------|
+| INT4 quantization (Q4_PLAN.md) | 🔜 Planned | Phase 1: weight format + Python converter. Phase 2: gemv_int4_warp kernel. Target ~250-290 t/s M=1. |
 | Deploy production server | ✅ Done | Docker built/tested, C++ batched server ready |
 | Speculative decoding | ❌ Abandoned | Batched verify 4.5× slower per-seq |
-| Real Q4 quantization (GPTQ/AWQ) | TODO | +80-100% M=1, needs quantize pipeline |
 | Qwen3.5-9B integration | TODO | 45.6 t/s bench exists, not in text_generate/server |
 
 ---
@@ -106,9 +106,9 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 
 | Priority | Task | Rationale |
 |----------|------|-----------|
-| **High** | **Real Q4 quantization (GPTQ/AWQ)** | Closes M=1 bandwidth gap. Would give ~350+ t/s M=1. |
+| **Active** | **INT4 quantization (`Q4_PLAN.md`)** | Phase 1: convert weights. Phase 2: gemv_int4_warp kernel. Target ~250-290 t/s M=1 (85-99% of Q4_K_M). |
 | Medium | Qwen3.5-9B integration | MoE decode, tokenizer integration |
-| Low | Deploy to production | Docker + server ready, just needs prod infra |
+| Low | Deploy to production | Docker + server ready, needs prod infra |
 
 ---
 
@@ -127,6 +127,15 @@ CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake --build build --parallel
 ./bench/decode_int8_batched_cgraph_attn 28 8    # M=8: 324.6 t/s
 ./bench/text_generate "The capital of France is" 30  # Correctness
 ./bench/decode_int8_generic 36 weights_int8_qwen3_8b 4096 4096 1024 12288 32 8 "Qwen3-8B"  # 44.6 t/s
+```
+
+### Q4 Quantization Plan (active)
+```
+Q4_PLAN.md — full 4-phase roadmap for INT4 migration
+Phase 1: weight format + Python conversion tools
+Phase 2: gemv_int4_warp kernel (nibble unpack + __dp4a)
+Phase 3: full decode pipeline + benchmarks
+Phase 4: batched kernel (optional)
 ```
 
 ### Server
@@ -169,8 +178,8 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-02 |
 | branch | master |
-| last_commit | `95684c6` benchmark: comprehensive llama.cpp comparison — fresh data session 33 |
-| repo_state | 157 symbols. M=8: 324.6 t/s (111% of Q4_K_M). M=1: 181.5 t/s (62%). Docker + C++ batch server ready. Spec decode infeasible. FP4/PDL dead ends. Benchmark data refreshed vs llama.cpp. |
+| last_commit | `7b37ae0` docs: Q4 quantization plan — full roadmap for INT4 migration |
+| repo_state | 157 symbols. M=8: 324.6 t/s (111% of Q4_K_M). M=1: 181.5 t/s (62%). Docker + C++ batch server ready. `Q4_PLAN.md` committed — 4-phase roadmap for INT4 migration to close M=1 gap. |
 | uncommitted | (none — clean) |
 
 ---
@@ -192,6 +201,6 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 **Revisitable**:
 - M=1 CUDA Graph: Need graph-safe wrappers that skip `cudaMemcpyAsync` H2D for seq_pos. Pre-set seq_pos before capture via direct device pointer. Low priority — 181.5 t/s per-kernel is <3% from theoretical graph max.
-- Q4 quantization (GPTQ/AWQ): Highest-impact remaining task. Halves memory reads → ~350+ t/s M-1. Needs quantize pipeline + INT4 GEMV kernel.
+- Q4 quantization (INT4): **Active — `Q4_PLAN.md` committed**. 4 phases: weight format, `gemv_int4_warp` kernel, pipeline integration, benchmarks. Target ~250-290 t/s M=1 (85-99% of Q4_K_M). Phase 1 = Python converter script + weight files.
 
 **Update discipline**: Update HANDOFF.md only when materially new state. Keep deduplicated with AGENTS.md. Prefer bullets over prose.
