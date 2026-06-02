@@ -79,6 +79,7 @@ set(KERNEL_SOURCES
     src/kernels/fused_residual_norm.cu
     src/kernels/fused_residual_norm_int4.cu
     src/kernels/fused_quant_attn_wo.cu
+    src/kernels/gemv_int4_batched.cu
     src/kernels/fused_unpack_quant.cu
     src/kernels/fused_swiglu_quant.cu
     src/kernels/fused_pack_gemv.cu

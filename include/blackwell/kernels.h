@@ -1078,6 +1078,20 @@ cudaError_t fused_quant_attn_wo(
     int             H,
     cudaStream_t    stream = 0);
 
+// Batched INT4 GEMV: processes M sequences in parallel.
+// Grid: (N/32) × M blocks, 32 threads/block.
+// Weight loaded once per K-block, reused across M tokens.
+cudaError_t gemv_int4_batched(
+    float*          y_out,
+    const uint8_t*  x_packed,
+    const float*    x_scale,
+    const uint8_t*  W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 
