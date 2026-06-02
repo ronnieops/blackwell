@@ -972,6 +972,28 @@ cudaError_t fused_residual_norm(
     int N, float eps,
     cudaStream_t stream = 0);
 
+// Fused residual add + RMSNorm + INT4 quant (symmetric, block=16)
+// Saves 2 kernel launches vs vector_add + fused_rmsnorm + quantize_int4
+cudaError_t fused_residual_norm_int4_fp32out(
+    void*   x_out,       // [N/2] uint8_t, packed INT4 (2 vals/byte)
+    float*  x_out_sc,    // [N/16] FP32 scales
+    float*  proj_out_fp32, // [N] FP32 normalized output (can be nullptr)
+    const float* proj_in, // input projection (not modified)
+    const float* residual,
+    const float* norm_w,
+    int N, float eps,
+    cudaStream_t stream = 0);
+
+// Same as above but modifies proj_in in-place (proj = proj + residual, then norm)
+cudaError_t fused_residual_norm_int4(
+    void*   x_out,       // [N/2] uint8_t, packed INT4 (2 vals/byte)
+    float*  x_out_sc,    // [N/16] FP32 scales
+    float*  proj,        // in/out: FP32 projection (modified in-place)
+    const float* residual,
+    const float* norm_w,
+    int N, float eps,
+    cudaStream_t stream = 0);
+
 cudaError_t fused_unpack_fp4_quant(
     int8_t* out_i8,
     float* out_scale,
