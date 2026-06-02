@@ -2,16 +2,31 @@
 
 ## Executive Summary
 
-Custom CUDA INT8 inference kernels for Qwen3-1.7B on RTX 5060 Ti (Blackwell, SM_120a).
-Primary result: **M=8 batched decode at 324 t/s** (110% of llama.cpp Q4_K_M baseline of 293 t/s).
+Custom CUDA INT8 inference kernels for Qwen3-1.7B/Qwen3-8B on RTX 5060 Ti (Blackwell, SM_120a).
+Primary result: **M=8 batched decode at 324 t/s (111% of llama.cpp Q4_K_M FA=on)**.
+
+Benchmark run: session 33, CUDA 13.3, llama.cpp build b9442.
+
+### Qwen3-1.7B (28 layers, H=2048)
 
 | Configuration | Total t/s | Per-seq t/s | vs Q4_K_M | VRAM |
 |--------------|-----------|-------------|-----------|------|
-| M=1 (decode) | 181 | 181 | 62% | ~3.4 GB |
-| M=8 (CUDA Graph) | 324 | 40.5 | 110% | ~4.4 GB |
-| M=16 (CUDA Graph) | 335 | 20.9 | 114% | 9 GB |
-| llama.cpp Q4_K_M | 293 | 293 | 100% | 5 GB |
-| llama.cpp F16 | 114 | 114 | 39% | 5 GB |
+| **llama.cpp Q4_K_M FA=on** | **293.4** | **293.4** | **100%** | ~5 GB |
+| llama.cpp Q4_K_M FA=off | 274.1 | 274.1 | 93% | ~5 GB |
+| llama.cpp F16 FA=on | 114.3 | 114.3 | 39% | ~5 GB |
+| Blackwell M=1 (fused per-kernel) | 181.5 | 181.5 | 62% | ~3.4 GB |
+| Blackwell M=1 (CUDA Graph generic) | 181.2 | 181.2 | 62% | ~3.4 GB |
+| Blackwell M=4 batched-attn + Graph | 308.3 | 77.1 | 105% | ~3.8 GB |
+| **Blackwell M=8 batched-attn + Graph** | **324.6** | **40.6** | **111%** | **~4.4 GB** |
+| Blackwell text_generate (M=1 pipeline) | ~140 | ~140 | 48% | ~3.4 GB |
+
+### Qwen3-8B (36 layers, H=4096)
+
+| Configuration | Total t/s | Per-seq t/s | vs Q4_K_M | VRAM |
+|--------------|-----------|-------------|-----------|------|
+| **llama.cpp Q4_K_M FA=on** | **82.56** | **82.56** | **100%** | ~6 GB |
+| llama.cpp Q4_K_M FA=off | 78.62 | 78.62 | 95% | ~6 GB |
+| Blackwell M=1 (CUDA Graph) | 44.6 | 44.6 | 54% | ~5 GB |
 
 **Note**: Earlier measurement of 864 t/s at M=16 was incorrect — `gemv_int8_batched` silently returned zero for M>8 (switch statement only supported M=1-8). After fixing, real M=16 is 335 t/s. M=8 is the practical limit for batched GEMV.
 

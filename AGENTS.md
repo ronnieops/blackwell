@@ -122,25 +122,16 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | Finding | Value | Notes |
 |---------|-------|-------|
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
-| INT8 fused (M=1) | **176.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
-| INT8 batched-attn M=8 CUDA Graph | **323.5 t/s** | **110%** of llama.cpp Q4_K_M (292.9) |
-| INT8 batched-attn M=8 vs llama.cpp F16 | **+183%** | 323.5 vs 114.3 t/s |
-| INT8 batched-attn M=4 CUDA Graph | **307.5 t/s** | **105%** of Q4_K_M |
-| INT8 batched-attn M=1 CUDA Graph | **118.5 t/s** | 40% of Q4_K_M |
-| INT8 generic CUDA Graph (1.7B) | **181.7 t/s** | 62% of Q4_K_M |
-| INT8 generic CUDA Graph (0.6B) | **444.1 t/s** | H=1024 |
-| INT8 generic CUDA Graph (8B, 28L) | **57.3 t/s** | H=4096, 69% of Q4_K_M (82.5) |
-| INT8 generic CUDA Graph (8B, 36L) | **44.6 t/s** | H=4096 |
-| WMMA GEMM (INT8) | **10,510 GFLOPS** | 3.81× over dp4a |
-| WMMA FAST GEMM (INT8) | **4.3-5.0K GFLOPS** | 1.2-1.4× over dp4a (real weights) |
-| Block GEMV unrolling | **+9-45%** | 4× unroll, K-dependent |
-| Speculative decode (M=4) | **190 t/s** | 0% speedup — same total work as autoregressive |
-| FP4 batched (M=8) | 243.4 t/s | 83% ⚠️ 180% RMS diff vs INT8 |
-| llama.cpp Q4_K_M FA=on | **292.9 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
-| llama.cpp Q4_K_M FA=off | **274.3 t/s** | Qwen3-1.7B (old baseline path) |
+| INT8 fused (M=1) | **181.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
+| INT8 batched-attn M=8 CUDA Graph | **324.6 t/s** | **111%** of llama.cpp Q4_K_M FA=on (293.4) |
+| INT8 batched-attn M=4 CUDA Graph | **308.3 t/s** | **105%** of Q4_K_M |
+| INT8 generic CUDA Graph (1.7B) | **181.2 t/s** | 62% of Q4_K_M |
+| INT8 generic CUDA Graph (8B) | **44.6 t/s** | 54% of Q4_K_M (82.6) — larger gap since INT8 reads 2× data |
+| M=8 vs llama.cpp F16 | **+184%** | 324.6 vs 114.3 t/s |
+| llama.cpp Q4_K_M FA=on | **293.4 t/s** | Qwen3-1.7B, build b9442, CUDA 13.3 |
+| llama.cpp Q4_K_M FA=off | **274.1 t/s** | Qwen3-1.7B |
 | llama.cpp F16 FA=on | **114.3 t/s** | Qwen3-1.7B |
-| llama.cpp F16 FA=off | **111.2 t/s** | Qwen3-1.7B (old baseline path) |
-| llama.cpp Q4_K_M FA=on (8B) | **82.5 t/s** | Qwen3-8B, build b9442 |
+| llama.cpp Q4_K_M FA=on (8B) | **82.56 t/s** | Qwen3-8B, build b9442 |
 | llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
 | Qwen3.5-9B INT8 decode | **45.6 t/s** | 64% of Q4_K_M, weight-bound (INT8 reads 2× Q4) |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |

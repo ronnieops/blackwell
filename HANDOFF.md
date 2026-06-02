@@ -28,11 +28,19 @@ INT8 inference engine for RTX 5060 Ti. Production-ready.
 
 | Config | Total t/s | Per-seq | vs Q4_K_M | VRAM |
 |--------|-----------|---------|-----------|------|
-| M=1 decode | 181 | 181 | 62% | ~3.4 GB |
-| **M=8 CUDA Graph** | **324** | **40.5** | **110%** | **~4.4 GB** |
-| M=16 batched MLP | 335 | 20.9 | 114% | 9 GB |
-| llama.cpp Q4_K_M | 293 | 293 | 100% | 5 GB |
-| llama.cpp F16 | 114 | 114 | 39% | 5 GB |
+| M=1 fused decode | 181.5 | 181.5 | 62% | ~3.4 GB |
+| M=4 batched-attn + Graph | 308.3 | 77.1 | 105% | ~3.8 GB |
+| **M=8 batched + CUDA Graph** | **324.6** | **40.6** | **111%** | **~4.4 GB** |
+| llama.cpp Q4_K_M FA=on | 293.4 | 293.4 | 100% | 5 GB |
+| llama.cpp Q4_K_M FA=off | 274.1 | 274.1 | 93% | 5 GB |
+| llama.cpp F16 FA=on | 114.3 | 114.3 | 39% | 5 GB |
+
+### Qwen3-8B
+
+| Config | Total t/s | vs Q4_K_M | VRAM |
+|--------|-----------|-----------|------|
+| llama.cpp Q4_K_M FA=on | 82.56 | 100% | ~6 GB |
+| Blackwell M=1 CUDA Graph | 44.6 | 54% | ~5 GB |
 
 ---
 
