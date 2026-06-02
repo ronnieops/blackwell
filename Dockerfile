@@ -31,6 +31,7 @@ WORKDIR /app
 COPY bench/text_generate /app/bin/
 COPY tokenizer_data.bin /app/
 COPY weights_int8_bf16 /app/weights_int8_bf16
+COPY server/inference_server /app/bin/
 COPY server/server.py /app/server.py
 
 EXPOSE 8080

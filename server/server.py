@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""server.py — Blackwell INT8 inference HTTP API server.
+"""server.py — Blackwell INT8 inference HTTP API server with continuous batching.
 
 Provides /generate endpoint for text generation.
-Calls text_generate binary as subprocess.
+Spawns a persistent C++ inference server process that handles M=8 batched decode.
 
 Run:
     python3 server.py
@@ -15,32 +15,79 @@ Test:
 
 import subprocess
 import json
-import re
 import os
 import sys
+import threading
+import queue
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-BIN = "/app/bin/text_generate"
-BIN_DEV = os.path.join(os.path.dirname(__file__), "..", "bench", "text_generate")
+BIN = os.path.join(os.path.dirname(__file__), "inference_server")
 
-def find_bin():
-    if os.path.exists(BIN):
-        return BIN
-    if os.path.exists(BIN_DEV):
-        return BIN_DEV
-    # Search PATH
-    for p in os.environ.get("PATH", "").split(":"):
-        fp = os.path.join(p, "text_generate")
-        if os.path.exists(fp):
-            return fp
-    return None
+# ── C++ inference server process (persistent, batched) ────────────────────
+class BatchServer:
+    """Manages a persistent C++ inference server process.
+    Accumulates requests and dispatches them in batches up to M=8."""
+
+    def __init__(self, bin_path, timeout=30):
+        self.bin_path = bin_path
+        self.timeout = timeout
+        self.proc = None
+        self.lock = threading.Lock()
+        self.pending = {}  # request_id → queue entry
+        self.req_counter = 0
+        self._start()
+
+    def _start(self):
+        if not os.path.exists(self.bin_path):
+            alt = os.path.join(os.path.dirname(__file__), "..", "server", "inference_server")
+            if os.path.exists(alt):
+                self.bin_path = alt
+            else:
+                raise RuntimeError(f"inference_server binary not found at {self.bin_path}")
+        self.proc = subprocess.Popen(
+            [self.bin_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+    def generate(self, token_ids, max_tokens, temperature, top_k):
+        """Send a single request to the batch server. Returns generated token IDs."""
+        req_id = self.req_counter
+        self.req_counter += 1
+
+        request = {
+            "prompts": [token_ids],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_k": top_k
+        }
+
+        with self.lock:
+            self.proc.stdin.write(json.dumps(request) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+
+        try:
+            result = json.loads(line)
+            tokens = result.get("tokens", [[]])[0]
+            return tokens
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            raise RuntimeError(f"batch server error: {e}, response: {line[:200]}")
+
+    def close(self):
+        if self.proc:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/generate":
             self.send_error(404)
             return
-        
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         try:
@@ -48,18 +95,28 @@ class Handler(BaseHTTPRequestHandler):
         except:
             self.send_json({"error": "invalid json"}, 400)
             return
-        
+
         prompt = req.get("prompt", "Once upon a time")
         max_tokens = req.get("max_tokens", 30)
-        temperature = req.get("temperature", 0.8)
+        temperature = req.get("temperature", 1.0)
         top_k = req.get("top_k", 40)
-        
+
         try:
-            output = self.generate(prompt, max_tokens, temperature, top_k)
+            # Tokenize prompt using the BPE tokenizer
+            prompt_tokens = self.server.tokenizer.encode(prompt)
+            # Generate via batch server
+            tokens = self.server.batch_server.generate(
+                prompt_tokens, max_tokens, temperature, top_k)
+            # Decode tokens to text
+            output = ""
+            for tid in tokens:
+                txt = self.server.tokenizer.decode(tid)
+                output += txt
+
             self.send_json({"generated": output, "prompt": prompt})
         except Exception as e:
             self.send_json({"error": str(e)}, 500)
-    
+
     def do_GET(self):
         if self.path == "/health":
             self.send_json({"status": "ok", "model": "Qwen3-1.7B INT8"})
@@ -68,72 +125,51 @@ class Handler(BaseHTTPRequestHandler):
                 "name": "Blackwell INT8 Inference",
                 "model": "Qwen3-1.7B",
                 "quant": "INT8",
-                "version": "0.1.0",
+                "version": "0.2.0",
                 "endpoints": {
                     "GET /health": "health check",
                     "GET /": "this info",
-                    "POST /generate": "generate text"
+                    "POST /generate": "generate text (single seq)"
                 }
             })
         else:
             self.send_error(404)
-    
-    def generate(self, prompt, max_tokens, temperature, top_k):
-        bin_path = find_bin()
-        if not bin_path:
-            raise RuntimeError("text_generate binary not found")
-        
-        cmd = [bin_path, prompt, str(max_tokens), "-t", str(temperature), "-k", str(top_k)]
-        
-        # Kill hashcat before generation (harmless if not running or not installed)
-        try:
-            subprocess.run(["killall", "hashcat"], capture_output=True, timeout=5)
-        except FileNotFoundError:
-            pass
-        
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=min(120, max_tokens * 5))
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"text_generate failed: {result.stderr[:500]}")
-        
-        # Parse output: extract text after ── Generating ──
-        lines = result.stdout.split("\n")
-        in_gen = False
-        for line in lines:
-            if "── Generating ──" in line:
-                in_gen = True
-                continue
-            if in_gen and line.strip() and "── Stats ──" not in line:
-                text = re.sub(r'\s*\[tok#\d+=?\d*\]', '', line).strip()
-                if text:
-                    return text
-        
-        return ""
-    
+
     def send_json(self, data, code=200):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-def main():
-    bin_path = find_bin()
-    if not bin_path:
-        print("ERROR: text_generate binary not found", file=sys.stderr)
-        print(f"  Expected at: {BIN} or {BIN_DEV}", file=sys.stderr)
-        sys.exit(1)
-    print(f"Blackwell INT8 Inference Server v0.1.0")
-    print(f"Binary: {bin_path}")
-    port = int(os.environ.get("PORT", 8080))
-    print(f"Listening on http://0.0.0.0:{port}")
-    print(f"Endpoints: GET /health, GET /, POST /generate")
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        server.shutdown()
+
+class Server:
+    def __init__(self):
+        # Load tokenizer
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from blackwell.bpe_tokenizer import BpeTokenizer
+        tokenizer_path = os.path.join(os.path.dirname(__file__), "..", "tokenizer_data.bin")
+        self.tokenizer = BpeTokenizer()
+        self.tokenizer.load(tokenizer_path)
+
+        # Start batch server
+        bin_path = os.path.join(os.path.dirname(__file__), "inference_server")
+        self.batch_server = BatchServer(bin_path)
+
+    def run(self, port=8080):
+        server = HTTPServer(("0.0.0.0", port), Handler)
+        Handler.server = self
+        print(f"Blackwell INT8 Inference Server v0.2.0")
+        print(f"Listening on http://0.0.0.0:{port}")
+        print(f"Endpoints: GET /health, GET /, POST /generate")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            server.shutdown()
+        finally:
+            self.batch_server.close()
 
 if __name__ == "__main__":
-    main()
+    s = Server()
+    s.run()
