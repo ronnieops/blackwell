@@ -208,9 +208,6 @@ int main(int argc, char** argv) {
             // and our activations start as FP32, we need to quantize first.
             // Let's quantize d_x32 → d_x_i4 (packed), then use gemv_int4_warp.
 
-            // Save input for residual connection
-            cudaMemcpy(d_res, d_x32, H * 4, cudaMemcpyDeviceToDevice);
-
             // Quantize x to INT4
             chk(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_x32, H), "quantize_x");
 
@@ -239,9 +236,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_attn_i4, d_attn_i4_sc,
                 lw[l].o.d, lw[l].o.sc, Q, H), "Wo");
 
-            // Residual: proj += input, then RMSNorm, then quantize for next layer
-            // d_proj = d_proj + d_res (FP32 residual add)
-            chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_attn");
+            // Residual: proj += d_x32 (current hidden state), then RMSNorm, then quantize
+            chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_attn");
 
             // MLP: gate/up → swiglu → quantize → down → residual → RMSNorm
             chk(blackwell::kernels::gemv_int4_warp(d_gate, d_x_i4, d_x_i4_sc,
@@ -254,8 +250,8 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc,
                 lw[l].d.d, lw[l].d.sc, I, H), "down");
 
-            // MLP residual: proj += x, then RMSNorm, then copy to x for next iteration
-            chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x32, d_x_i4_sc, d_x32, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_mlp");
+            // MLP residual: INT4 → d_x_i4 (not d_x32!), FP32 → d_x32
+            chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x_i4, d_x_i4_sc, d_x32, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_mlp");
         }
     }
     printf("done\n");
@@ -275,8 +271,7 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     t.start();
     for (int i = 0; i < warmup; ++i) {
-        // Single layer decode
-        int l = 0;
+        for (int l = 0; l < num_layers; ++l) {
 
         chk(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_x32, H), "quantize_x");
         chk(blackwell::kernels::gemv_int4_warp(d_Q, d_x_i4, d_x_i4_sc, lw[l].q.d, lw[l].q.sc, H, Q), "Q");
@@ -288,12 +283,13 @@ int main(int argc, char** argv) {
         chk(blackwell::kernels::attention_decode_gqa(d_attn, d_Q, d_kc + kb, d_vc + kb, sq + 1, nqh, nkv, hd, ms), "attn");
         chk(blackwell::kernels::quantize_int4(d_attn_i4, d_attn_i4_sc, d_attn, Q), "quantize_attn");
         chk(blackwell::kernels::gemv_int4_warp(d_proj, d_attn_i4, d_attn_i4_sc, lw[l].o.d, lw[l].o.sc, Q, H), "Wo");
-        chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_attn");
+        chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_attn");
         chk(blackwell::kernels::gemv_int4_warp(d_gate, d_x_i4, d_x_i4_sc, lw[l].g.d, lw[l].g.sc, H, I), "gate");
         chk(blackwell::kernels::gemv_int4_warp(d_up, d_x_i4, d_x_i4_sc, lw[l].u.d, lw[l].u.sc, H, I), "up");
         chk(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, d_up, I), "fused_swiglu_quant");
         chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc, lw[l].d.d, lw[l].d.sc, I, H), "down");
-        chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x32, d_x_i4_sc, d_x32, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_mlp");
+        chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x_i4, d_x_i4_sc, d_x32, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_mlp");
+        }
 
         // Restore scales for next iter
         cudaMemcpy(d_x_i4_sc, d_x_i4_sc_init, (H / 16) * 4, cudaMemcpyDeviceToDevice);
@@ -317,15 +313,12 @@ int main(int argc, char** argv) {
             chk(blackwell::kernels::attention_decode_gqa(d_attn, d_Q, d_kc + kb, d_vc + kb, sq + 1, nqh, nkv, hd, ms), "attn");
             chk(blackwell::kernels::quantize_int4(d_attn_i4, d_attn_i4_sc, d_attn, Q), "quantize_attn");
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_attn_i4, d_attn_i4_sc, lw[l].o.d, lw[l].o.sc, Q, H), "Wo");
-            chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_attn");
+            chk(blackwell::kernels::fused_residual_norm_int4(d_x_i4, d_x_i4_sc, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_attn");
             chk(blackwell::kernels::gemv_int4_warp(d_gate, d_x_i4, d_x_i4_sc, lw[l].g.d, lw[l].g.sc, H, I), "gate");
             chk(blackwell::kernels::gemv_int4_warp(d_up, d_x_i4, d_x_i4_sc, lw[l].u.d, lw[l].u.sc, H, I), "up");
             chk(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, d_up, I), "fused_swiglu_quant");
             chk(blackwell::kernels::gemv_int4_warp(d_proj, d_mlp_i4, d_mlp_i4_sc, lw[l].d.d, lw[l].d.sc, I, H), "down");
-            chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x32, d_x_i4_sc, d_x32, d_proj, d_res, d_rn, H, 1e-6f), "fused_rnq_mlp");
-            cudaMemcpy(d_x_i4_sc, d_x_i4_sc_init, (H / 16) * 4, cudaMemcpyDeviceToDevice);
-            cudaMemcpy(d_attn_i4_sc, d_attn_i4_sc_init, (Q / 16) * 4, cudaMemcpyDeviceToDevice);
-            cudaMemcpy(d_mlp_i4_sc, d_mlp_i4_sc_init, (I / 16) * 4, cudaMemcpyDeviceToDevice);
+            chk(blackwell::kernels::fused_residual_norm_int4_fp32out(d_x_i4, d_x_i4_sc, d_x32, d_proj, d_x32, d_rn, H, 1e-6f), "fused_rnq_mlp");
         }
     }
     float ms_total = t.stop();
