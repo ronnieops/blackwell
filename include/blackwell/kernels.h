@@ -1067,6 +1067,17 @@ cudaError_t fused_swiglu_gemv(
     int K, int N,
     cudaStream_t stream = 0);
 
+// Fused quantize_attn + Wo GEMV: quantize attn output to INT4 in smem, run Wo projection.
+// Saves 1 kernel launch + device memory round-trip for attn_i4.
+cudaError_t fused_quant_attn_wo(
+    float*          proj_out,
+    const float*    attn,
+    const uint8_t*  Wo_packed,
+    const float*    Wo_scale,
+    int             Q,
+    int             H,
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 
