@@ -31,37 +31,66 @@ def quantize_per_row_int8(W_f32):
     q = np.clip(q, -127, 127).astype(np.int8)
     return q, scales.astype(np.float32)
 
-def quantize_per_row_int4(W_f32):
-    """INT4: symmetric block-16, 4-bit signed [-7..7], nibble-packed 2 values/byte.
+def quantize_per_row_int4_asym(W_f32):
+    """INT4: asymmetric block-16 with per-block zero point.
+
+    For each 16-element block: scale=(max-min)/15, zero=round(-min/scale), [0..15].
+    Nibble = round(val/scale) + zero, [0..15], packed 2 vals/byte.
 
     Returns:
-        packed: uint8 array [N * K/2] — lower nibble = even idx, upper nibble = odd idx
-        scales: float32 array [N * num_K_blks] — per-16-element block scales
+        packed: uint8 array [N * K/2]
+        sc_zero: float32 array [N * 2 * num_K_blks] — even=scale, odd=zero
     """
     N, K = W_f32.shape
-    assert K % BLOCK == 0, f"K={K} not divisible by block={BLOCK}"
+    assert K % BLOCK == 0
     num_K_blks = K // BLOCK
 
-    # Compute per-block scales (absmax / 7 for 4-bit range)
     W_blk = W_f32.reshape(N, num_K_blks, BLOCK)
-    block_max = np.max(np.abs(W_blk), axis=2)  # [N, num_K_blks]
-    scales = block_max / 7.0
-    scales = np.maximum(scales, 1e-10)  # prevent div-by-zero
+    blk_min = np.min(W_blk, axis=2)  # [N, num_K_blks]
+    blk_max = np.max(W_blk, axis=2)
 
-    # Quantize to [-7..7], symmetric
-    sc_bc = scales[:, :, np.newaxis]  # [N, num_K_blks, 1]
-    sc_bc = np.repeat(sc_bc, BLOCK, axis=2)  # [N, num_K_blks, BLOCK]
-    sc_bc = sc_bc.reshape(N, K)  # [N, K]
-    q = np.round(W_f32 / sc_bc)
-    q = np.clip(q, -7, 7).astype(np.int8)  # [N, K]
+    scale = (blk_max - blk_min) / 15.0
+    scale = np.maximum(scale, 1e-10)
+    zero_f = -blk_min / scale
+    zero_i = np.round(zero_f).astype(np.int32)
+    zero_i = np.clip(zero_i, 0, 15)
 
-    # Vectorized nibble-pack: reshape to [N, K/2, 2], pack even/odd into bytes
+    # Quantize: nib = round(val / scale) + zero
+    sc_bc = scale[:, :, np.newaxis]
+    sc_bc = np.repeat(sc_bc, BLOCK, axis=2).reshape(N, K)
+    q = np.round(W_f32 / sc_bc).astype(np.int32)
+    q = q + zero_i[:, :, np.newaxis].repeat(BLOCK, axis=2).reshape(N, K)
+    q = np.clip(q, 0, 15).astype(np.int8)
+
+    # Nibble-pack
     q_reshaped = q.reshape(N, K // 2, 2)
-    nib0 = q_reshaped[:, :, 0]  # even indices
-    nib1 = q_reshaped[:, :, 1]  # odd indices
-    packed = ((nib0 + 8) & 0x0F) | (((nib1 + 8) & 0x0F) << 4)
+    packed = (q_reshaped[:, :, 0] & 0x0F) | ((q_reshaped[:, :, 1] & 0x0F) << 4)
 
-    return packed, scales.astype(np.float32)
+    # Interleave scale + zero: [N, 2*num_K_blks]
+    sc_zero = np.empty((N, 2 * num_K_blks), dtype=np.float32)
+    sc_zero[:, 0::2] = scale
+    sc_zero[:, 1::2] = zero_i.astype(np.float32)
+
+    return packed, sc_zero
+
+
+def write_weight_int4_asym(prefix, int4_packed, sc_zero, K_in, N_out):
+    """Write asymmetric INT4 weights. Scale file stores (scale, zero) pairs."""
+    num_K_blks = K_in // BLOCK
+    # Header: same format, but scale_t has 2x entries
+    header = np.array([K_in, N_out, BLOCK, num_K_blks, N_out], dtype=np.int32)
+    path = f"{prefix}.int4_t"
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(int4_packed.tobytes())
+    path = f"{prefix}.sc_zero_t"
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(sc_zero.tobytes())
+    mb_data = int4_packed.nbytes / (1024*1024)
+    mb_sc = sc_zero.nbytes / (1024*1024)
+    print(f"  {prefix}: [{N_out}×{K_in}] INT4_asym data={mb_data:.1f}MB scales={mb_sc:.1f}MB")
 
 def write_weight_int8(prefix, int8_data, scales, K_in, N_out):
     """Write INT8 weight file with same header format as existing."""
@@ -199,8 +228,8 @@ def main():
     MODEL = sys.argv[1]
     OUT = sys.argv[2]
     fmt = sys.argv[3].lower() if len(sys.argv) > 3 else 'int8'
-    if fmt not in ('int8', 'int4'):
-        print("Format must be 'int8' or 'int4'")
+    if fmt not in ('int8', 'int4', 'int4_asym'):
+        print("Format must be 'int8', 'int4', or 'int4_asym'")
         sys.exit(1)
     print(f"Quantization format: {fmt.upper()}")
 
@@ -255,7 +284,11 @@ def main():
                 continue
             W = read_tensor(tensor_map, shard_paths, tname)
             N_out, K_in = W.shape
-            if fmt == 'int4':
+            if fmt == 'int4_asym':
+                int4_packed, sc_zero = quantize_per_row_int4_asym(W)
+                prefix = f"{OUT}/{layer}_{wn}"
+                write_weight_int4_asym(prefix, int4_packed, sc_zero, K_in, N_out)
+            elif fmt == 'int4':
                 int4_packed, scales = quantize_per_row_int4(W)
                 prefix = f"{OUT}/{layer}_{wn}"
                 write_weight_int4(prefix, int4_packed, scales, K_in, N_out)
@@ -267,7 +300,10 @@ def main():
     print(f"\nProcessing embed_tokens...")
     W_emb = read_tensor(tensor_map, shard_paths, "model.embed_tokens.weight")
     N_out, K_in = W_emb.shape
-    if fmt == 'int4':
+    if fmt == 'int4_asym':
+        int4_packed, sc_zero = quantize_per_row_int4_asym(W_emb)
+        write_weight_int4_asym(f"{OUT}/embed_tokens", int4_packed, sc_zero, K_in, N_out)
+    elif fmt == 'int4':
         int4_packed, scales = quantize_per_row_int4(W_emb)
         write_weight_int4(f"{OUT}/embed_tokens", int4_packed, scales, K_in, N_out)
     else:

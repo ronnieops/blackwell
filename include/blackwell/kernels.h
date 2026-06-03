@@ -671,6 +671,25 @@ cudaError_t fused_swiglu_quant_int4(
     int N,
     cudaStream_t stream = 0);
 
+// Asymmetric INT4 quantization with per-block zero point
+// For 16-element block: scale=(max-min)/15, zero=round(-min/scale)
+// Output scale format: [2*K/16] floats, even=scale, odd=zero
+cudaError_t quantize_int4_asym(
+    uint8_t*        x_out_packed,   // [K/2] packed nibbles
+    float*          x_out_sc_zero,  // [2*K/16] scale,zero pairs
+    const float*    in_fp32,
+    int             K,
+    cudaStream_t    stream = 0);
+
+// Fused SwiGLU + INT4 quant (asymmetric) — replaces apply_swiglu + quantize_int4_asym
+cudaError_t fused_swiglu_quant_int4_asym(
+    uint8_t* out_packed,
+    float* out_sc_zero,
+    const float* gate,
+    const float* up,
+    int N,
+    cudaStream_t stream = 0);
+
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
 // Fixes quality: per-row scales prevent 16-row quantization error accumulation.
@@ -1007,6 +1026,28 @@ cudaError_t fused_residual_norm_int4(
     int N, float eps,
     cudaStream_t stream = 0);
 
+// Fused residual add + RMSNorm + INT4 quant (ASYMMETRIC, zero point, block=16)
+// Output scale format: [2 * N/16] floats, even=scale, odd=zero (as float)
+cudaError_t fused_residual_norm_int4_asym_fp32out(
+    void*   x_out,          // [N/2] uint8_t, packed INT4
+    float*  x_out_sc_zero,  // [2*N/16] scale,zero pairs
+    float*  proj_out_fp32,  // [N] FP32 normalized output (can be nullptr)
+    const float* proj_in,
+    const float* residual,
+    const float* norm_w,
+    int N, float eps,
+    cudaStream_t stream = 0);
+
+// Same as above but modifies proj_in in-place
+cudaError_t fused_residual_norm_int4_asym(
+    void*   x_out,          // [N/2] uint8_t, packed INT4
+    float*  x_out_sc_zero,  // [2*N/16] scale,zero pairs
+    float*  proj,           // in/out: FP32 projection (modified in-place)
+    const float* residual,
+    const float* norm_w,
+    int N, float eps,
+    cudaStream_t stream = 0);
+
 cudaError_t fused_unpack_fp4_quant(
     int8_t* out_i8,
     float* out_scale,
@@ -1079,7 +1120,7 @@ cudaError_t fused_quant_attn_wo(
     cudaStream_t    stream = 0);
 
 // Batched INT4 GEMV: processes M sequences in parallel.
-// Grid: (N/32) × M blocks, 32 threads/block.
+// Grid: N × M blocks, 32 threads/block.
 // Weight loaded once per K-block, reused across M tokens.
 cudaError_t gemv_int4_batched(
     float*          y_out,
@@ -1087,6 +1128,20 @@ cudaError_t gemv_int4_batched(
     const float*    x_scale,
     const uint8_t*  W_packed,
     const float*    W_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream = 0);
+
+// Batched asymmetric INT4 GEMV with per-block zero points.
+// x_sc_zero / W_sc_zero: [2 * K/16] floats: even=scale, odd=zero.
+// Grid: N × M blocks, 32 threads/block.
+cudaError_t gemv_int4_asym_batched(
+    float*          y_out,
+    const uint8_t*  x_packed,
+    const float*    x_sc_zero,   // [M][2*K/16] scale,zero pairs
+    const uint8_t*  W_packed,
+    const float*    W_sc_zero,   // [N][2*K/16] scale,zero pairs
     int             K,
     int             N,
     int             M,

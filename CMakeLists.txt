@@ -71,6 +71,7 @@ set(KERNEL_SOURCES
     src/kernels/gemv_fp4_nv.cu
     src/kernels/gemv_int4_qkv.cu
     src/kernels/fused_swiglu_quant_int4.cu
+    src/kernels/fused_swiglu_quant_int4_asym.cu
     src/kernels/fused_mlp.cu
     src/kernels/sample_gpu.cu
     src/kernels/gated_delta_net.cu
@@ -78,8 +79,11 @@ set(KERNEL_SOURCES
     src/kernels/gemv_int8_gate_up.cu
     src/kernels/fused_residual_norm.cu
     src/kernels/fused_residual_norm_int4.cu
+    src/kernels/fused_residual_norm_int4_asym.cu
     src/kernels/fused_quant_attn_wo.cu
     src/kernels/gemv_int4_batched.cu
+    src/kernels/gemv_int4_asym_batched.cu
+    src/kernels/quantize_int4_asym.cu
     src/kernels/fused_unpack_quant.cu
     src/kernels/fused_swiglu_quant.cu
     src/kernels/fused_pack_gemv.cu
