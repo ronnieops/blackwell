@@ -1147,6 +1147,48 @@ cudaError_t gemv_int4_asym_batched(
     int             M,
     cudaStream_t    stream = 0);
 
+// FP32 activation × asymmetric INT4 weight GEMV (weight-only quantization).
+// No activation quant — eliminates the main quality bottleneck.
+// W_sc_zero: [N][2*K/16] scale,zero pairs.
+// Grid: N blocks, 32 threads/block.
+cudaError_t gemv_fp32_int4_asym(
+    float*          y_out,
+    const float*    x_fp32,
+    const uint8_t*  W_packed,
+    const float*    W_sc_zero,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// FP32 activation × asymmetric INT5 weight GEMV (weight-only 5-bit quantization).
+// 5-bit per-block-16: 16 vals packed into 10 bytes (80 bits). PSNR ~29 dB vs BF16.
+// W_sc_zero: [N][2*K/16] scale,zero pairs.
+// Grid: N blocks, 32 threads/block.
+cudaError_t gemv_fp32_int5_asym(
+    float*          y_out,
+    const float*    x_fp32,
+    const uint8_t*  W_packed,
+    const float*    W_sc_zero,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// Fused gate+up INT8 GEMV: single kernel computes both projections.
+// Reads input once, 2 warps/block (warp0=gate, warp1=up). Saves 1 input read.
+// Grid: N blocks, 64 threads/block.
+cudaError_t gemv_int8_gate_up(
+    float*          gate_out,
+    float*          up_out,
+    const int8_t*   x_int8,
+    const float*    x_scale,
+    const int8_t*   W_gate,
+    const float*    W_gate_sc,
+    const int8_t*   W_up,
+    const float*    W_up_sc,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 } // namespace kernels
 } // namespace blackwell
 

@@ -74,6 +74,79 @@ def quantize_per_row_int4_asym(W_f32):
     return packed, sc_zero
 
 
+def quantize_per_row_int5_asym(W_f32):
+    """INT5: asymmetric block-16 with per-block zero point.
+
+    For each 16-element block: scale=(max-min)/31, zero=round(-min/scale), [0..31].
+    5-bit values packed into 10 bytes per block (16*5=80 bits).
+    """
+    N, K = W_f32.shape
+    assert K % BLOCK == 0
+    num_K_blks = K // BLOCK
+
+    W_blk = W_f32.reshape(N, num_K_blks, BLOCK)
+    blk_min = np.min(W_blk, axis=2)
+    blk_max = np.max(W_blk, axis=2)
+
+    scale = (blk_max - blk_min) / 31.0
+    scale = np.maximum(scale, 1e-10)
+    zero_f = -blk_min / scale
+    zero_i = np.round(zero_f).astype(np.int32)
+    zero_i = np.clip(zero_i, 0, 31)
+
+    # Quantize: q = round(val / scale + zero)
+    sc_bc = scale[:, :, np.newaxis].repeat(BLOCK, axis=2).reshape(N, K)
+    z_bc = zero_i[:, :, np.newaxis].repeat(BLOCK, axis=2).reshape(N, K)
+    q = np.clip(np.round(W_f32 / sc_bc + z_bc), 0, 31).astype(np.int64)
+
+    # Pack 16 x 5-bit values into 10 bytes per block
+    q_blk = q.reshape(N, num_K_blks, BLOCK)
+
+    # Split into low (val[0..7]) and high (val[8..15]) 40-bit halves
+    shifts = np.array([0, 5, 10, 15, 20, 25, 30, 35], dtype=np.int64)
+    q_lo = q_blk[:, :, :8]   # [N, nb, 8]
+    q_hi = q_blk[:, :, 8:]   # [N, nb, 8]
+
+    lo = np.zeros((N, num_K_blks), dtype=np.int64)
+    hi = np.zeros((N, num_K_blks), dtype=np.int64)
+    for i in range(8):
+        lo |= (q_lo[:, :, i] << int(shifts[i]))
+        hi |= (q_hi[:, :, i] << int(shifts[i]))
+
+    # Extract 10 bytes: 5 from lo, 5 from hi
+    packed = np.zeros((N, num_K_blks * 10), dtype=np.uint8)
+    for j in range(5):
+        packed[:, j::10] = ((lo >> (j * 8)) & 0xFF).astype(np.uint8)
+        packed[:, 5 + j::10] = ((hi >> (j * 8)) & 0xFF).astype(np.uint8)
+
+    # Interleave scale + zero
+    sc_zero = np.empty((N, 2 * num_K_blks), dtype=np.float32)
+    sc_zero[:, 0::2] = scale
+    sc_zero[:, 1::2] = zero_i.astype(np.float32)
+
+    return packed, sc_zero
+
+
+def write_weight_int5_asym(prefix, int5_packed, sc_zero, K_in, N_out):
+    """Write asymmetric INT5 weights. 5-bit packed data + scale/zero pairs."""
+    num_K_blks = K_in // BLOCK
+    packed_row = num_K_blks * 10  # bytes per row
+    # Header: packed data has packed_row bytes per row
+    header = np.array([K_in, N_out, BLOCK, packed_row, N_out], dtype=np.int32)
+    path = f"{prefix}.int5_t"
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(int5_packed.tobytes())
+    path = f"{prefix}.sc_zero_t"
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(sc_zero.tobytes())
+    mb_data = int5_packed.nbytes / (1024*1024)
+    mb_sc = sc_zero.nbytes / (1024*1024)
+    print(f"  {prefix}: [{N_out}x{K_in}] INT5_asym data={mb_data:.1f}MB scales={mb_sc:.1f}MB")
+
+
 def write_weight_int4_asym(prefix, int4_packed, sc_zero, K_in, N_out):
     """Write asymmetric INT4 weights. Scale file stores (scale, zero) pairs."""
     num_K_blks = K_in // BLOCK
@@ -228,8 +301,8 @@ def main():
     MODEL = sys.argv[1]
     OUT = sys.argv[2]
     fmt = sys.argv[3].lower() if len(sys.argv) > 3 else 'int8'
-    if fmt not in ('int8', 'int4', 'int4_asym'):
-        print("Format must be 'int8', 'int4', or 'int4_asym'")
+    if fmt not in ('int8', 'int4', 'int4_asym', 'int5_asym'):
+        print("Format must be 'int8', 'int4', 'int4_asym', or 'int5_asym'")
         sys.exit(1)
     print(f"Quantization format: {fmt.upper()}")
 
@@ -284,7 +357,11 @@ def main():
                 continue
             W = read_tensor(tensor_map, shard_paths, tname)
             N_out, K_in = W.shape
-            if fmt == 'int4_asym':
+            if fmt == 'int5_asym':
+                int5_packed, sc_zero = quantize_per_row_int5_asym(W)
+                prefix = f"{OUT}/{layer}_{wn}"
+                write_weight_int5_asym(prefix, int5_packed, sc_zero, K_in, N_out)
+            elif fmt == 'int4_asym':
                 int4_packed, sc_zero = quantize_per_row_int4_asym(W)
                 prefix = f"{OUT}/{layer}_{wn}"
                 write_weight_int4_asym(prefix, int4_packed, sc_zero, K_in, N_out)
@@ -300,7 +377,10 @@ def main():
     print(f"\nProcessing embed_tokens...")
     W_emb = read_tensor(tensor_map, shard_paths, "model.embed_tokens.weight")
     N_out, K_in = W_emb.shape
-    if fmt == 'int4_asym':
+    if fmt == 'int5_asym':
+        int5_packed, sc_zero = quantize_per_row_int5_asym(W_emb)
+        write_weight_int5_asym(f"{OUT}/embed_tokens", int5_packed, sc_zero, K_in, N_out)
+    elif fmt == 'int4_asym':
         int4_packed, sc_zero = quantize_per_row_int4_asym(W_emb)
         write_weight_int4_asym(f"{OUT}/embed_tokens", int4_packed, sc_zero, K_in, N_out)
     elif fmt == 'int4':
