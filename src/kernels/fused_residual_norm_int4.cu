@@ -15,8 +15,8 @@ namespace blackwell {
 namespace kernels {
 namespace {
 
-constexpr int kFusedThreads = 256;
-constexpr int kFusedREPT = 8;    // elements per thread (covers H=2048 in 256 threads)
+constexpr int kFusedThreads = 512;
+constexpr int kFusedREPT = 8;    // elements per thread (covers H=4096 in 512 threads)
 constexpr int kBlockSize = 16;   // quantization block size (matches INT4 format)
 
 __device__ __forceinline__ float warp_reduce_sum_f(float val) {
@@ -69,14 +69,14 @@ __global__ void fused_residual_norm_int4_kernel(
         }
     }
 
-    // Warp-reduce sum_sq across 8 warps
+    // Warp-reduce sum_sq across 16 warps
     sum_sq = warp_reduce_sum_f(sum_sq);
 
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[16];
     if ((tid & 31) == 0) warp_sums[tid >> 5] = sum_sq;
     __syncthreads();
 
-    float block_sum = (tid < 8) ? warp_sums[tid] : 0.0f;
+    float block_sum = (tid < 16) ? warp_sums[tid] : 0.0f;
     block_sum = warp_reduce_sum_f(block_sum);
 
     __shared__ float s_rstd;
@@ -189,11 +189,11 @@ __global__ void fused_residual_norm_int4_fp32out_kernel(
 
     sum_sq = warp_reduce_sum_f(sum_sq);
 
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[16];
     if ((tid & 31) == 0) warp_sums[tid >> 5] = sum_sq;
     __syncthreads();
 
-    float block_sum = (tid < 8) ? warp_sums[tid] : 0.0f;
+    float block_sum = (tid < 16) ? warp_sums[tid] : 0.0f;
     block_sum = warp_reduce_sum_f(block_sum);
 
     __shared__ float s_rstd;

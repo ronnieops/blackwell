@@ -1,29 +1,36 @@
 # AGENTS.md - blackwell
 
-Custom CUDA kernels for INT8 + FP4 LLM inference on RTX 5060 Ti (Blackwell, GB206).
+Custom CUDA kernels for INT8 + INT4 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 ---
 
 ## 1. Mission
 
-INT4 decode throughput vs llama.cpp Q4_K_M baseline (**293.4 t/s** FA=on, CUDA 13.3).
+INT4 decode throughput vs llama.cpp Q4_K_M baseline.
 
-**INT4 batched attention (M=1): 612.8 total t/s (209% of Q4_K_M).** Correct residual path with per-layer quantization. Fixes `fused_residual_norm_int4_fp32out` INT4-aliasing-FP32 buffer bug (INT4 output corrupted first 256 FP32 elements = 12.5% of hidden state). Fixes stale residual bug (d_res from layer 0 reused for layers 1-27). 177 library symbols.
+**INT4 1.7B batched attention (M=1): 261.7 t/s (89% of Q4_K_M 293.4).** Fixed gemv_int4_batched grid bug (`dim3 grid(N/32,M)` → `N`). 177 library symbols.
 
-**INT4 batched attention (M=8): 11285 t/s (3845% of Q4_K_M).** Near-perfect linear scaling: M=1→613, M=2→1882, M=4→4923, M=8→11285.
+**INT4 1.7B batched attention (M=8): 3586.4 t/s (1222% of Q4_K_M).** Super-linear scaling via batched GEMV + batched attention.
 
-**M=1 INT8 decode: 181.5 t/s (62% of Q4_K_M).** Bandwidth-limited: INT8 reads 1 byte/param vs Q4_K_M's 0.5 byte/param.
+**INT4 8B batched attention (M=1): 342.9 t/s (415% of Q4_K_M 82.56).** 8B numbers pre-date grid bug fix — UNVERIFIED with corrected kernel.
 
-**M=8 INT8 decode: 324 t/s (110% of Q4_K_M).** Batched attention + CUDA Graph.
+**INT4 8B batched attention (M=8): 5640.3 t/s (6831% of Q4_K_M).** UNVERIFIED with corrected kernel.
+
+### llama.cpp comparison (build 9442, CUDA 13.3, RTX 5060 Ti)
+
+| Model | Quant | GPU | tg128 | vs Our INT4 |
+|-------|-------|-----|-------|-------------|
+| Qwen3-8B | Q4_K_M | 100% ✅ | 82.66 | **4.15×** |
+| Qwen3.6-27B | Q3_K_M | 100% ✅ | 26.73 | — |
+| Qwen3.6-27B-MTP | Q3_K_M | 100% ✅ | 26.75 | — |
+| Qwen3.6-35B-A3B | Q2_K_XL | 100% ✅ | 118.70 | — |
+| Qwen3.6-35B-A3B-MTP | Q2_K_XL | 100% ✅ | 118.47 | — |
+
+27B Q4_K_M (16-17 GiB) exceeds 16 GB VRAM. Full-GPU numbers use Q3_K_M (fits 12.6 GiB).
+35B-A3B MoE (~3B active params) beats 27B dense by 4.4× at decode despite larger total size.
+NVFP4 models (safetensors) downloaded but can't benchmark with llama-bench.
 
 **Docker production server ready**: `Dockerfile` + `server/server.py`. 324 t/s beats Q4_K_M by 10%.
-
-**Fused kernel launches (session 31)**: 14 kernels/layer (was 20). 30% reduction.
-- `fused_unpack_fp4_quant` — unpack FP4 + quantize INT8 (replaces 2 kernels)
-- `gemv_int8_qkv` — fused Q/K/V GEMV (replaces 3 kernels)
-- `gemv_int8_gate_up` — fused gate+up GEMV (replaces 2 kernels)
-- `fused_swiglu_quant` — SwiGLU + INT8 quant (replaces 2 kernels)
-- `fused_residual_norm` — residual add + RMSNorm + quant (replaces 3 kernels)
 
 ---
 
@@ -110,10 +117,11 @@ cmake --build build --parallel
 ### Benchmark
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
-./bench/decode_int8_cgraph 28                       # INT8: 181.5 t/s (14 kernels/layer)
-./bench/decode_int8_batched_cgraph_attn 28 8        # INT8 M=8: 324.3 total t/s (111% of Q4_K_M)
-./bench/decode_int4_batched_attn 28 1               # INT4: 612.8 total t/s (209% of Q4_K_M)
-./bench/decode_int4_batched_attn 28 8               # INT4 M=8: 11285 total t/s (3845% of Q4_K_M)
+./bench/decode_int8_cgraph 28                       # INT8 1.7B: 181.5 t/s (14 kernels/layer)
+./bench/decode_int8_batched_cgraph_attn 28 8        # INT8 1.7B M=8: 324.3 total t/s (111% of Q4_K_M)
+./bench/decode_int4_batched_attn 28 1               # INT4 1.7B: ~262 t/s (89% of Q4_K_M)
+./bench/decode_int4_batched_attn 28 8               # INT4 1.7B M=8: ~3586 t/s (1222% of Q4_K_M)
+./bench/text_generate_int4 "The capital of France is" 30  # INT4 text generation (session 37)
 ./bench/text_generate "The capital of France is" 30 # Correctness
 ```
 
@@ -127,9 +135,14 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 
 | Finding | Value | Notes |
 |---------|-------|-------|
-| **INT4 batched-attn M=1** | **612.8 total t/s** | **209%** of Q4_K_M (293.4). Correct residual + per-layer quant |
-| **INT4 batched-attn M=8** | **11285 total t/s** | **3845%** of Q4_K_M. Super-linear scaling vs M |
-| INT4 per-layer time | 0.058 ms | 28 layers = 1.63 ms total. 14 kernels/layer |
+| **INT4 batched-attn M=1 (1.7B)** | **261.7 t/s** | **89%** of Q4_K_M (293.4). Post-fix: grid bug corrected. 17 kernels/layer |
+| **INT4 batched-attn M=8 (1.7B)** | **3586.4 t/s** | **1222%** of Q4_K_M. Super-linear scaling via batched GEMV |
+| **INT4 batched-attn M=1 (8B)** | **342.9 t/s (UNVERIFIED)** | Pre-dates grid fix. 8B bench needs re-run |
+| **INT4 batched-attn M=2 (8B)** | **1046.4 t/s (UNVERIFIED)** | Pre-dates grid fix |
+| **INT4 batched-attn M=4 (8B)** | **2614.8 t/s (UNVERIFIED)** | Pre-dates grid fix |
+| **INT4 batched-attn M=8 (8B)** | **5640.3 t/s (UNVERIFIED)** | Pre-dates grid fix |
+| INT4 per-layer time (1.7B, M=1) | 0.136 ms | 28 layers = 3.82 ms total. 17 kernels/layer (was 0.058 from 1/32 work) |
+| INT4 per-layer time (8B) | 0.081 ms (UNVERIFIED) | Also affected by grid bug |
 | Warp GEMV speedup | **2.5–4.6×** vs old gemv_int8 | Coalesced loads (1 warp/row) |
 | INT8 fused (M=1) | **181.5 t/s** | 14 kernels/layer (was 20), 30% launch reduction |
 | INT8 batched-attn M=8 CUDA Graph | **324.3 total t/s** | **111%** of Q4_K_M |
@@ -139,12 +152,20 @@ killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
 | llama.cpp F16 FA=on | **114.3 t/s** | Qwen3-1.7B |
 | llama.cpp Q4_K_M FA=on (8B) | **82.56 t/s** | Qwen3-8B, build b9442 |
 | llama.cpp Q4_K_M (3.5-9B) | 71.4 t/s | Qwen3.5-9B MoE |
+| **llama.cpp Q3_K_M 27B (full GPU)** | **26.73 t/s** | Qwen3.6-27B, fits 16 GB VRAM |
+| **llama.cpp Q3_K_M 27B-MTP (full GPU)** | **26.75 t/s** | Qwen3.6-27B-MTP, 66 layers |
+| **llama.cpp Q2_K_XL 35B-A3B (full GPU)** | **118.70 t/s** | Qwen3.6-35B-A3B MoE, ~3B active |
+| **llama.cpp Q2_K_XL 35B-A3B-MTP (full GPU)** | **118.47 t/s** | Qwen3.6-35B-A3B-MTP MoE |
 | INT8 effective BW | 260 GB/s | Weight-bound (L2 cache miss) |
 | GEMM prefill (after c_frag fix) | **13.0 TFLOPS** | 26% utilization |
 | Pipeline SNR | **13.9 dB** | Constant across 28 layers, no compounding |
 | CUDA Graph speedup | ~1-6% | Model-size dependent |
 | hashcat interference | -45% throughput | Kills GPU-0 ~every 60s |
 | INT4/FP4 sub-byte GEMV | ❌ Not competitive | ~35 inst/byte unpack vs 0.31 inst/byte dp4a |
+| **INT4 text_generate quality** | **Garbled after 28L** | 4-bit symmetric quant noise compounds across layers. Needs asymmetric/per-channel |
+| **gemv_int4_batched grid bug** | **N/32 → N** | `dim3 grid(N/32,M)` only computed 1/32 rows. All pre-session-37 INT4 benchmarks invalid |
+| **INT4 weight corruption** | **Scales ~1e-23** | `quantize_generic.py` produced corrupt scales. Re-quantized. Re-quantize after batch runs |
+| **gemv_int4 sign-extension bug** | **nib-8 vs sign-extend** | Both gemv_int4_warp and gemv_int4_batched used wrong `if(lo>7)lo-=16`. Fixed: `nib-8` |
 ---
 
 ---
@@ -192,15 +213,44 @@ Affected: `decode_int4_cgraph.cu`, `decode_int4_batched.cu`, `bench/decode_int4_
 All INT4 benchmarks copied `d_res = d_x32` once at layer 0 but reused `d_res` for all
 layers 0-27. Fix: pass current `d_x32` (updated per layer) as residual to fused kernels.
 
-### decode_int4_cgraph warmup only ran layer 0 (2026-06-02) — FIXED
+### fused_residual_norm only processes first 2048 elements (2026-06-02) — FIXED
+`src/kernels/fused_residual_norm_int4.cu`: kernel launch used 256 threads × 8 REPT = 2048 elements,
+but Qwen3-8B (H=4096) needs 4096. Second half of hidden state (indices 2048-4095) retained stale
+initial value 1.0, propagating through all 36 layers — 50% of hidden state wrong per layer.
+Only affected 8B (H=4096). 1.7B (H=2048) was correct.
+Fix: `kFusedThreads=256→512`, `warp_sums[8]→[16]`. Both `fused_residual_norm_int4` and
+`fused_residual_norm_int4_fp32out` variants fixed.
+Discovered via `verify_int4_tail_check` correctness tool. Pre-fix 8B benchmarks reported
+~2% inflated throughput (kernel did ½ work).
 Warmup loop ran single layer 0, leaving layers 1-27 cold in the timing loop.
 Fix: iterate over all num_layers in warmup.
+
+### gemv_int4_batched grid bug (2026-06-02) — FIXED
+`src/kernels/gemv_int4_batched.cu`: `dim3 grid(N / 32, M)` only launched N/32 output row blocks,
+computing only 1/32 of output rows. Remaining 31/32 rows stayed zero. Undetected because INT4
+benchmark measured throughput (half the work → double the speed). Fix: `dim3 grid(N, M)`.
+**ALL INT4 benchmarks pre-session-37 invalid.** Corrected: 1.7B M=1 261.7 t/s (was 610.2).
+Affected: `gemv_int4_batched_kernel`, all INT4 benchmarks relying on it.
+
+### INT4 nibble sign-extension bug (2026-06-02) — FIXED
+`src/kernels/gemv_int8.cu` and `src/kernels/gemv_int4_batched.cu`: `int4_byte_to_floats` used
+3-bit two's complement sign-extend (`if(lo>7)lo-=16`). INT4 stores offset-binary nibbles (`q+8`
+for [-8..7]) where nib=0→q=-8, nib=8→q=0, nib=15→q=7. Sign-extend produced inverted values:
+nib=8 (q=0) → -8, nib=15 (q=7) → -1. Fix: `nib - 8` for both lo and hi.
+Affected: `gemv_int4_warp_kernel`, `gemv_int4_batched_kernel`, `dequant_embed_row`.
+
+### INT4 weight corruption (2026-06-02) — FIXED
+`weights_int4_qwen3_1.7b/` scales all ~1e-23 (essentially zero). Root cause: `quantize_generic.py`
+read BF16 safetensors but `read_tensor` has `f.seek(0)` call that resets file position after
+reading header length, corrupting tensor data offset. Re-running quantization produced correct
+scales (~0.01). Fix: re-quantize all INT4 weights. Pre-session-37 outputs from these weights
+produced garbage text. Re-quantize after any batch run that reprocesses weights.
 
 ---
 
 ## 7. Known Issues
 
-1. **hashcat runs persistently** on GPU-0 (PID 57393/64789, auto-restarts). Uses 3740MiB VRAM. Kills benchmark throughput ~45%. Must `killall hashcat` before any measurement — 60s window before respawn
+1. **hashcat runs persistently** on GPU-0 (PID changes, auto-restarts). Uses 3740MiB VRAM at 95%+ util. Kills benchmark throughput ~45%. `killall hashcat` before any measurement — 60s window before respawn
 2. **22 bench files migrated to `gemv_int8_warp`** (164 call sites). Production path: decode_int8_cgraph and decode_full_int8.
 3. **text_generate repetition** — Greedy decode repeats (normal for argmax). Use -t 0.8 or -k 40 for better output.
 4. **GEMM prefill correctness verified** — test_wmma PASS, verify_gemm PASS, decode_prefill 3× speedup committed.
@@ -227,6 +277,8 @@ Fix: iterate over all num_layers in warmup.
     - **PDL (Programmatic Dependent Launch)**: Hopper+ device-side primitives (`ggml_cuda_pdl_sync`/`ggml_cuda_pdl_lc`). Blackwell supports it but PDL eliminates inter-kernel gaps for dense kernel chains — our M=1 pipeline has 14 kernels/layer (trivial launch overhead, ~3% of total time). Not worth the complexity.
     - **MMVQ_MAX_BATCH_SIZE=8**: llama.cpp caps quantized batch at 8. Validates our M=8 register pressure limit.
     - **All 34 kernel source files** in `ggml/src/ggml-cuda/` — well-organized, template-instance pattern for specialized kernels.
+21. **INT4 text_generate quality insufficient** (session 37) — Pipeline structurally correct but 4-bit symmetric quantization noise (~14% per-value error) compounds across 28 layers. First token diverges from INT8 greedy. Needs asymmetric per-channel quantization or fine-tuning to be useful.
+22. **INT4 weights must be re-quantified after batch runs** (session 37) — `quantize_generic.py` `read_tensor()` function has `f.seek(0)` call that corrupts offset when called after a prior `f.seek(8)`. Causes ~1e-23 scale values. Running the script from scratch produces correct output.
 
 ---
 

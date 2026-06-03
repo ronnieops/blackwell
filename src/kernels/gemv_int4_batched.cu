@@ -20,8 +20,10 @@ namespace {
 
 // Unpack 1 byte (2 INT4 nibbles) to 2 floats
 __device__ __forceinline__ void int4_byte_to_floats(uint8_t b, float& f0, float& f1) {
-    int lo = b & 0x0F; if (lo > 7) lo -= 16;
-    int hi = (b >> 4) & 0x0F; if (hi > 7) hi -= 16;
+    // Nibble stores q+8 (offset-binary, [0..15] for [-8..7]).
+    // Convert back: val = nib - 8.
+    int lo = (b & 0x0F) - 8;
+    int hi = ((b >> 4) & 0x0F) - 8;
     f0 = static_cast<float>(lo);
     f1 = static_cast<float>(hi);
 }
@@ -112,7 +114,7 @@ cudaError_t gemv_int4_batched(
     if (K % 16 != 0 || N % 32 != 0 || M < 1)
         return cudaErrorInvalidValue;
 
-    dim3 grid(N / 32, M);
+    dim3 grid(N, M);
     gemv_int4_batched_kernel<<<grid, 32, 0, stream>>>(
         y_out, x_packed, x_scale, W_packed, W_scale, K, N, M);
     return cudaPeekAtLastError();
