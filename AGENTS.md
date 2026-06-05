@@ -221,6 +221,7 @@ Each layer uses per-layer RMSNorm weights (`{L}_input_layernorm.f32`, `{L}_post_
 - **Works**: Graph captures, instantiates, replays correctly
 - **Result**: 9.4ms/tok with head_norm/RoPE — same as per-kernel
 - **Reason**: Benchmark's 575 t/s omits head_norm + RoPE (4 extra kernels/layer). With correct model, CUDA Graph provides no speedup over per-kernel.
+- **head_norm+RoPE fusion**: No speedup (141 vs 140 t/s, +0.7%). Element-wise ops negligible vs GEMV. Kernel kept for reference, not used in production.
 - **Deferred**: CUDA Graph for server. Per-kernel path is fast enough (~106 t/s).
 
 ---
