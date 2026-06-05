@@ -197,7 +197,7 @@ bench/text_generate.cu             # End-to-end correctness
 | HTTP /v1/models | ✅ |
 | hashcat killed | ✅ |
 | 8B batched KV cache fix | ✅ | 41 t/s M=8 28L |
-| Docker build | ✅ | blackwell-server:v0.4.0 |
+| Docker build + push | ✅ | `ghcr.io/ronnieops/blackwell-server:v0.4.0` pushed |
 
 ---
 
@@ -210,7 +210,7 @@ bench/text_generate.cu             # End-to-end correctness
 | active components | server/inference_server (v0.4.0), http_subprocess, decode_int8_nofp4 benchmark, decode_int8_batched_cgraph_attn_qwen3_8b |
 | last_build | 2026-06-05 06:00 |
 | disk_usage | 58% (100 GB free) after cleanup |
-| docker_image | blackwell-server:v0.4.0 (4.13 GB) |
+| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.4.0` (4.13 GB) |
 
 ---
 
