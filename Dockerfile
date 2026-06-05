@@ -1,41 +1,45 @@
-# Dockerfile — Blackwell INT8 Inference Server
+# Dockerfile — Blackwell INT8 NOFP4 Inference Server
 #
-# text_generate statically links CUDA 13.3 (cudart + curand) via the .a archive.
-# No CUDA runtime needed at container level — only nvidia-container-toolkit
-# providing the kernel-mode driver (libcuda.so).
+# C++ only: http_subprocess + inference_server binary
+# Correct model: per-layer RMSNorm, Q/K head norms, RoPE
 #
 # Build:
-#   docker build -t blackwell-inference .
+#   docker build -t blackwell-server .
 #
-# Run (requires nvidia-container-toolkit on host):
-#   docker run --gpus all -p 8080:8080 blackwell-inference
+# Run (requires nvidia-container-toolkit):
+#   docker run --gpus all -p 8080:8080 blackwell-server
 #
 # Test:
-#   curl -X POST http://localhost:8080/generate \
+#   curl -X POST http://localhost:8080/v1/completions \
 #     -H 'Content-Type: application/json' \
-#     -d '{"prompt":"The capital of France is","max_tokens":30}'
+#     -d '{"prompt":"The capital of France is","max_tokens":10}'
 
 FROM ubuntu:24.04
 
-LABEL description="Blackwell INT8 Inference — RTX 5060 Ti"
-LABEL version="0.1.0"
+LABEL description="Blackwell INT8 NOFP4 — RTX 5060 Ti, correct model"
+LABEL version="0.4.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    python3 \
-    python3-pip \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy CUDA runtime library from host
+# nvidia-container-toolkit provides driver but NOT cudart
+COPY cuda-libs/libcudart.so.13* /usr/local/lib/
 
 WORKDIR /app
 
 COPY bench/text_generate /app/bin/
 COPY tokenizer_data.bin /app/
 COPY weights_int8_bf16 /app/weights_int8_bf16
+COPY server/http_subprocess /app/bin/
 COPY server/inference_server /app/bin/
-COPY server/server.py /app/server.py
+
+RUN ldconfig
 
 EXPOSE 8080
 
 ENV CUDA_VISIBLE_DEVICES=0
 
-CMD ["python3", "/app/server.py"]
+CMD ["/app/bin/http_subprocess", "8080", "1.7b"]

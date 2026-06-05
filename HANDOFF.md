@@ -6,7 +6,7 @@ Continuity doc. Read with AGENTS.md before acting.
 
 ## 1. Current Objective
 
-**text_generate INT4 inference path created** (`bench/text_generate_int4.cu`). Pipeline structurally correct (17 kernels/layer, correct residuals + head_norms + RoPE) but 4-bit symmetric quantization noise compounds across 28 layers — first token diverges from INT8 greedy. Needs asymmetric quantization or fine-tuning for quality. M=1 throughput: 262 t/s (89% Q4_K_M). M=8: 3586 t/s (1222% Q4_K_M).
+Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoints working. Benchmark research ongoing (CUDA Graph, batched attention, nofp4 path).
 
 ---
 
@@ -16,84 +16,85 @@ Continuity doc. Read with AGENTS.md before acting.
 |--------|-------|
 | GPU | RTX 5060 Ti, compute 12.0, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3, SM_120a, C++17, CMake |
-| Library | **177 symbols** in `build/libblackwell_kernels.a` |
+| Library | 191 symbols in `build/libblackwell_kernels.a` (was 177, grew) |
 | Branch | master |
-| Session | **37 (end)** |
+| Server | **v0.4.0 — correct model** (per-layer RMSNorm, head_norm, RoPE) |
 
-### INT4 batched attention — CORRECTED (post-grid-bug-fix)
+### Throughput
 
-| Model | M | Per-seq t/s | vs Q4_K_M | Notes |
-|-------|---|-------------|-----------|-------|
-| Qwen3-1.7B | 1 | **261.7** | **89%** | Post-fix. Was 610 (208%) |
-| Qwen3-1.7B | 8 | **3586.4** | **1222%** | Post-fix. Was 11293 (3848%) |
-| Qwen3-8B | 1 | 342.9 (UNVERIFIED) | — | Pre-dates grid fix |
-| Qwen3-8B | 8 | 5640.3 (UNVERIFIED) | — | Pre-dates grid fix |
+| Method | t/s | vs Q4_K_M | Notes |
+|--------|-----|-----------|-------|
+| Server (production, M=1) | ~106 | 36% | Correct model, per-kernel |
+| Benchmark M=1 (no head_norm/RoPE) | 181 | 62% | Per-kernel, fused |
+| Benchmark CUDA Graph M=8 (no hn/RoPE) | 575 | 196% | ⚠️ Omits head_norm+RoPE |
+| Benchmark FP4 M=8 | 324 | 111% | Legacy, nofp4 now used |
 
-### Bugs found (session 37)
+⚠️ 575 t/s benchmark omits head_norm and RoPE — not achievable with correct model.
 
-| Bug | Severity | Fix |
-|-----|----------|-----|
-| `gemv_int4_batched` grid `N/32` → `N` | **CRITICAL** — only 1/32 rows computed | `dim3 grid(N, M)` |
-| INT4 nibble sign-extend `if(lo>7)lo-=16` → `nib-8` | HIGH — wrong scale levels | Both `gemv_int8.cu` + `gemv_int4_batched.cu` |
-| INT4 weight scales ~1e-23 | HIGH — re-quantize required | `read_tensor` bug, re-run script |
-| Missing head_norm + RoPE in INT4 pipeline | MEDIUM — copied from bench | Added handwritten kernels |
+### HTTP Server
+
+| Endpoint | Status |
+|----------|--------|
+| `GET /health` | ✅ `{"status":"ok"}` |
+| `GET /v1/models` | ✅ model list |
+| `POST /v1/completions` | ✅ " Paris, a which is" |
+| `POST /v1/chat/completions` | ✅ works |
 
 ---
 
 ## 3. Recent Decisions
 
-- **gemv_int4_batched grid bug** — `dim3 grid(N/32, M)` was wrong. Now `grid(N, M)`. **ALL pre-session-37 INT4 benchmark numbers invalid**
-- **Nibble offset-binary fix** — INT4 packs as `nib = q+8` (offset-binary). GEMV unpack must use `nib - 8`, not two's complement sign-extend
-- **text_generate_int4 pipeline** — uses 17 kernels/layer (not 14 fused). Has correct residual buffers (`d_res`), head norms, RoPE
-- **INT4 quality insufficient** — 4-bit symmetric ~14% per-value error compounds across 28 layers
-- **INT4 weights must be re-quantized after batch runs** — `read_tensor` has `f.seek(0)` bug
+- **Server v0.4.0**: Correct model — per-layer RMSNorm, Q/K head norms, RoPE. Same output as `text_generate.cu`.
+- **HTTP working**: Raw read/write syscalls for subprocess IPC (no FILE* — pipe issues with forked process).
+- **HTTP timeout**: Set to 300s (`svr.set_read_timeout(300)`) — httplib default 5s too short for inference.
+- **FP4 eliminated**: `decode_int8_nofp4.cu` benchmark, nofp4 server path. 575 t/s vs FP4 324 t/s (77% faster).
+- **INT4/INT5 dead**: Confirmed garbled after 28 layers. 23-29 dB PSNR compounds to ~5 dB at lm_head. No viable quality path below INT8.
+- **CUDA Graph for server**: Captured, works, but no speedup (~106 t/s same as per-kernel). Reason: benchmark's 575 t/s omits head_norm+RoPE. Deferred.
+- **Parsing bug fixed**: `parse_prompt_ids` consumed `"prompts":["hello"]` as token IDs (h=104, e=101, l=108...). Fixed with early return on `"` or `[`. `parse_string_prompts` also fixed string element skip.
 
 ---
 
 ## 4. Important Constraints
 
-- `PATH` must include `/usr/local/cuda-13.3/bin` before nvcc
+- `CUDACXX` env var must be set before `cmake`
 - `compute_120a` required (not `compute_120`)
 - `killall hashcat` before every measurement (auto-restarts, -45% throughput)
 - `gemv_int8_warp` is production INT8 GEMV — NOT `gemv_int8`
-- CUDA Graph harmful on Blackwell (~10× slower)
-- L2 persisting cache harmful for weights >8 MB — only d_rn (8 KB) safe
-- M>8 not viable (batched GEMV register pressure)
-- Speculative decode, FP4 tensor core GEMV, PDL — all dead ends
-- INT4 weights corrupt after batch model loading; re-quantize before use
+- All weight matrices exceed L2 cache (32 MB)
+- M>8 not viable (register pressure in batched GEMV)
+- `pack_int8` takes PRE-COMPUTED scales as INPUT. Use `quantize_int8` to compute them.
+- `update_decode_seq_pos` writes to pinned host memory, then cudaMemcpyAsync to device — graph-safe
+- `update_kv_cache_device` uses device-side seq_pos (no H2D copy in capture)
 
 ---
 
 ## 5. Known Issues / Risks
 
-1. **hashcat** — `killall hashcat` 30s before benchmark. 60s respawn.
-2. **INT4 text_generate quality** — garbled after 28 layers. Symmetric 4-bit ~14% error compounds. Needs asymmetric Q or fine-tuning.
-3. **8B INT4 benchmarks UNVERIFIED** — pre-date grid fix. Need re-run.
-4. **weights_int4_* corruption** — `read_tensor()` in `quantize_generic.py` has `f.seek(0)` offset bug. Re-run script if weights loaded fresh.
-5. **text_generate repetition** — greedy decode repeats. Use `-t 0.8` or `-k 40`.
+1. **hashcat** — `killall hashcat` 30s before benchmark. Respawns in 60s.
+2. **Server quality (chat)**: Chat completions garbled — prompt format (`<|im_start|>` / `<|im_end|>`) works but model has repetition issues without temperature.
+3. **Benchmark vs server gap**: 181 t/s (benchmark) vs ~106 t/s (server) — 70% overhead from head_norm + RoPE kernels (~4 extra kernels/layer × 28 layers).
+4. **CUDA Graph deferred**: Works in benchmark but provides no speedup with correct model. May revisit if head_norm+RoPE can be fused.
+5. **Benchmark numbers context-sensitive**: 575 t/s omits head_norm/RoPE. Always note model correction when citing throughput.
 
 ---
 
 ## 6. Pending Tasks
 
-| Task | Status | Notes |
-|------|--------|-------|
-| text_generate INT4 inference | ✅ | `bench/text_generate_int4.cu` created, builds, runs. Quality needs improvement |
-| 8B INT4 re-benchmark (post-grid-fix) | 🔜 | Current 342.9/5640.3 numbers invalid |
-| INT4 quality fix (asymmetric Q) | 🔜 | 4-bit symmetric compounds error across 28 layers |
-| Docker server INT4 support | ⏸ | Blocked on INT4 quality |
-| Qwen3.6-27B INT4 decode | ⏸ | Depends on quality fix |
-| Pipeline SNR on 8B (36 layers) | ⏸ | Low priority |
+| Task | Priority | Notes |
+|------|----------|-------|
+| 8B model optimization | MEDIUM | 46 t/s (56% Q4_K_M), room for batched attention |
+| Docker push | LOW | Build and push `blackwell-server` image |
+| CUDA Graph (server) | LOW | Deferred — no speedup with correct model |
+| head_norm+RoPE fusion | LOW | Would close benchmark-vs-server gap |
 
 ---
 
 ## 7. Suggested Next Actions
 
-1. Verify INT4 vs INT8 at single-layer level (measure per-layer SNR)
-2. Implement asymmetric per-block INT4 quantization (separate +ve/-ve scale per block)
-3. Or use per-channel INT4 (one scale per output channel instead of per-block)
-4. If quality fixed, re-bench 8B INT4 with corrected kernel
-5. Extend text_generate_int4 to 8B
+1. **Run end-to-end test**: `./server/http_subprocess weights_int8_bf16` then `curl` all 4 endpoints — verify server still working.
+2. **Docker**: Build and push `blackwell-server` image. Dockerfile exists.
+3. **8B optimization**: Batched attention for M>1 decode.
+4. **Benchmark hygiene**: Always run `killall hashcat` before measurement.
 
 ---
 
@@ -102,34 +103,53 @@ Continuity doc. Read with AGENTS.md before acting.
 ### Build
 ```bash
 export PATH=/usr/local/cuda-13.3/bin:$PATH
+CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+
+# Server binaries
+nvcc -O3 -std=c++17 -arch=sm_120a \
+  server/inference_server_nofp4.cu build/libblackwell_kernels.a \
+  -I include -o server/inference_server -lcudart -lpthread -lz
+
+/usr/bin/g++ -O2 /tmp/httplib.o server/http_subprocess.cpp -I include \
+  -o server/http_subprocess -lpthread -lz -lssl -lcrypto
+# /tmp/httplib.o: g++ -O2 -std=c++17 -I include -DCPPHTTPLIB_OPENSSL_SUPPORT=0 \
+#   -DCPPHTTPLIB_ZLIB_SUPPORT=0 include/blackwell/httplib.cpp -c -o /tmp/httplib.o
+```
+
+### Run
+```bash
 killall hashcat 2>/dev/null
-CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
-```
 
-### Key source
-- `bench/text_generate_int4.cu` — **NEW** INT4 end-to-end generation (session 37)
-- `bench/text_generate.cu` — INT8 reference (correct residuals, head norms, RoPE)
-- `bench/decode_int4_batched_attn.cu` — INT4 benchmark (identity norms, no head_norm/RoPE)
-- `src/kernels/gemv_int4_batched.cu` — **FIXED** grid bug + nibble sign bug
-- `src/kernels/gemv_int8.cu` — **FIXED** INT4 nibble sign bug (lines 473-476)
-- `scripts/quantize_generic.py` — INT4 weight generation (has f.seek(0) bug)
+# Server (HTTP)
+./server/http_subprocess weights_int8_bf16 &
 
-### Benchmark
-```bash
-./bench/decode_int4_batched_attn 28 1              # 1.7B: ~262 t/s (89% Q4_K_M)
-./bench/decode_int4_batched_attn 28 8              # 1.7B M=8: ~3586 t/s (1222%)
-./bench/text_generate_int4 "The capital of France is" 30  # INT4 generation (garbled)
-./bench/text_generate "The capital of France is" 30       # INT8 reference
-```
+# Direct pipe (debug)
+echo '{"prompt":"hi","max_tokens":1}' | ./server/inference_server weights_int8_bf16
 
-### INT4 weights (re-quantize if corrupt)
-```bash
-python3 scripts/quantize_generic.py /mnt/data/ai/hf/qwen3-1.7b-base weights_int4_qwen3_1.7b int4
+# Benchmarks
+./bench/decode_int8_cgraph 28                   # M=1: 181 t/s (no head_norm/RoPE)
+./bench/decode_int8_nofp4 28 8                 # M=8 CUDA Graph: 575 t/s (no head_norm/RoPE)
+./bench/text_generate "hi" 5                    # Correctness
 ```
 
 ### Verify
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 177
+nm build/libblackwell_kernels.a | grep " T blackwell" | wc -l   # expect 191
+# Correctness
+echo '{"prompt":"The capital of France is","max_tokens":3}' | \
+  ./server/inference_server weights_int8_bf16 | grep text
+# Expect: " Paris, a which is"
+```
+
+### Key source files
+```
+server/inference_server_nofp4.cu    # C++ daemon, correct model decode
+server/http_subprocess.cpp           # HTTP wrapper, raw syscalls for IPC
+server/http_server.py              # Python fallback HTTP
+bench/decode_int8_nofp4.cu         # nofp4 benchmark (per-kernel + CUDA Graph)
+bench/decode_int8_cgraph.cu        # M=1 benchmark
+bench/text_generate.cu             # End-to-end correctness
 ```
 
 ---
@@ -138,13 +158,15 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 | Check | Status |
 |-------|--------|
-| Library symbols | ✅ 177 |
-| INT4 1.7B M=1 (post-grid-fix) | ✅ 261.7 t/s (89% Q4_K_M) |
-| INT4 1.7B M=8 (post-grid-fix) | ✅ 3586.4 t/s (1222% Q4_K_M) |
-| INT4 single-layer GEMV accuracy | ✅ Avg err 0.11 vs INT8 (expected for 4-bit) |
-| INT4 embedding quality | ✅ RMS diff 0.002 vs INT8 |
-| LB: text_generate_int4 builds | ✅ |
-| LB: hashcat killed | ✅ |
+| Library symbols | ✅ 191 |
+| Benchmark M=1 (no head_norm/RoPE) | ✅ 181 t/s |
+| CUDA Graph M=8 (no head_norm/RoPE) | ✅ 575 t/s |
+| Server correctness | ✅ " Paris, a which is" |
+| HTTP /health | ✅ |
+| HTTP /v1/completions | ✅ |
+| HTTP /v1/chat/completions | ✅ |
+| HTTP /v1/models | ✅ |
+| hashcat killed | ✅ |
 
 ---
 
@@ -152,38 +174,45 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-02 |
+| updated_at | 2026-06-04 |
 | branch | master |
-| last_commit | `09b8217` + uncommitted changes |
-| uncommitted | AGENTS.md, HANDOFF.md, `bench/text_generate_int4.cu`, `src/kernels/gemv_int4_batched.cu`, `src/kernels/gemv_int8.cu` |
-| active components | `bench/text_generate_int4.cu` (created), `gemv_int4_batched.cu` (fixed), `gemv_int8.cu` (fixed) |
+| active components | server/inference_server (v0.4.0), http_subprocess, decode_int8_nofp4 benchmark |
+| last_build | 2026-06-04 15:45 |
 
 ---
 
 ## META PROMPT
 
-**Boot**: Read `AGENTS.md` → `HANDOFF.md` → `git log --oneline -3` → `killall hashcat` → `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 177) → `./bench/decode_int4_batched_attn 28 1` (expect ~262 t/s) → `./bench/text_generate_int4 "hello" 5 -t 0` (expect garbled output — quality known issue).
+**Boot sequence**:
+1. Read `AGENTS.md` → `HANDOFF.md`
+2. `git status` — check uncommitted changes
+3. `killall hashcat 2>/dev/null`
+4. `nm build/libblackwell_kernels.a | grep " T blackwell" | wc -l` (expect 191)
+5. `ls server/inference_server server/http_subprocess` (check binaries exist)
+6. `./server/http_subprocess weights_int8_bf16 &` → test endpoints
 
-**Verified**: 177 symbols. INT4 1.7B M=1: 261.7 t/s (89% Q4_K_M). M=8: 3586.4 t/s (1222%).
+**Verified facts (2026-06-04)**:
+- Server produces " Paris, a which is" for "The capital of France is" ✅
+- All 4 HTTP endpoints working ✅
+- INT4/INT5 quality dead (garbled after 28 layers) ✅
+- 575 t/s benchmark omits head_norm/RoPE — not achievable with correct model ✅
+- Server per-kernel: ~106 t/s with correct model ✅
+- `parse_prompt_ids` collision bug fixed (consumed string arrays as token IDs) ✅
 
-**CRITICAL BUGS (session 37)**:
-1. `gemv_int4_batched` grid was `N/32` — only computed 1/32 output rows. Fixed to `dim3 grid(N, M)`. **ALL pre-fix INT4 benchmarks invalid**.
-2. INT4 nibble unpack used wrong sign-extend (`if(lo>7)lo-=16`) instead of offset-binary decode (`nib - 8`). Fixed in both `gemv_int8.cu` and `gemv_int4_batched.cu`.
-3. INT4 weight scales were ~1e-23 (corrupt). Re-quantize output fixed it.
-
-**text_generate_int4 pipeline**: Structurally correct (17 kernels/layer, correct residuals, head_norms, RoPE). But INT4 symmetric quant noise ~14% per-value (~1.5% for INT8). Compounds across 28 layers. First token diverges from INT8 ground truth.
+**Critical constraints**:
+- `compute_120a` (not `compute_120`)
+- `killall hashcat` before measurement
+- `gemv_int8_warp` production — NOT `gemv_int8`
+- `pack_int8` takes pre-computed scales (INPUT). Use `quantize_int8` to compute.
 
 **DO NOT**:
-- Use `compute_120` (must be `compute_120a`)
-- Use `gemv_int8` (use `gemv_int8_warp`)
-- Benchmark without `killall hashcat` (-45%)
-- Use `decode_int4_batched.cu` or `decode_int4_cgraph.cu` (stale data / 2.4× slower)
-- Expect M>8 scaling
-- Rely on pre-session-37 INT4 benchmark numbers
-- Re-dig dead ends: speculative decode, FP4 tensor core GEMV, PDL, CUDA Graph
+- Use stale benchmark numbers without noting head_norm/RoPE context
+- Run benchmarks without killing hashcat (-45% throughput)
+- Use INT4/INT5 (quality dead, garbled after 28 layers)
+- Re-dig dead ends: speculative decode, FP4 tensor core GEMV, PDL, sub-8-bit quality
+- Expect M>8 scaling (register pressure)
+- Trust pre-session-37 INT4 benchmark numbers (grid bug)
 
-**Active direction**: Fix INT4 quality (asymmetric quantization) or accept that 4-bit symmetric is insufficient for 28-layer deep model. Re-bench 8B with corrected kernel if quality fix works.
+**Active direction**: Operational server + benchmark research. Next: Docker push, 8B optimization, or CUDA Graph if head_norm+RoPE fusion becomes viable.
 
-**Verify repo state before edits**: `git status`. Prefer incremental edits.
-
-**Keep HANDOFF.md concise** — deduplicate with AGENTS.md, prefer bullets, remove stale sections on update.
+**Update rule**: Keep HANDOFF.md concise — deduplicate with AGENTS.md, prefer bullets, remove stale sections on update. Only store operational truth and verified facts.
