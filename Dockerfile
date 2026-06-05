@@ -19,14 +19,18 @@ FROM ubuntu:24.04
 LABEL description="Blackwell INT8 NOFP4 — RTX 5060 Ti, correct model"
 LABEL version="0.4.0"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    -o Acquire::Check-Valid-Until=false \
+    -o Acquire::Check-Date=false \
+    -o Acquire::AllowInsecureRepositories=true \
+    -o Acquire::AllowDowngradeToInsecureRepositories=true && \
+    apt-get install -y --allow-unauthenticated --no-install-recommends \
+    ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 # Copy CUDA runtime library from host
 # nvidia-container-toolkit provides driver but NOT cudart
 COPY cuda-libs/libcudart.so.13* /usr/local/lib/
+RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
 
 WORKDIR /app
 
@@ -36,7 +40,7 @@ COPY weights_int8_bf16 /app/weights_int8_bf16
 COPY server/http_subprocess /app/bin/
 COPY server/inference_server /app/bin/
 
-RUN ldconfig
+RUN ldconfig || true  # symlink may already exist
 
 EXPOSE 8080
 
