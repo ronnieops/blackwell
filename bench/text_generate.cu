@@ -35,6 +35,44 @@ __global__ void absmax_scales_kernel(const float* in, float* sc, int n) {
 }
 
 // Per-head RMSNorm for Q/K norms
+// Fused head_norm + RoPE kernel
+// Phase 1: warp-reduced RMSNorm (all 128 threads per head)
+// Phase 2: RoPE rotation (all 128 threads, thread i handles pair i)
+__global__ void fused_headnorm_rope_kernel(float* data, const float* norm_w, int n_heads, int head_dim, int pos, float eps) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    float* d = data + h * head_dim;
+    __shared__ float warp_partial[4];
+    int tid = threadIdx.x;
+
+    // Phase 1: head_norm (warp-reduced reduction)
+    float s = 0;
+    for (int i = tid; i < head_dim; i += blockDim.x) s += d[i] * d[i];
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if ((tid & 31) == 0) warp_partial[tid >> 5] = s;
+    __syncthreads();
+    if (tid < 4) s = warp_partial[tid]; else s = 0;
+    for (int off = 2; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if (tid == 0) warp_partial[0] = rsqrtf(s / head_dim + eps);
+    __syncthreads();
+    float inv_std = warp_partial[0];
+
+    // Phase 2: RoPE rotation (each thread handles one pair: elements 2*tid, 2*tid+1)
+    // All 128 threads active, each writes 2 elements
+    const float rope_theta = 1000000.0f;
+    int pair = tid;  // tid = 0..127, pair = 0..63 (pairs per head)
+    if (pair < head_dim / 2) {
+        int idx = pair * 2;
+        float x = d[idx]     * inv_std * norm_w[idx];
+        float y = d[idx + 1] * inv_std * norm_w[idx + 1];
+        float theta = (float)pos * powf(rope_theta, -2.0f * (float)pair / (float)head_dim);
+        float c = cosf(theta), s2 = sinf(theta);
+        d[idx]     = x * c - y * s2;
+        d[idx + 1] = x * s2 + y * c;
+    }
+}
+
+// Standalone head_norm (kept for reference, use fused version)
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
     int h=blockIdx.x; if(h>=nh) return;
     float* d=data+h*hd;
@@ -53,8 +91,7 @@ __global__ void head_norm_kernel(float* data, const float* weight, int nh, int h
     for(int i=tid;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
 }
 
-// RoPE kernel: apply rotary position embeddings to Q and K
-// Qwen3: rotate each pair (2i, 2i+1) by θ_i × pos
+// Standalone RoPE (kept for reference, use fused version)
 __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int pos) {
     int h = blockIdx.x;
     int d = threadIdx.x;
