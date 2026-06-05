@@ -58,11 +58,14 @@ static DevW upload(const char* prefix) {
 int main(int argc, char** argv) {
     int num_layers = 4;
     int M = 4;
+    int max_seq_len = 256;  // Reduced for M=8 memory fit (full 2048 needs ~15.9GB, 512 still OOM for M>=7@36L)
     if (argc > 1) num_layers = atoi(argv[1]);
     if (argc > 2) M = atoi(argv[2]);
+    if (argc > 3) max_seq_len = atoi(argv[3]);
     if (num_layers > 36) num_layers = 36;
     if (M < 1) M = 1;
     if (M > 8) M = 8;
+    if (max_seq_len < 128) max_seq_len = 128;
 
     // Qwen3-8B dimensions
     const int H = 4096, Q = 4096, KV = 1024, I = 12288;
@@ -75,7 +78,7 @@ int main(int argc, char** argv) {
     printf("# INT8 Batched Decode — Qwen3-8B (Batched Attention + CUDA Graph)\n");
     printf("# Device: %s (%d.%d)\n", p.name, p.major, p.minor);
     printf("# Layers: %d, Batch M: %d, H=%d, Q=%d, KV=%d, I=%d\n", num_layers, M, H, Q, KV, I);
-    printf("# nqh=%d, nkv=%d, head_dim=%d\n", nqh, nkv, hd);
+    printf("# nqh=%d, nkv=%d, head_dim=%d, max_seq_len=%d\n", nqh, nkv, hd, max_seq_len);
     fflush(stdout);
 
     // Load weights
@@ -170,12 +173,17 @@ int main(int argc, char** argv) {
     }
     cudaFree(d_bixsh);
 
-    // ── KV cache: [M][total_layers][nkv][ms][hd] contiguous ─────────────────
+    // ── KV cache: [layers][M][nkv][ms][hd] contiguous ──────────────────────
+    // Layout chosen for batched attention: batch is inner dimension (small stride)
+    // update_kv_cache only supports batch_idx=0, so we write directly via cudaMemcpy
     float *d_kc, *d_vc;
-    size_t kv_sz = (size_t)M * num_layers * nkv * ms * hd * 4;
+    size_t kv_sz = (size_t)num_layers * M * nkv * ms * hd * 4;
     cudaMalloc(&d_kc, kv_sz); cudaMalloc(&d_vc, kv_sz);
     cudaMemset(d_kc, 0, kv_sz); cudaMemset(d_vc, 0, kv_sz);
-    size_t kv_seq_stride = (size_t)num_layers * nkv * ms * hd;  // floats per seq
+    // Strides for [layers][M][nkv][ms][hd] layout
+    size_t kv_layer_stride = (size_t)M * nkv * ms * hd;   // floats between layers
+    size_t kv_batch_stride  = (size_t)nkv * ms * hd;        // floats between batches in same layer
+    size_t kv_head_stride   = (size_t)ms * hd;              // floats between heads
 
     // L2 persisting cache
     cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 8*1024*1024);
@@ -186,7 +194,8 @@ int main(int argc, char** argv) {
     for (int s = 0; s <= sq; ++s) {
         for (int m = 0; m < M; ++m) {
             for (int l = 0; l < num_layers; ++l) {
-                size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
+                // KV cache offset for [layers][M][nkv][ms][hd] layout
+                size_t kv_off = l * kv_layer_stride + m * kv_batch_stride + s * hd;
 
                 // Unpack FP4 → FP32 residual
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
@@ -201,16 +210,17 @@ int main(int argc, char** argv) {
                 blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_s, d_xi8s_s,
                     lw[l].v.d, lw[l].v.sc, H, KV, 0);
 
-                // Update KV cache
-                blackwell::kernels::update_kv_cache(
-                    d_kc + km, d_vc + km,
-                    d_K_b + m*KV, d_V_b + m*KV,
-                    0, s, nkv, hd, ms, 0);
+                // Write K/V to cache at [l][m][h][s][d] via cudaMemcpy
+                // update_kv_cache ignores batch_idx → use direct memcpy instead
+                cudaMemcpyAsync(d_kc + kv_off, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                cudaMemcpyAsync(d_vc + kv_off, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
 
                 // Attention (serial per-seq — for KV fill correctness)
+                // attention_decode_gqa expects flat KV base + computes seq_pos*hd internally
+                size_t kv_base_off_fill = l * kv_layer_stride + m * kv_batch_stride;
                 blackwell::kernels::attention_decode_gqa(
                     d_attn_out_s, d_Q_b + m*Q,
-                    d_kc + km, d_vc + km,
+                    d_kc + kv_base_off_fill, d_vc + kv_base_off_fill,
                     s, nqh, nkv, hd, ms, 0);
 
                 // O projection: quantize → INT8 → GEMV → FP32
@@ -277,14 +287,15 @@ int main(int argc, char** argv) {
     for (int w = 0; w < WARMUP; ++w) {
         for (int m = 0; m < M; ++m) {
             for (int l = 0; l < num_layers; ++l) {
-                size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
+                size_t kv_base_off = l * kv_layer_stride + m * kv_batch_stride;
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::pack_int8(d_xi8_s, d_res_s, d_xi8s_s, H, 0);
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_s, d_xi8s_s, lw[l].q.d, lw[l].q.sc, H, Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_K_b + m*KV, d_xi8_s, d_xi8s_s, lw[l].k.d, lw[l].k.sc, H, KV, 0);
                 blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_s, d_xi8s_s, lw[l].v.d, lw[l].v.sc, H, KV, 0);
-                blackwell::kernels::update_kv_cache(d_kc + km, d_vc + km, d_K_b + m*KV, d_V_b + m*KV, 0, sq, nkv, hd, ms, 0);
-                blackwell::kernels::attention_decode_gqa(d_attn_out_s, d_Q_b + m*Q, d_kc + km, d_vc + km, sq, nqh, nkv, hd, ms, 0);
+                cudaMemcpyAsync(d_kc + kv_base_off + sq * hd, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                cudaMemcpyAsync(d_vc + kv_base_off + sq * hd, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                blackwell::kernels::attention_decode_gqa(d_attn_out_s, d_Q_b + m*Q, d_kc + kv_base_off, d_vc + kv_base_off, sq, nqh, nkv, hd, ms, 0);
                 blackwell::kernels::pack_int8(d_attn_i8_b + m*Q, d_attn_out_s, d_attn_i8s_b + m*(Q/16), Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_proj_b + m*H, d_attn_i8_b + m*Q, d_attn_i8s_b + m*(Q/16), lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b + m*H, d_proj_b + m*H, d_res_s, H, 0);
@@ -315,14 +326,16 @@ int main(int argc, char** argv) {
     for (int i = 0; i < BENCH; ++i) {
         for (int m = 0; m < M; ++m) {
             for (int l = 0; l < num_layers; ++l) {
-                size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
+                size_t kv_off = l * kv_layer_stride + m * kv_batch_stride + sq * hd;
+                size_t kv_base_off = l * kv_layer_stride + m * kv_batch_stride;
                 blackwell::kernels::unpack_fp4(d_res_s, d_x_fp4_arr[m], d_xs_arr[m], H, 0);
                 blackwell::kernels::pack_int8(d_xi8_s, d_res_s, d_xi8s_s, H, 0);
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_s, d_xi8s_s, lw[l].q.d, lw[l].q.sc, H, Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_K_b + m*KV, d_xi8_s, d_xi8s_s, lw[l].k.d, lw[l].k.sc, H, KV, 0);
                 blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_s, d_xi8s_s, lw[l].v.d, lw[l].v.sc, H, KV, 0);
-                blackwell::kernels::update_kv_cache(d_kc + km, d_vc + km, d_K_b + m*KV, d_V_b + m*KV, 0, sq, nkv, hd, ms, 0);
-                blackwell::kernels::attention_decode_gqa(d_attn_out_s, d_Q_b + m*Q, d_kc + km, d_vc + km, sq, nqh, nkv, hd, ms, 0);
+                cudaMemcpyAsync(d_kc + kv_off, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                cudaMemcpyAsync(d_vc + kv_off, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                blackwell::kernels::attention_decode_gqa(d_attn_out_s, d_Q_b + m*Q, d_kc + kv_base_off, d_vc + kv_base_off, sq, nqh, nkv, hd, ms, 0);
                 blackwell::kernels::pack_int8(d_attn_i8_b + m*Q, d_attn_out_s, d_attn_i8s_b + m*(Q/16), Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_proj_b + m*H, d_attn_i8_b + m*Q, d_attn_i8s_b + m*(Q/16), lw[l].o.d, lw[l].o.sc, Q, H, 0);
                 blackwell::kernels::vector_add_fp32(d_proj_b + m*H, d_proj_b + m*H, d_res_s, H, 0);
@@ -376,18 +389,18 @@ int main(int argc, char** argv) {
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].q.d, lw[l].q.sc, H, Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_K_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].k.d, lw[l].k.sc, H, KV, 0);
                 blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].v.d, lw[l].v.sc, H, KV, 0);
-                size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
-                blackwell::kernels::update_kv_cache(d_kc + km, d_vc + km, d_K_b + m*KV, d_V_b + m*KV, 0, sq, nkv, hd, ms, 0);
+                size_t kv_off = l * kv_layer_stride + m * kv_batch_stride + sq * hd;
+                cudaMemcpyAsync(d_kc + kv_off, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                cudaMemcpyAsync(d_vc + kv_off, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
             // Batched attention (single kernel, all M sequences)
-            size_t kv_base = (size_t)l * nkv * ms * hd;
             chk(blackwell::kernels::attention_decode_batched_gqa(
                 d_attn_b, d_Q_b,
                 d_kc, d_vc,
                 sq, nqh, nkv, hd, ms,
                 M,
-                kv_seq_stride,   // floats between sequence KV bases
-                kv_base          // floats to layer
+                kv_batch_stride,   // stride between batches (nkv*ms*hd)
+                l * kv_layer_stride // offset to layer l (l*M*nkv*ms*hd)
             ), "batched_attn");
             // O projections (per-sequence, H=Q=4096)
             for (int m = 0; m < M; ++m) {
@@ -431,13 +444,13 @@ int main(int argc, char** argv) {
                 blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].q.d, lw[l].q.sc, H, Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_K_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].k.d, lw[l].k.sc, H, KV, 0);
                 blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].v.d, lw[l].v.sc, H, KV, 0);
-                size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
-                blackwell::kernels::update_kv_cache(d_kc + km, d_vc + km, d_K_b + m*KV, d_V_b + m*KV, 0, sq, nkv, hd, ms, 0);
+                size_t kv_off = l * kv_layer_stride + m * kv_batch_stride + sq * hd;
+                cudaMemcpyAsync(d_kc + kv_off, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+                cudaMemcpyAsync(d_vc + kv_off, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
-            size_t kv_base = (size_t)l * nkv * ms * hd;
             blackwell::kernels::attention_decode_batched_gqa(
                 d_attn_b, d_Q_b, d_kc, d_vc, sq, nqh, nkv, hd, ms, M,
-                kv_seq_stride, kv_base, 0);
+                kv_batch_stride, l * kv_layer_stride, 0);
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::pack_int8(d_attn_i8_b + m*Q, d_attn_b + m*Q, d_attn_i8s_b + m*(Q/16), Q, 0);
                 blackwell::kernels::gemv_int8_warp(d_proj_b + m*H, d_attn_i8_b + m*Q, d_attn_i8s_b + m*(Q/16), lw[l].o.d, lw[l].o.sc, Q, H, 0);
@@ -508,7 +521,7 @@ int main(int argc, char** argv) {
     // Pre-trigger batched attention to set smem config
     chk(blackwell::kernels::attention_decode_batched_gqa(
         d_attn_b, d_Q_b, d_kc, d_vc, sq, nqh, nkv, hd, ms, M,
-        kv_seq_stride, 0, gst), "pre_trigger");
+        kv_batch_stride, 0, gst), "pre_trigger");
     cudaStreamSynchronize(gst);
 
     cudaGraph_t graph; cudaGraphExec_t exec;
@@ -522,13 +535,13 @@ int main(int argc, char** argv) {
             blackwell::kernels::gemv_int8_warp(d_Q_b + m*Q, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].q.d, lw[l].q.sc, H, Q, gst);
             blackwell::kernels::gemv_int8_warp(d_K_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].k.d, lw[l].k.sc, H, KV, gst);
             blackwell::kernels::gemv_int8_warp(d_V_b + m*KV, d_xi8_b + m*H, d_xi8s_b + m*(H/16), lw[l].v.d, lw[l].v.sc, H, KV, gst);
-            size_t km = m * kv_seq_stride + (size_t)l * nkv * ms * hd;
-            blackwell::kernels::update_kv_cache(d_kc + km, d_vc + km, d_K_b + m*KV, d_V_b + m*KV, 0, sq, nkv, hd, ms, gst);
+            size_t kv_off = l * kv_layer_stride + m * kv_batch_stride + sq * hd;
+            cudaMemcpyAsync(d_kc + kv_off, d_K_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, gst);
+            cudaMemcpyAsync(d_vc + kv_off, d_V_b + m*KV, KV * sizeof(float), cudaMemcpyDeviceToDevice, gst);
         }
-        size_t kv_base = (size_t)l * nkv * ms * hd;
         blackwell::kernels::attention_decode_batched_gqa(
             d_attn_b, d_Q_b, d_kc, d_vc, sq, nqh, nkv, hd, ms, M,
-            kv_seq_stride, kv_base, gst);
+            kv_batch_stride, l * kv_layer_stride, gst);
         for (int m = 0; m < M; ++m) {
             blackwell::kernels::pack_int8(d_attn_i8_b + m*Q, d_attn_b + m*Q, d_attn_i8s_b + m*(Q/16), Q, gst);
             blackwell::kernels::gemv_int8_warp(d_proj_b + m*H, d_attn_i8_b + m*Q, d_attn_i8s_b + m*(Q/16), lw[l].o.d, lw[l].o.sc, Q, H, gst);
