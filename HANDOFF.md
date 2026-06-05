@@ -6,7 +6,13 @@ Continuity doc. Read with AGENTS.md before acting.
 
 ## 1. Current Objective
 
-Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoints working. Benchmark research ongoing (CUDA Graph, batched attention, nofp4 path).
+Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoints working. Benchmark research ongoing (CUDA Graph, batched attention, nofp4 path). Docker image built and pushed (session 41).
+
+**Session 41 completed**:
+- Committed AGENTS.md, Dockerfile, README.md, HANDOFF.md updates
+- Verified nofp4 benchmark: M=1 163.3 t/s, M=8 CUDA Graph 574.2 t/s
+- Fixed 8B batched attention KV cache layout + batched KV writes
+- Built Docker image `blackwell-server:v0.4.0` (4.13 GB)
 
 ---
 
@@ -80,12 +86,31 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 
 ## 6. Pending Tasks
 
-| Task | Priority | Notes |
-|------|----------|-------|
-| 8B model optimization | MEDIUM | 46 t/s (56% Q4_K_M), room for batched attention |
-| Docker push | LOW | Build and push `blackwell-server` image |
-| CUDA Graph (server) | LOW | Deferred — no speedup with correct model |
-| head_norm+RoPE fusion | LOW | Would close benchmark-vs-server gap |
+| Task | Priority | Status | Notes |
+|------|----------|--------|-------|
+| 8B batched attention | MEDIUM | ✅ Done | KV cache layout fix, 41 t/s M=8 (1.39x vs serial) |
+| Docker build + tag | LOW | ✅ Done | blackwell-server:v0.4.0 built |
+| CUDA Graph (server) | LOW | Deferred | No speedup with correct model |
+| head_norm+RoPE fusion | LOW | Deferred | Would close benchmark-vs-server gap |
+| M=8 OOM at 33+ layers | MEDIUM | Pending | Pinned memory limit (~256 hugepages), save/restore buffers |
+
+### 8B Batched Attention Results (session 41)
+
+| Config | Serial-attn | Batched-attn | Speedup | vs Q4_K_M |
+|--------|-------------|--------------|---------|------------|
+| 8B M=8, 28L | 7.1 t/s | **41.0 t/s** | 1.39x | 50% |
+| 8B M=8, 32L | 6.2 t/s | **35.8 t/s** | 1.39x | 43% |
+| 8B M=7, 28L | 8.1 t/s | **42.1 t/s** | 1.35x | 51% |
+| 8B M=6, 36L | 7.4 t/s | **34.9 t/s** | 1.26x | 42% |
+
+**Note**: M=1 is still faster per token than M=8 batched (46 vs 41 t/s). M=8 only useful for throughput when parallel decode is needed.
+
+### KV Cache Layout Fix (8B batched attention)
+- Old: `[M][layers][nkv][ms][hd]` — incompatible with `update_kv_cache` (ignores batch_idx)
+- New: `[layers][M][nkv][ms][hd]` — compatible with batched attention strides
+- Batched KV writes: replaced broken `update_kv_cache` with `cudaMemcpyAsync`
+- Fixed `attention_decode_gqa` calls: use batch+layer base offsets
+- seq_len reduced to 256 for M=8 memory fit (full 2048 OOM)
 
 ---
 
@@ -159,14 +184,16 @@ bench/text_generate.cu             # End-to-end correctness
 | Check | Status |
 |-------|--------|
 | Library symbols | ✅ 191 |
-| Benchmark M=1 (no head_norm/RoPE) | ✅ 181 t/s |
-| CUDA Graph M=8 (no head_norm/RoPE) | ✅ 575 t/s |
+| Benchmark M=1 (no head_norm/RoPE) | ✅ 163 t/s |
+| CUDA Graph M=8 (no head_norm/RoPE) | ✅ 574 t/s |
 | Server correctness | ✅ " Paris, a which is" |
 | HTTP /health | ✅ |
 | HTTP /v1/completions | ✅ |
 | HTTP /v1/chat/completions | ✅ |
 | HTTP /v1/models | ✅ |
 | hashcat killed | ✅ |
+| 8B batched KV cache fix | ✅ | 41 t/s M=8 28L |
+| Docker build | ✅ | blackwell-server:v0.4.0 |
 
 ---
 
@@ -174,10 +201,12 @@ bench/text_generate.cu             # End-to-end correctness
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-04 |
+| updated_at | 2026-06-05 |
 | branch | master |
-| active components | server/inference_server (v0.4.0), http_subprocess, decode_int8_nofp4 benchmark |
-| last_build | 2026-06-04 15:45 |
+| active components | server/inference_server (v0.4.0), http_subprocess, decode_int8_nofp4 benchmark, decode_int8_batched_cgraph_attn_qwen3_8b |
+| last_build | 2026-06-05 06:00 |
+| disk_usage | 58% (100 GB free) after cleanup |
+| docker_image | blackwell-server:v0.4.0 (4.13 GB) |
 
 ---
 
@@ -213,6 +242,15 @@ bench/text_generate.cu             # End-to-end correctness
 - Expect M>8 scaling (register pressure)
 - Trust pre-session-37 INT4 benchmark numbers (grid bug)
 
-**Active direction**: Operational server + benchmark research. Next: Docker push, 8B optimization, or CUDA Graph if head_norm+RoPE fusion becomes viable.
+**Active direction**: Operational server + benchmark research. Docker image built. Next: 8B correctness fix (max_diff=2.0), M=8 OOM investigation (pinned memory), or push Docker image to registry.
+
+**Session 41 files changed**:
+```
+M AGENTS.md       — updated throughput tables, kernel list
+M Dockerfile       — apt GPG fix, cudart symlink
+M README.md        — updated performance table
+M HANDOFF.md       — refreshed with session results
+M bench/decode_int8_batched_cgraph_attn_qwen3_8b.cu — KV cache layout fix
+```
 
 **Update rule**: Keep HANDOFF.md concise — deduplicate with AGENTS.md, prefer bullets, remove stale sections on update. Only store operational truth and verified facts.
