@@ -17,7 +17,7 @@
 FROM ubuntu:24.04
 
 LABEL description="Blackwell INT8 NOFP4 — RTX 5060 Ti, correct model"
-LABEL version="0.4.0"
+LABEL version="0.4.1"
 
 RUN apt-get update \
     -o Acquire::Check-Valid-Until=false \
