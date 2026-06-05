@@ -266,19 +266,8 @@ int main(int argc, char** argv) {
     }
     printf("done\n"); fflush(stdout);
 
-    printf("Save state...\n"); fflush(stdout);
-    void** d_x_fp4_init = new void*[M];
-    float** d_xs_init = new float*[M];
-    for (int m = 0; m < M; ++m) {
-        cudaMalloc(&d_x_fp4_init[m], H);
-        cudaMalloc(&d_xs_init[m], (H/16)*4);
-        cudaMemcpy(d_x_fp4_init[m], d_x_fp4_arr[m], H, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(d_xs_init[m], d_xs_arr[m], (H/16)*4, cudaMemcpyDeviceToDevice);
-    }
-    float *d_kc_save, *d_vc_save;
-    cudaMalloc(&d_kc_save, kv_sz); cudaMalloc(&d_vc_save, kv_sz);
-    cudaMemcpy(d_kc_save, d_kc, kv_sz, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_vc_save, d_vc, kv_sz, cudaMemcpyDeviceToDevice);
+    // Save state (removed for memory - not needed for throughput benchmark)
+    // Skip save/restore to free ~9.4GB pinned memory for M=8 36L
 
     const int WARMUP = 5, BENCH = 20;
 
@@ -367,13 +356,7 @@ int main(int argc, char** argv) {
         cudaFree(d_tmp);
     }
 
-    // Restore initial state
-    for (int m = 0; m < M; ++m) {
-        cudaMemcpy(d_x_fp4_arr[m], d_x_fp4_init[m], H, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(d_xs_arr[m], d_xs_init[m], (H/16)*4, cudaMemcpyDeviceToDevice);
-    }
-    cudaMemcpy(d_kc, d_kc_save, kv_sz, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_vc, d_vc_save, kv_sz, cudaMemcpyDeviceToDevice);
+    // Restore initial state (removed - save/restore disabled for memory)
 
     // ── BATCHED ATTENTION: benchmark ────────────────────────────────────────
     printf("\nBenchmark batched-attn (per-kernel, %d iters)...\n", BENCH);
@@ -493,13 +476,7 @@ int main(int argc, char** argv) {
         maxdiff = fmaxf(maxdiff, fabsf(h_serial_out[i] - h_batch_out[i]));
     delete[] h_serial_out; delete[] h_batch_out;
 
-    // Restore for CUDA Graph benchmark
-    for (int m = 0; m < M; ++m) {
-        cudaMemcpy(d_x_fp4_arr[m], d_x_fp4_init[m], H, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(d_xs_arr[m], d_xs_init[m], (H/16)*4, cudaMemcpyDeviceToDevice);
-    }
-    cudaMemcpy(d_kc, d_kc_save, kv_sz, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_vc, d_vc_save, kv_sz, cudaMemcpyDeviceToDevice);
+    // Restore for CUDA Graph benchmark (removed - save/restore disabled for memory)
 
     // ── CUDA Graph (batched attention) ─────────────────────────────────────
     printf("\nCapturing CUDA Graph (batched attention, %d layers, %d sequences)... ", num_layers, M);
