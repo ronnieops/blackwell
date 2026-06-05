@@ -1,0 +1,538 @@
+// server/inference_server_nofp4.cu — Blackwell INT8 nofp4 inference server
+//
+// FP32 residual state (no FP4 pack/unpack). Persistent C++ daemon for M=8 batched decode.
+// Uses CORRECT model architecture: per-layer RMSNorm, Q/K head norms, RoPE.
+// Protocol: JSON lines on stdin/stdout.
+//
+// Build:
+//   CUDACXX=/usr/local/cuda-13.3/bin/nvcc nvcc -O3 -std=c++17 \
+//     -gencode=arch=compute_120a,code=sm_120a \
+//     -I include server/inference_server_nofp4.cu build/libblackwell_kernels.a \
+//     -o server/inference_server
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <cstdint>
+#include <vector>
+#include <string>
+#include "blackwell/kernels.h"
+#include "blackwell/bpe_tokenizer.h"
+
+static void die(cudaError_t e, const char* msg) {
+    if (e != cudaSuccess) { fprintf(stderr, "FAIL %s: %s\n", msg, cudaGetErrorString(e)); exit(1); }
+}
+
+// ── Inline CUDA kernels (not in library) ──────────────────────────────
+
+// Per-head RMSNorm for Q/K attention heads (from text_generate.cu)
+__global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
+    int h = blockIdx.x; if (h >= nh) return;
+    float* d = data + h * hd;
+    __shared__ float warp_partial[4];
+    float s = 0;
+    int tid = threadIdx.x;
+    for (int i = tid; i < hd; i += blockDim.x) s += d[i] * d[i];
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if ((tid & 31) == 0) warp_partial[tid >> 5] = s;
+    __syncthreads();
+    if (tid < 4) s = warp_partial[tid]; else s = 0;
+    for (int off = 2; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if (tid == 0) warp_partial[0] = rsqrtf(s / hd + eps);
+    __syncthreads();
+    float is = warp_partial[0];
+    for (int i = tid; i < hd; i += blockDim.x) d[i] = d[i] * is * weight[i];
+}
+
+// RoPE kernel using library's device-side seq_pos (cudaGraph compatible)
+// RoPE kernel — reads seq_pos from library's device pointer (set by update_decode_seq_pos)
+// Both the kernel AND attention_decode_gqa read from the same device pointer.
+// update_decode_seq_pos's captured cudaMemcpyAsync replays each graph launch → correct seq_pos.
+__global__ void rope_kernel(float* data, int n_heads, int head_dim, int* d_seq_pos) {
+    int h = blockIdx.x; int d = threadIdx.x;
+    if (h >= n_heads || d >= head_dim / 2) return;
+    // Read pos from device memory (updated by update_decode_seq_pos before kernel launch)
+    // Single __threadfence ensures visibility of the async copy result
+    int pos = *d_seq_pos;
+    __threadfence();
+    const float rope_theta = 1000000.0f;
+    float theta = (float)pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);
+    float c = cosf(theta), s = sinf(theta);
+    int i2 = d * 2;
+    float* pair = data + h * head_dim + i2;
+    float x = pair[0], y = pair[1];
+    pair[0] = x * c - y * s;
+    pair[1] = x * s + y * c;
+}
+struct DevW { int K, N; int8_t* d; float* sc; };
+static DevW upload_int8(const char* prefix) {
+    char p[256]; snprintf(p, 256, "%s.int8_t", prefix);
+    FILE* f = fopen(p, "rb"); if (!f) { fprintf(stderr, "Cannot open %s\n", p); exit(1); }
+    int h[5]; (void)fread(h, 4, 5, f);
+    std::vector<int8_t> tmp((size_t)h[0] * h[1]); (void)fread(tmp.data(), 1, tmp.size(), f); fclose(f);
+    DevW dw{h[0], h[1], nullptr, nullptr};
+    cudaMalloc(&dw.d, (size_t)h[0] * h[1]); cudaMemcpy(dw.d, tmp.data(), dw.K * dw.N, cudaMemcpyHostToDevice);
+    snprintf(p, 256, "%s.scale_t", prefix); f = fopen(p, "rb"); if (!f) { fprintf(stderr, "Cannot open %s\n", p); exit(1); }
+    (void)fread(h, 4, 5, f); size_t ns = (size_t)h[3] * h[4]; std::vector<float> ts(ns); (void)fread(ts.data(), 4, ns, f); fclose(f);
+    cudaMalloc(&dw.sc, ns * 4); cudaMemcpy(dw.sc, ts.data(), ns * 4, cudaMemcpyHostToDevice);
+    return dw;
+}
+
+struct LW { DevW q, k, v, o, gate, up, down; float* qn; float* kn; };
+
+struct ServerState {
+    int NL, H, Q, KV, ID, nqh, nkv, hd, ms, V;
+    float eps;
+
+    std::vector<LW> layers;
+    // Per-layer RMSNorm weights
+    std::vector<float*> d_rn_in;    // input layernorm [NL][H]
+    std::vector<float*> d_rn_post;  // post-attention layernorm [NL][H]
+    float* d_fn;                     // final RMSNorm [H]
+
+    // Embed tokens (host-side for CPU dequant)
+    DevW emb;
+    int8_t* h_emb_int8;
+    float* h_emb_scale;
+
+    // Per-seq FP32 residual state
+    float* d_residual[8];
+
+    int M;
+    int8_t* d_xi8; float* d_xi8s;
+    float* d_Q, *d_K, *d_V;
+    float* d_attn;
+    int8_t* d_attn_i8; float* d_attn_i8s;
+    float* d_gate, *d_up, *d_mlp;
+    int8_t* d_mlp_i8; float* d_mlp_i8s;
+    float* d_proj;
+    float* d_logits;
+    int* d_next_id;
+
+    // KV cache
+    float* d_kc, *d_vc;
+    size_t kv_stride;
+
+    // Device-side seq_pos for graph-compatible RoPE
+    int* d_seq_pos;
+
+    cudaStream_t st;
+};
+
+// ── JSON helpers ──────────────────────────────────────────────────────
+static std::string read_stdin_line() {
+    std::string line; int c;
+    while ((c = getchar()) != EOF && c != '\n') line.push_back((char)c);
+    return line;
+}
+
+static std::vector<std::vector<uint32_t>> parse_prompt_ids(const std::string& json) {
+    std::vector<std::vector<uint32_t>> result;
+    const char* p = strstr(json.c_str(), "\"prompts\"");
+    if (!p) return result;
+    p = strchr(p, '['); if (!p) return result; p++;
+    while (*p && *p != ']') {
+        // Skip whitespace but stop at '[' (array start) or ']' (end)
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == ']' || !*p) break;
+        // At this point: either '[' or a digit. Both are valid.
+        if (*p == '[') { p++; } // nested array
+        std::vector<uint32_t> ids;
+        while (*p && *p != ']') {
+            while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r') p++;
+            if (*p == ']' || *p == '[' || !*p) break;
+            long val = strtol(p, (char**)&p, 10);
+            if (val == 0 && p == json.c_str()) { p++; continue; }
+            ids.push_back((uint32_t)val);
+            while (*p == ' ' || *p == ',') p++;
+        }
+        if (!ids.empty()) result.push_back(ids);
+        if (*p == ']') p++;
+    }
+    return result;
+}
+
+static int find_int(const std::string& json, const char* key, int def) {
+    const char* p = strstr(json.c_str(), key); if (!p) return def;
+    p = strchr(p, ':'); if (!p) return def; p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return (int)strtol(p, nullptr, 10);
+}
+
+static float find_float(const std::string& json, const char* key, float def) {
+    const char* p = strstr(json.c_str(), key); if (!p) return def;
+    p = strchr(p, ':'); if (!p) return def; p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return (float)atof(p);
+}
+
+// Encode with special token support: <|im_start|> → 151644, <|im_end|> → 151645
+static std::vector<uint32_t> encode_with_special(const std::string& s, blackwell::BpeTokenizer& tokenizer) {
+    std::vector<uint32_t> result;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        // Check for <|im_start|>
+        if (s.compare(pos, 12, "<|im_start|>") == 0) {
+            result.push_back(151644);
+            pos += 12;
+        } else if (s.compare(pos, 10, "<|im_end|>") == 0) {
+            result.push_back(151645);
+            pos += 10;
+        } else {
+            // Find next special token or end
+            size_t next_sp = s.find("<|im_", pos);
+            if (next_sp == std::string::npos) next_sp = s.size();
+            std::string chunk = s.substr(pos, next_sp - pos);
+            auto ids = tokenizer.encode(chunk);
+            result.insert(result.end(), ids.begin(), ids.end());
+            pos = next_sp;
+        }
+    }
+    return result;
+}
+
+static std::vector<std::vector<uint32_t>> parse_string_prompts(
+    const std::string& json, blackwell::BpeTokenizer& tokenizer) {
+    std::vector<std::vector<uint32_t>> result;
+    // Try "prompt" key first (OpenAI API style)
+    const char* prompt_p = strstr(json.c_str(), "\"prompt\"");
+    if (prompt_p) {
+        const char* p = strchr(prompt_p, ':'); if (!p) return result; p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '"') return result; p++;
+        std::string s;
+        while (*p && *p != '"') {
+            if (*p == '\\' && *(p+1) == 'n') { s += '\n'; p += 2; }
+            else if (*p == '\\' && *(p+1) == 'r') { s += '\r'; p += 2; }
+            else if (*p == '\\' && *(p+1) == 't') { s += '\t'; p += 2; }
+            else if (*p == '\\' && *(p+1) == '\\') { s += '\\'; p += 2; }
+            else { s += *p; p++; }
+        }
+        result.push_back(encode_with_special(s, tokenizer));
+        return result;
+    }
+    // Try "prompts" array (batch style)
+    const char* p = strstr(json.c_str(), "\"prompts\"");
+    if (!p) return result;
+    p = strchr(p, '['); if (!p) return result; p++;
+    while (*p && *p != ']') {
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\n')) p++;
+        if (*p == ']' || !*p) break;
+        if (*p != '"') { p++; continue; } p++;
+        std::string s;
+        while (*p && *p != '"') {
+            if (*p == '\\' && *(p + 1) == '"') { s += '"'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == 'n') { s += '\n'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == 'r') { s += '\r'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == 't') { s += '\t'; p += 2; }
+            else if (*p == '\\' && *(p + 1) == '\\') { s += '\\'; p += 2; }
+            else { s += *p; p++; }
+        }
+        if (*p == '"') p++;
+        auto ids = encode_with_special(s, tokenizer);
+        result.push_back(ids);
+        while (*p && (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n')) p++;
+    }
+    return result;
+}
+
+static void server_write_results(const std::vector<std::vector<uint32_t>>& tokens,
+    blackwell::BpeTokenizer& tokenizer) {
+    printf("{\"tokens\":[");
+    for (size_t s = 0; s < tokens.size(); s++) {
+        if (s > 0) printf(",");
+        printf("[");
+        for (size_t t = 0; t < tokens[s].size(); t++) {
+            if (t > 0) printf(",");
+            printf("%u", tokens[s][t]);
+        }
+        printf("]");
+    }
+    printf("],\"text\":[");
+    for (size_t s = 0; s < tokens.size(); s++) {
+        if (s > 0) printf(",");
+        printf("\"");
+        std::string txt;
+        for (size_t t = 0; t < tokens[s].size(); t++) txt += tokenizer.decode(tokens[s][t]);
+        for (size_t i = 0; i < txt.size(); i++) {
+            char c = txt[i];
+            if (c == '"') printf("\\\"");
+            else if (c == '\\') printf("\\\\");
+            else if (c == '\n') printf("\\n");
+            else if (c == '\r') printf("\\r");
+            else if (c == '\t') printf("\\t");
+            else printf("%c", c);
+        }
+        printf("\"");
+    }
+    printf("]}\n"); fflush(stdout);
+}
+
+// ── Embed: CPU-side dequant, store as FP32 residual ───────────────────
+static void embed_batch(ServerState& S, const std::vector<std::vector<uint32_t>>& prompts, int step) {
+    int M = (int)prompts.size();
+    for (int m = 0; m < M; m++) {
+        uint32_t tid = prompts[m][step];
+        std::vector<float> h_hidden(S.H);
+        for (int d = 0; d < S.H; d++)
+            h_hidden[d] = (float)S.h_emb_int8[tid * S.H + d] * S.h_emb_scale[tid * (S.H / 16) + d / 16];
+        cudaMemcpy(S.d_residual[m], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
+    }
+}
+
+// ── Batched decode step (CORRECT model architecture) ──────────────────
+static void batched_decode_step(ServerState& S, int seq_pos) {
+    int M = S.M;
+    size_t kv_seq_stride = (size_t)S.nkv * S.hd * S.ms;
+
+    for (int l = 0; l < S.NL; l++) {
+        size_t kv_layer_off = (size_t)l * S.nkv * S.hd * S.ms;
+
+        // ── Input layernorm + quantize (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.d_residual[m], S.d_rn_in[l], S.H, S.eps, S.st);
+        }
+
+        // ── Q/K/V projections + head_norm + RoPE (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::gemv_int8_warp(S.d_Q + m * S.Q, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].q.d, S.layers[l].q.sc, S.H, S.Q, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_K + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].k.d, S.layers[l].k.sc, S.H, S.KV, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_V + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].v.d, S.layers[l].v.sc, S.H, S.KV, S.st);
+
+            // Q/K head norms
+            head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
+            head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K + m * S.KV, S.layers[l].kn, S.nkv, S.hd, S.eps);
+
+            // RoPE: update device seq_pos and sync before kernel reads it
+            blackwell::kernels::update_decode_seq_pos(seq_pos, S.st);
+            cudaStreamSynchronize(S.st);
+            rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q + m * S.Q, S.nqh, S.hd, S.d_seq_pos);
+            rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
+
+            // KV cache write
+            size_t km = (size_t)m * kv_seq_stride + kv_layer_off;
+            blackwell::kernels::update_kv_cache(
+                S.d_kc + km, S.d_vc + km, S.d_K + m * S.KV, S.d_V + m * S.KV,
+                0, seq_pos, S.nkv, S.hd, S.ms, S.st);
+        }
+
+        // ── Attention (single-seq for M=1) ──
+        if (M == 1) {
+            size_t kb = kv_layer_off;
+            blackwell::kernels::attention_decode_gqa(
+                S.d_attn, S.d_Q, S.d_kc + kb, S.d_vc + kb,
+                seq_pos, S.nqh, S.nkv, S.hd, S.ms, S.st);
+        } else {
+            blackwell::kernels::attention_decode_batched_gqa(
+                S.d_attn, S.d_Q, S.d_kc, S.d_vc,
+                seq_pos, S.nqh, S.nkv, S.hd, S.ms,
+                M, (int)kv_seq_stride, (int)kv_layer_off, S.st);
+        }
+
+        // ── Attention output projection + residual 1 (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), S.d_attn + m * S.Q, S.Q, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_proj + m * S.H, S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
+                S.layers[l].o.d, S.layers[l].o.sc, S.Q, S.H, S.st);
+            // Residual 1: proj = attn_out + input (before RMSNorm)
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+            // Save attention output for MLP residual
+            cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+        }
+
+        // ── Post-attention layernorm + quantize (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.d_proj + m * S.H, S.d_rn_post[l], S.H, S.eps, S.st);
+        }
+
+        // ── MLP: batched gate/up ──
+        blackwell::kernels::gemv_int8_batched(S.d_gate, S.d_xi8, S.d_xi8s,
+            S.layers[l].gate.d, S.layers[l].gate.sc, S.H, S.ID, M, S.st);
+        blackwell::kernels::gemv_int8_batched(S.d_up, S.d_xi8, S.d_xi8s,
+            S.layers[l].up.d, S.layers[l].up.sc, S.H, S.ID, M, S.st);
+
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::apply_swiglu(S.d_mlp + m * S.ID, S.d_gate + m * S.ID, S.d_up + m * S.ID, S.ID, S.st);
+            blackwell::kernels::quantize_int8(S.d_mlp_i8 + m * S.ID, S.d_mlp_i8s + m * (S.ID / 16), S.d_mlp + m * S.ID, S.ID, S.st);
+        }
+
+        // ── MLP down projection (batched) ──
+        blackwell::kernels::gemv_int8_batched(S.d_proj, S.d_mlp_i8, S.d_mlp_i8s,
+            S.layers[l].down.d, S.layers[l].down.sc, S.ID, S.H, M, S.st);
+
+        // ── Residual 2: down + attention output (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+            cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+        }
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+int main() {
+    ServerState S;
+    S.NL = 28; S.H = 2048; S.Q = 2048; S.KV = 1024; S.ID = 6144;
+    S.nqh = 16; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
+    S.eps = 1e-6f; S.M = 8;
+
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
+    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.4.0 (correct model)\n");
+    fprintf(stderr, "Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
+
+    die(cudaStreamCreate(&S.st), "stream");
+
+    blackwell::BpeTokenizer tokenizer;
+    if (tokenizer.load("tokenizer_data.bin") != 0) {
+        fprintf(stderr, "FAIL: no tokenizer_data.bin\n"); return 1;
+    }
+
+    // ── Load INT8 weights ──
+    fprintf(stderr, "Loading weights...\n");
+    S.layers.resize(S.NL);
+    for (int l = 0; l < S.NL; l++) {
+        char p[256];
+        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.q_proj", l); S.layers[l].q = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.k_proj", l); S.layers[l].k = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.v_proj", l); S.layers[l].v = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.o_proj", l); S.layers[l].o = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_mlp.gate_proj", l);  S.layers[l].gate = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_mlp.up_proj", l);    S.layers[l].up = upload_int8(p);
+        snprintf(p, 256, "weights_int8_bf16/%d_mlp.down_proj", l);  S.layers[l].down = upload_int8(p);
+        if (l % 7 == 0) fprintf(stderr, "  layer %d/%d\n", l, S.NL);
+    }
+    S.emb = upload_int8("weights_int8_bf16/embed_tokens");
+
+    // Host-side embed copies
+    {
+        char p[256]; snprintf(p, 256, "weights_int8_bf16/embed_tokens.int8_t");
+        FILE* f = fopen(p, "rb"); int h[5]; (void)fread(h, 4, 5, f);
+        size_t num = (size_t)h[0] * h[1];
+        S.h_emb_int8 = (int8_t*)malloc(num); (void)fread(S.h_emb_int8, 1, num, f); fclose(f);
+        snprintf(p, 256, "weights_int8_bf16/embed_tokens.scale_t");
+        f = fopen(p, "rb"); (void)fread(h, 4, 5, f);
+        size_t ns = (size_t)h[3] * h[4];
+        S.h_emb_scale = (float*)malloc(ns * 4); (void)fread(S.h_emb_scale, 4, ns, f); fclose(f);
+    }
+
+    // ── Per-layer RMSNorm weights ──
+    S.d_rn_in.resize(S.NL); S.d_rn_post.resize(S.NL);
+    for (int l = 0; l < S.NL; l++) {
+        float* w = (float*)malloc(S.H * 4);
+        char p[256];
+        snprintf(p, 256, "weights_int8_bf16/%d_input_layernorm.f32", l);
+        FILE* f = fopen(p, "rb"); (void)fread(w, 4, S.H, f); fclose(f);
+        cudaMalloc(&S.d_rn_in[l], S.H * 4); cudaMemcpy(S.d_rn_in[l], w, S.H * 4, cudaMemcpyHostToDevice);
+        snprintf(p, 256, "weights_int8_bf16/%d_post_attention_layernorm.f32", l);
+        f = fopen(p, "rb"); (void)fread(w, 4, S.H, f); fclose(f);
+        cudaMalloc(&S.d_rn_post[l], S.H * 4); cudaMemcpy(S.d_rn_post[l], w, S.H * 4, cudaMemcpyHostToDevice);
+        free(w);
+    }
+
+    // ── Per-layer Q/K norms ──
+    {
+        float* qk_h = (float*)malloc(28 * 2 * 128 * 4);
+        FILE* f = fopen("weights_int8_bf16/qk_norms.f32", "rb");
+        (void)fread(qk_h, 4, 28 * 2 * 128, f); fclose(f);
+        for (int l = 0; l < S.NL; l++) {
+            cudaMalloc(&S.layers[l].qn, 128 * 4);
+            cudaMemcpy(S.layers[l].qn, qk_h + l * 2 * 128, 128 * 4, cudaMemcpyHostToDevice);
+            cudaMalloc(&S.layers[l].kn, 128 * 4);
+            cudaMemcpy(S.layers[l].kn, qk_h + l * 2 * 128 + 128, 128 * 4, cudaMemcpyHostToDevice);
+        }
+        free(qk_h);
+    }
+
+    // ── Final norm ──
+    {
+        float* w = (float*)malloc(S.H * 4);
+        FILE* f = fopen("weights_int8_bf16/final_norm.f32", "rb");
+        (void)fread(w, 4, S.H, f); fclose(f);
+        cudaMalloc(&S.d_fn, S.H * 4); cudaMemcpy(S.d_fn, w, S.H * 4, cudaMemcpyHostToDevice);
+        free(w);
+    }
+    fprintf(stderr, "  done\n");
+
+    // ── Allocate buffers ──
+    for (int m = 0; m < S.M; m++) cudaMalloc(&S.d_residual[m], S.H * 4);
+    cudaMalloc(&S.d_xi8, S.M * S.H); cudaMalloc(&S.d_xi8s, S.M * (S.H / 16) * 4);
+    cudaMalloc(&S.d_Q, S.M * S.Q * 4); cudaMalloc(&S.d_K, S.M * S.KV * 4); cudaMalloc(&S.d_V, S.M * S.KV * 4);
+    cudaMalloc(&S.d_attn, S.M * S.Q * 4);
+    cudaMalloc(&S.d_attn_i8, S.M * S.Q); cudaMalloc(&S.d_attn_i8s, S.M * (S.Q / 16) * 4);
+    cudaMalloc(&S.d_gate, S.M * S.ID * 4); cudaMalloc(&S.d_up, S.M * S.ID * 4); cudaMalloc(&S.d_mlp, S.M * S.ID * 4);
+    cudaMalloc(&S.d_mlp_i8, S.M * S.ID); cudaMalloc(&S.d_mlp_i8s, S.M * (S.ID / 16) * 4);
+    cudaMalloc(&S.d_proj, S.M * S.H * 4);
+    cudaMalloc(&S.d_logits, S.V * 4); cudaMalloc(&S.d_next_id, sizeof(int));
+
+    size_t kv_sz = (size_t)S.NL * S.M * S.nkv * S.ms * S.hd * 4;
+    cudaMalloc(&S.d_kc, kv_sz); cudaMalloc(&S.d_vc, kv_sz);
+    cudaMemset(S.d_kc, 0, kv_sz); cudaMemset(S.d_vc, 0, kv_sz);
+    // Get device-side seq_pos from library (for graph-compatible RoPE)
+    int* tmp_ptr = nullptr; blackwell::kernels::get_seq_pos_device_ptr(&tmp_ptr); S.d_seq_pos = tmp_ptr;
+    // Initialize to 0
+    int zero = 0;
+    cudaMemcpyAsync(S.d_seq_pos, &zero, sizeof(int), cudaMemcpyHostToDevice, S.st);
+    S.kv_stride = (size_t)S.nkv * S.hd * S.ms;
+
+    fprintf(stderr, "Ready.\n");
+
+    // ── Main request loop ──
+    while (true) {
+        std::string line = read_stdin_line();
+        if (line.empty()) break;
+
+        auto prompts = parse_prompt_ids(line);
+        if (prompts.empty()) prompts = parse_string_prompts(line, tokenizer);
+        if (prompts.empty()) continue;
+
+        int M = (int)prompts.size();
+        if (M > 8) { M = 8; prompts.resize(8); }
+        S.M = M;
+        int max_tokens = find_int(line, "max_tokens", 30);
+        float temperature = find_float(line, "temperature", 0);
+        int top_k = find_int(line, "top_k", 0);
+
+        int gen_start = (int)prompts[0].size();
+        for (int s = 0; s < gen_start; s++) {
+            embed_batch(S, prompts, s);
+            batched_decode_step(S, s);
+        }
+
+        // Generate
+        std::vector<std::vector<uint32_t>> outputs(M);
+        for (int s = gen_start; s < gen_start + max_tokens; s++) {
+            for (int m = 0; m < M; m++) {
+                // Final norm + lm_head + sample
+                blackwell::kernels::fused_rmsnorm(S.d_residual[m], S.d_residual[m], S.d_fn, S.H, S.eps, S.st);
+                blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[m], S.H, S.st);
+                blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
+                    S.emb.d, S.emb.sc, S.H, S.V, S.st);
+                blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
+                    S.d_next_id, 0xdeadbeefLL, s, S.st);
+                uint32_t next_id;
+                cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
+                outputs[m].push_back(next_id);
+                if (next_id == 151643) break;
+
+                // Embed next token
+                std::vector<float> h_hidden(S.H);
+                for (int d = 0; d < S.H; d++)
+                    h_hidden[d] = (float)S.h_emb_int8[next_id * S.H + d] * S.h_emb_scale[next_id * (S.H / 16) + d / 16];
+                cudaMemcpy(S.d_residual[m], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
+            }
+            batched_decode_step(S, s);
+        }
+
+        server_write_results(outputs, tokenizer);
+        cudaMemset(S.d_kc, 0, kv_sz); cudaMemset(S.d_vc, 0, kv_sz);
+    }
+    return 0;
+}

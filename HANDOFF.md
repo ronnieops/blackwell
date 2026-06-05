@@ -90,7 +90,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 |------|----------|--------|-------|
 | 8B batched attention | MEDIUM | ✅ Done | KV cache layout fix, 41 t/s M=8 (1.39x vs serial) |
 | Docker build + tag | LOW | ✅ Done | blackwell-server:v0.4.0 built |
-| CUDA Graph (server) | LOW | Deferred | No speedup with correct model |
+| CUDA Graph (server) | LOW | ❌ Failed | Capture fails with cudaErrorCaptureInternal (700). attention_decode_gqa internal state (smem config, seq_pos alloc) causes capture failures. Per-kernel path works correctly (~106 t/s). CUDA Graph works in benchmark (574 t/s) but benchmark uses wrong model (no head_norm/RoPE). |
 | head_norm+RoPE fusion | LOW | ❌ No benefit | Fused: 141 t/s vs separate: 140 t/s (+0.7%, noise). GEMV is bottleneck, element-wise ops negligible. Keep fused kernel for reference.
 | M=8 OOM at 33+ layers | MEDIUM | ✅ Done | Removed save/restore buffers — M=8 36L now works |
 
