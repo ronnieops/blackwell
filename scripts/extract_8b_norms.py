@@ -3,7 +3,7 @@
 import json, struct, sys, os
 import numpy as np
 
-MODEL = "/mnt/data/ai/hf/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
+MODEL = "/mnt/data/models/Qwen3-8B"
 OUT = "weights_int8_qwen3_8b"
 os.makedirs(OUT, exist_ok=True)
 

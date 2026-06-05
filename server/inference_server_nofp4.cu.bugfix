@@ -130,32 +130,25 @@ static std::string read_stdin_line() {
 
 static std::vector<std::vector<uint32_t>> parse_prompt_ids(const std::string& json) {
     std::vector<std::vector<uint32_t>> result;
-    // Returns empty if prompts are strings (use parse_string_prompts instead)
     const char* p = strstr(json.c_str(), "\"prompts\"");
     if (!p) return result;
     p = strchr(p, '['); if (!p) return result; p++;
-    // Check if first non-whitespace is a quote (string prompt)
-    const char* ws = p;
-    while (*ws == ' ' || *ws == '\t' || *ws == '\n' || *ws == '\r') ws++;
-    if (*ws == '"') return result;  // String prompts handled by parse_string_prompts
-    // Numeric IDs
     while (*p && *p != ']') {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        // Skip whitespace but stop at '[' (array start) or ']' (end)
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         if (*p == ']' || !*p) break;
-        if (*p == '[') { p++; continue; }
-        long val = strtol(p, (char**)&p, 10);
-        if (val == 0 && p == json.c_str()) { p++; continue; }
+        // At this point: either '[' or a digit. Both are valid.
+        if (*p == '[') { p++; } // nested array
         std::vector<uint32_t> ids;
-        ids.push_back((uint32_t)val);
-        while (*p == ' ' || *p == ',') p++;
-        if (*p == ']') { result.push_back(ids); break; }
         while (*p && *p != ']') {
             while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r') p++;
-            if (*p == ']' || !*p) break;
-            val = strtol(p, (char**)&p, 10);
+            if (*p == ']' || *p == '[' || !*p) break;
+            long val = strtol(p, (char**)&p, 10);
+            if (val == 0 && p == json.c_str()) { p++; continue; }
             ids.push_back((uint32_t)val);
+            while (*p == ' ' || *p == ',') p++;
         }
-        result.push_back(ids);
+        if (!ids.empty()) result.push_back(ids);
         if (*p == ']') p++;
     }
     return result;
@@ -392,7 +385,7 @@ int main() {
     S.eps = 1e-6f; S.M = 8;
 
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.4.1 (streaming)\n");
+    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.4.0 (correct model)\n");
     fprintf(stderr, "Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
 
     die(cudaStreamCreate(&S.st), "stream");
@@ -506,7 +499,6 @@ int main() {
         int max_tokens = find_int(line, "max_tokens", 30);
         float temperature = find_float(line, "temperature", 0);
         int top_k = find_int(line, "top_k", 0);
-        bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
         for (int s = 0; s < gen_start; s++) {
@@ -528,22 +520,6 @@ int main() {
                 uint32_t next_id;
                 cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
                 outputs[m].push_back(next_id);
-
-                // Stream token if enabled
-                if (stream) {
-                    std::string tok_txt = tokenizer.decode(next_id);
-                    printf("data: {\x22token\x22:%u,\x22text\x22:\x22", next_id); fflush(stdout);
-                    for (size_t i = 0; i < tok_txt.size(); i++) {
-                        char c = tok_txt[i];
-                        if (c == '"') printf("\\\"");
-                        else if (c == '\\') printf("\\\\");
-                        else if (c == '\n') printf("\\n");
-                        else if (c == '\r') printf("\\r");
-                        else printf("%c", c);
-                    }
-                    printf("}\\n\\n"); fflush(stdout);
-                }
-
                 if (next_id == 151643) break;
 
                 // Embed next token
@@ -555,12 +531,7 @@ int main() {
             batched_decode_step(S, s);
         }
 
-        if (stream) {
-            printf("data: [DONE]\n\n"); fflush(stdout);
-        } else {
-            server_write_results(outputs, tokenizer);
-        }
-
+        write_results(outputs, tokenizer);
         cudaMemset(S.d_kc, 0, kv_sz); cudaMemset(S.d_vc, 0, kv_sz);
     }
     return 0;

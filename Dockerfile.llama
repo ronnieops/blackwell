@@ -1,0 +1,55 @@
+# Dockerfile.llama — llama.cpp Q4_K_M server for Blackwell benchmark comparison
+#
+# Serves the same OpenAI-compatible API as Blackwell containers.
+# Uses the same GPU (RTX 5060 Ti) with Q4_K_M quantization.
+#
+# Dockerfile.llama — llama.cpp Q4_K_M server for Blackwell benchmark comparison
+#
+# Serves the same OpenAI-compatible API as Blackwell containers.
+# Uses the same GPU (RTX 5060 Ti) with Q4_K_M quantization.
+#
+# Prep (run before build):
+#   ./scripts/copy_llama_docker.sh
+#
+# Build:
+#   docker build -t llama-server -f Dockerfile.llama .
+#
+# Run:
+#   docker run --gpus all -p 8082:8082 llama-server
+#
+# Test:
+#   curl http://localhost:8082/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"qwen3-1.7b-q4_k_m","messages":[{"role":"user","content":"Hello"}],"max_tokens":10}'
+
+FROM ubuntu:24.04
+
+LABEL description="llama.cpp Q4_K_M Server (Blackwell comparison)"
+LABEL version="0.1.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# llama-server binary + shared libs (bundled by scripts/copy_llama_docker.sh)
+COPY llama-docker/llama-server /app/
+COPY llama-docker/*.so* /app/
+
+# 1.7B Q4_K_M GGUF model (bundled by scripts/copy_llama_docker.sh)
+COPY llama-docker/model.gguf /app/model.gguf
+
+ENV LD_LIBRARY_PATH=/app
+
+EXPOSE 8082
+
+ENV CUDA_VISIBLE_DEVICES=0
+
+CMD ["/app/llama-server", \
+     "-m", "/app/model.gguf", \
+     "--port", "8082", \
+     "--host", "0.0.0.0", \
+     "-ngl", "99", \
+     "--log-disable"]

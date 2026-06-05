@@ -14,6 +14,17 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - Fixed 8B batched attention KV cache layout + batched KV writes
 - Built Docker image `blackwell-server:v0.4.0` (4.13 GB)
 
+**Session 42 completed**:
+- HTTP streaming: SSE token-by-token output via `/v1/completions/stream`
+- Fixed parse_prompt_ids infinite loop bug (didn't handle string prompts)
+- Fixed streaming printf buffering with fflush
+- Used httplib ContentProvider API for true streaming
+- Pushed Docker v0.4.1 to ghcr.io/ronnieops/blackwell-server
+
+**Session 43 - blocked**:
+- 9B GatedDeltaNet optimization blocked: weights missing, HF cache incomplete (19GB partial)
+- Need to re-download Qwen3.5-9B from HuggingFace to proceed
+
 ---
 
 ## 2. Current Status
@@ -24,7 +35,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 | CUDA | 13.3, SM_120a, C++17, CMake |
 | Library | 191 symbols in `build/libblackwell_kernels.a` (was 177, grew) |
 | Branch | master |
-| Server | **v0.4.0 — correct model** (per-layer RMSNorm, head_norm, RoPE) |
+| Server | **v0.4.1 — correct model + streaming** (per-layer RMSNorm, head_norm, RoPE) |
 
 ### Throughput
 
@@ -45,6 +56,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 | `GET /v1/models` | ✅ model list |
 | `POST /v1/completions` | ✅ " Paris, a which is" |
 | `POST /v1/chat/completions` | ✅ works |
+| `POST /v1/completions/stream` | ✅ SSE token-by-token streaming |
 
 ---
 
