@@ -92,7 +92,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 | Docker build + tag | LOW | ✅ Done | blackwell-server:v0.4.0 built |
 | CUDA Graph (server) | LOW | Deferred | No speedup with correct model |
 | head_norm+RoPE fusion | LOW | Deferred | Would close benchmark-vs-server gap |
-| M=8 OOM at 33+ layers | MEDIUM | Pending | Pinned memory limit (~256 hugepages), save/restore buffers |
+| M=8 OOM at 33+ layers | MEDIUM | ✅ Done | Removed save/restore buffers — M=8 36L now works |
 
 ### 8B Batched Attention Results (session 41)
 
@@ -100,10 +100,14 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 |--------|-------------|--------------|---------|------------|
 | 8B M=8, 28L | 7.1 t/s | **41.0 t/s** | 1.39x | 50% |
 | 8B M=8, 32L | 6.2 t/s | **35.8 t/s** | 1.39x | 43% |
+| **8B M=8, 36L** | **5.5 t/s** | **31.9 t/s** | **1.39x** | **38.6%** |
+| 8B M=8, 32L | 6.2 t/s | **35.8 t/s** | 1.39x | 43% |
 | 8B M=7, 28L | 8.1 t/s | **42.1 t/s** | 1.35x | 51% |
 | 8B M=6, 36L | 7.4 t/s | **34.9 t/s** | 1.26x | 42% |
 
 **Note**: M=1 is still faster per token than M=8 batched (46 vs 41 t/s). M=8 only useful for throughput when parallel decode is needed.
+
+**Memory fix**: Removed save/restore buffers (9.4 GB pinned memory for M=8 36L). Full 36 layers now works.
 
 ### KV Cache Layout Fix (8B batched attention)
 - Old: `[M][layers][nkv][ms][hd]` — incompatible with `update_kv_cache` (ignores batch_idx)
