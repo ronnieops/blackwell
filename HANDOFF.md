@@ -28,6 +28,13 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - MLP batched GEMV fails: slower due to layout mismatch, kept per-seq
 - 9B weights restored from HF cache (10.4 GB)
 
+**Session 44 - profiling**:
+- Profile breakdown (M=8): MLP 74.8%, LinAttn 18%, FullAttn 3.2%, Conv+Rec 2.1%
+- MLP is the bottleneck — per-seq GEMV (3 × 32 layers = 96 calls/step)
+- Batching MLP: 1.8× slower (gate+up), kept per-seq
+- 9B at practical limit — weight matrices (200 MB/layer) exceed L2 cache
+- Bandwidth-bound. Further optimization has negligible room.
+
 ---
 
 ## 2. Current Status
