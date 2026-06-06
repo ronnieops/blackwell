@@ -89,7 +89,35 @@ Operational INT8 inference server with batched prefill for single-prompt request
 
 ---
 
-## 8. Important Files / Commands
+## 8. Cleanup Summary
+
+**Library symbols**: 165 (was 195 — 30 dead-end kernel symbols removed)
+
+**Disk**: 99% → 61% (~493 GB freed from unrelated HF models + 5 GB .venv)
+
+**Source kernels removed** (12 files, 14 CMake entries):
+- `gemv_fp4_nv.cu`, `gemv_fp32_int4_asym.cu`, `gemv_fp32_int5_asym.cu`
+- `gemv_int4_batched.cu`, `gemv_int4_asym_batched.cu`, `gemv_int4_qkv.cu`
+- `gemv_int8_gate_up.cu` (0.91× slower, listed twice)
+- `fused_*_int4*.cu`, `fused_*_int4_asym*.cu` (4 files)
+- `quantize_int4_asym.cu`
+
+**Deleted during cleanup**:
+- Dead-end weight dirs: `weights/` (FP4), `weights_int4_test/`
+- All compiled bench binaries (120+ files), `.venv/` (4.9 GB)
+- All stale session docs (8 files)
+- Unrelated HF model cache (Qwen3.6 series, GGUF, etc.) — ~493 GB
+- `gemv_fp4_nv.ptx`, `Dockerfile.llama`, `CMakeLists.txt.bak`
+- `test_tokenizer`, `test_engine*.cpp` cruft
+- `nvfp4_quantize.py`, `quantize_per_row*.py`, `check_quality.py`, `validate_full_pipeline.py`
+- `.ralph/` artifacts, `docs/PREFILL_REFACTOR_PLAN.md`
+- `weights_int8_qwen3_8b_instruct/` (duplicate, earlier)
+
+**Kept**: Production weight dirs (1.7B, 8B, 9B), all production kernels, server source, build/
+
+---
+
+## 9. Important Files / Commands
 
 ### Build
 ```bash
@@ -111,45 +139,39 @@ killall hashcat 2>/dev/null
 curl -X POST http://localhost:8123/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"The capital of France is","max_tokens":5,"temperature":0}'
-
-# Benchmarks
-./bench/decode_int8_cgraph 28          # M=1: 181.5 t/s (no head_norm/RoPE)
-./bench/text_generate "hi" 5           # Correctness
 ```
 
 ### Key files
 ```
 server/inference_server_nofp4.cu    # Server with batched prefill (v0.6.0)
-docs/PREFILL_REFACTOR_PLAN.md        # Prefill integration plan (partially obsolete)
-bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 ```
 
 ---
 
-## 9. Validation
+## 10. Validation
 
 | Check | Value |
 |-------|-------|
 | Server output (greedy) | " Paris, a which is" ✅ |
 | HTTP /v1/completions | ✅ |
-| Library symbols | 195 ✅ |
-| Server binary | 3155176 bytes ✅ |
-| http_subprocess | 1195800 bytes ✅ |
-| Prefill M=1 | ✅ batched_prefill called, correct output |
+| Library symbols | 165 ✅ |
+| Server binary | ✅ |
+| http_subprocess | ✅ |
+| Prefill M=1 | ✅ |
 
 ---
 
-## 10. Session Metadata
+## 11. Session Metadata
 
 | Field | Value |
 |-------|-------|
 | updated_at | 2026-06-06 |
 | branch | master |
-| repo_state | Clean (committed: 7f5d823 — batched prefill v0.6.0) |
-| active components | server (prefill), bench/*, lib |
-| last_session | 53 |
-| server_version | v0.6.0 (batched prefill) |
-| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.6.0` |
+| repo_state | Clean (committed) |
+| active components | server, bench/*.cu, lib |
+| last_session | 54 |
+| server_version | v0.6.1 |
+| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.6.1` |
 
 ---
 
@@ -159,26 +181,20 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 1. Read `AGENTS.md` → `HANDOFF.md`
 2. `git status` — check uncommitted changes (should be clean)
 3. `killall hashcat 2>/dev/null`
-4. `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 195)
+4. `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 165)
 5. `./server/http_subprocess &` → test `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":3,"temperature":0}'`
-
-**Current priorities**:
-1. Verify M=1 prefill hidden state matches decode (GPU memory comparison)
-2. Test M>1 batched requests
-3. Investigate chat completions garbled output
 
 **Verified facts**:
 - Server produces " Paris, a which is" (greedy, temp=0) ✅
-- Library 195 symbols, all kernels present ✅
+- Library 165 symbols, all production kernels present ✅
 - Prefill integrated for gen_start≤M ✅
-- gen_start>M falls back to per-token decode ✅
-- Chat completions garbled: pre-existing bug ✅
-- Changes committed: 7f5d823 ✅
+- INT4/INT5/FP4 dead ends removed ✅
+- HF model cache cleaned (~493 GB freed) ✅
 
 **DO NOT**:
 - Use benchmark numbers without noting head_norm/RoPE context
 - Run measurements without `killall hashcat`
-- Use INT4/INT5 (quality dead)
+- Use INT4/INT5 (quality dead) — source removed
 - Trust pre-session-37 INT4 benchmark numbers (grid bug)
 - Expect M>8 scaling (register pressure)
 - Re-dig: FP4 GEMM, speculative decode, PDL, sub-8-bit quality

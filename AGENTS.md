@@ -35,7 +35,7 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 195 symbols in `build/libblackwell_kernels.a`
+**Library**: 165 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed 30 dead-end INT4/INT5/FP4 kernel symbols)
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -143,7 +143,7 @@ killall hashcat 2>/dev/null
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 195
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 165 (was 195 before cleanup)
 ```
 
 ### Docker server
@@ -295,7 +295,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (M=1 benchmark)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 195)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 165)
 HTTP test: `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":1}'`
 
 ---
