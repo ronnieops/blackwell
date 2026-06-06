@@ -21,9 +21,12 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - Used httplib ContentProvider API for true streaming
 - Pushed Docker v0.4.1 to ghcr.io/ronnieops/blackwell-server
 
-**Session 43 - blocked**:
-- 9B GatedDeltaNet optimization blocked: weights missing, HF cache incomplete (19GB partial)
-- Need to re-download Qwen3.5-9B from HuggingFace to proceed
+**Session 43 completed**:
+- 9B GatedDeltaNet batched GEMV: attention+linear attn projections batched, 50.9 vs 49.8 t/s (+2.2%)
+- Batched RMSNorm kernel: fused_rmsnorm_batched(M blocks × 128 threads), 52.1 vs 49.9 t/s (+4.4% combined)
+- M=8: 52.1 t/s (73% of Q3_K_M 71.4 t/s). M<4 batched RMSNorm hurts (block overhead)
+- MLP batched GEMV fails: slower due to layout mismatch, kept per-seq
+- 9B weights restored from HF cache (10.4 GB)
 
 ---
 
@@ -45,6 +48,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 | Benchmark M=1 (no head_norm/RoPE) | 181 | 62% | Per-kernel, fused |
 | Benchmark CUDA Graph M=8 (no hn/RoPE) | 575 | 196% | ⚠️ Omits head_norm+RoPE |
 | Benchmark FP4 M=8 | 324 | 111% | Legacy, nofp4 now used |
+| 9B GatedDeltaNet M=8 | 52.1 | 73% of Q3_K_M | Batched GEMV + RMSNorm |
 
 ⚠️ 575 t/s benchmark omits head_norm and RoPE — not achievable with correct model.
 
