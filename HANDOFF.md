@@ -42,16 +42,15 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - Built `bench/prefill_benchmark.cu` — GEMM-only prefill benchmark (no attention)
 - Results: GEMM prefill ~15-24× faster than decode per token
 
-| SEQ | GEMM prefill (warp) | GEMM prefill (batched M=8) | Decode | Speedup (batched) |
-|-----|---------------------|------------------------------|--------|-------------------|
-| 4 | 109 t/s | 72 t/s | ~106 t/s | 0.7× |
-| 8 | ~100 t/s | 133 t/s | ~106 t/s | 1.3× |
-| 16 | 456 t/s | 419 t/s | ~106 t/s | 4.0× |
-| 32 | 485 t/s | 910 t/s | ~106 t/s | **8.6×** |
-| 64 | 1389 t/s | 1517 t/s | ~106 t/s | 14× |
-| 128 | 2444 t/s | 3953 t/s | ~106 t/s | **37×** |
-| 256 | ~3100 t/s | 4007 t/s | ~106 t/s | 38× |
-| 512 | ~4000 t/s | **13688 t/s** | ~106 t/s | **129×** |
+| SEQ | GEMM prefill (warp) | GEMM prefill (batched M=8) | WMMA GEMM | Decode | Speedup (batched) |
+|-----|---------------------|------------------------------|---------|--------|-------------------|
+| 32 | 485 t/s | 910 t/s | 554 t/s | ~106 t/s | 8.6× |
+| 64 | 1389 t/s | 1517 t/s | **1803 t/s** | ~106 t/s | 14× |
+| 128 | 2444 t/s | **3953 t/s** | 3596 t/s | ~106 t/s | **37×** |
+| 256 | ~3100 t/s | 4007 t/s | **6576 t/s** | ~106 t/s | 38× |
+| 512 | ~4000 t/s | **13688 t/s** | 8348 t/s | ~106 t/s | **129×** |
+
+WMMA only wins at SEQ=64,256. Batched is better at most SEQ. Quantization overhead dominates at large SEQ.
 
 - Attention not included (O(n²) cost, would dominate for long sequences)
 - Benchmark uses zero-initialized inputs — crashes at layer 3 with real weights (numerical issues from non-zero activations). Expected for research benchmark.
@@ -166,7 +165,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 
 ## 7. Suggested Next Actions
 
-1. **WMMA GEMM prefill** (HIGH): Transpose weights to [N×K] at load (~3s one-time). Then single `gemm_int8_wmma_fast` call per GEMV vs 16 batched calls. Expected: ~50,000+ t/s at SEQ=512 (vs current 13,688 t/s batched).
+1. **WMMA GEMM prefill** (tested, NOT WORTH IT): Transposed weights + single `gemm_int8_wmma_fast` call. Result: 8348 t/s at SEQ=512 vs batched 13,688 t/s. WMMA wins only at SEQ=64 and SEQ=256. Batched GEMV is better for most SEQ. Skip WMMA path.
 2. **Prefill attention kernel**: Build flash-attention-style prefill attention (O(n²) cost per layer). This is the missing piece for full prefill pipeline.
 3. **Prefill + decode pipeline**: Hook prefill into server for prompt processing + autoregressive decode.
 4. **8B HTTP server**: Port server to 8B weights for batched decode.
