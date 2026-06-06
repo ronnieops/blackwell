@@ -14,12 +14,12 @@ Operational INT8 inference server with batched prefill for single-prompt request
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Server (batched prefill) | ✅ Working | batched_prefill for gen_start≤M, decode fallback |
+| Server (batched prefill) | ✅ Working | v0.6.0: 1.7B and 8B models, batched_prefill for gen_start≤M |
 | HTTP endpoints | ✅ Working | /health, /v1/completions, /v1/chat/completions |
 | Library | 195 symbols | `build/libblackwell_kernels.a` |
 | Prefill (M=1) | ✅ Integrated | batched_prefill called from main loop |
 | Prefill (M>1, gen_start>1) | ✅ Fixed | Sequential per-item generation avoids KV cache conflicts |
-| Chat completions | ⚠️ Garbled | Pre-existing bug (not caused by prefill changes) |
+| Chat completions | ⚠️ Model limit | 1.7B too small for INT8 chat. Needs 8B+ instruct model |
 
 ### Throughput
 
@@ -34,12 +34,14 @@ Operational INT8 inference server with batched prefill for single-prompt request
 
 ## 3. Recent Decisions
 
-- **Prefill integrated (v0.5.0)**: Added d_x and d_tmp_save to ServerState. batched_prefill() is now called from main loop for gen_start≤M. gen_start>M falls back to per-token decode.
+- **Prefill integrated (v0.6.0)**: Added d_x and d_tmp_save to ServerState. batched_prefill() is now called from main loop for gen_start≤M. gen_start>M falls back to per-token decode.
 - **M>1 batched fixed**: Sequential per-item generation avoids KV cache conflicts. Different prompts now produce different outputs.
+- **v0.6.0 multi-model**: Server accepts model arg (1.7b/8b), loads correct weights and architecture
+- **8B separate lm_head**: INT8 lm_head for non-tied models
 - **parse_string_prompts bug fixed**: `strstr("prompt")` matched inside `"prompts"` → added boundary check `prompt_p[8] == ':'`
 - **INT4/INT5 dead**: Quality garbage after 28 layers. No viable path below INT8.
-- **Docker image**: `ghcr.io/ronnieops/blackwell-server:v0.5.0` (prefill integrated)
-- **Chat completions garbled**: Pre-existing bug, not caused by prefill changes.
+- **Docker image**: `ghcr.io/ronnieops/blackwell-server:v0.6.0` (prefill integrated)
+- **Chat completions**: 1.7B model (base+instruct) too small for coherent INT8 chat. Instruct model quantized to weights_int8_qwen3_1.7b_instruct/ but quality still poor.
 
 ---
 
@@ -62,7 +64,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 |-------|--------|-------|
 | hashcat interference | ⚠️ | Always `killall hashcat` before measurement |
 | Server vs benchmark gap | ~40% | head_norm + RoPE adds ~70% overhead |
-| Chat completions garbled | ⚠️ | Pre-existing, unrelated to prefill |
+| Chat completions | ⚠️ | 1.7B model too small for coherent chat with INT8 quantization |
 | Prefill (M>1) | ✅ Fixed | Sequential per-item generation. Different prompts produce different outputs |
 
 ---
@@ -73,17 +75,18 @@ Operational INT8 inference server with batched prefill for single-prompt request
 |------|----------|--------|
 | Prefill M=1 correctness | HIGH | ✅ Integrated — verify hidden state match |
 | Prefill M>1 full support | ✅ Fixed | Sequential per-item generation. M=1 fast path, M>1 correct but slower |
-| 8B HTTP server | MEDIUM | Port server to 8B weights |
-| Chat completions garbled | MEDIUM | Pre-existing — investigate tokenizer or special tokens |
+| 8B HTTP server | ✅ Done | v0.6.0 multi-model support |
+| Chat completions | ✅ Investigated | 1.7B too small, needs 8B+ instruct |
 | CUDA Graph (server) | LOW | Deferred — no speedup with correct model |
 
 ---
 
 ## 7. Suggested Next Actions
 
-1. **M>1 batched KV cache fix**: Generate loop shares KV cache across M batch items. All items converge to last prompt's output. Fix: allocate separate KV regions per batch item OR process M>1 requests sequentially.
-2. **Investigate chat completions**: Garbled output for `<|im_start|>` / `<|im_end|>` token handling.
-3. **8B HTTP server**: Port server to 8B weights (weights_int8_qwen3_8b/).
+1. ✅ **M>1 batched KV cache fix**: Fixed. Sequential per-item generation.
+2. ✅ **Chat completions**: Investigated. 1.7B too small for INT8 chat. Instruct model quantized but still garbled.
+3. ✅ **8B HTTP server**: Done. v0.6.0 supports both 1.7B and 8B models.
+4. **Next**: Port 8B instruct model for chat quality. Consider 9B GatedDeltaNet.
 
 ---
 
@@ -117,7 +120,7 @@ curl -X POST http://localhost:8123/v1/completions \
 
 ### Key files
 ```
-server/inference_server_nofp4.cu    # Server with batched prefill (v0.5.0)
+server/inference_server_nofp4.cu    # Server with batched prefill (v0.6.0)
 docs/PREFILL_REFACTOR_PLAN.md        # Prefill integration plan (partially obsolete)
 bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 ```
@@ -143,11 +146,11 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 |-------|-------|
 | updated_at | 2026-06-06 |
 | branch | master |
-| repo_state | Clean (committed: 7f5d823 — batched prefill v0.5.0) |
+| repo_state | Clean (committed: 7f5d823 — batched prefill v0.6.0) |
 | active components | server (prefill), bench/*, lib |
 | last_session | 53 |
-| server_version | v0.5.0 (batched prefill) |
-| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.5.0` |
+| server_version | v0.6.0 (batched prefill) |
+| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.6.0` |
 
 ---
 
