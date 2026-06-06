@@ -52,6 +52,38 @@ static float* load_f32(const char* dir, const char* name, int n) {
     float* d; cudaMalloc(&d, n*4); cudaMemcpy(d, h, n*4, cudaMemcpyHostToDevice); free(h); return d;
 }
 
+// Load token embeddings as FP32 (dequantize INT8 → FP32)
+// Embeddings stored as [H × vocab] INT8 (h[0]=H, h[1]=vocab)
+// Returns device pointer with [num_tokens × H] FP32 embeddings
+static float* load_embeddings(const char* dir, int num_tokens, int H, int* vocab_out) {
+    char p[1024]; snprintf(p, 1024, "%s/embed_tokens.int8_t", dir);
+    FILE* f = fopen(p, "rb"); if (!f) { printf("FAIL open %s\n", p); exit(1); }
+    int h[5]; (void)fread(h, 4, 5, f); int K = h[0], vocab = h[1];
+    *vocab_out = vocab;
+    if (K != H) { printf("EMBED K MISMATCH: %d vs %d\n", K, H); exit(1); }
+    std::vector<int8_t> emb_int8((size_t)K * vocab); (void)fread(emb_int8.data(), 1, (size_t)K * vocab, f); fclose(f);
+    snprintf(p, 1024, "%s/embed_tokens.scale_t", dir); f = fopen(p, "rb"); if (!f) { printf("FAIL open %s\n", p); exit(1); }
+    (void)fread(h, 4, 5, f); int ns = h[3] * h[4];
+    std::vector<float> emb_sc(ns); (void)fread(emb_sc.data(), 4, ns, f); fclose(f);
+    // Dequantize first num_tokens embeddings to FP32
+    // Embeddings are [H × vocab], so token v is at offset v*H
+    float* emb_fp32 = (float*)malloc((size_t)num_tokens * H * 4);
+    for (int t = 0; t < num_tokens; t++) {
+        for (int i = 0; i < H; i++) {
+            int blk = i / 16;
+            float val = (float)emb_int8[t * H + i] * emb_sc[blk];
+            // Clamp extreme values for numerical stability
+            if (val > 100.f) val = 100.f;
+            if (val < -100.f) val = -100.f;
+            emb_fp32[t * H + i] = val;
+        }
+    }
+    float* d_emb; cudaMalloc(&d_emb, (size_t)num_tokens * H * 4);
+    cudaMemcpy(d_emb, emb_fp32, (size_t)num_tokens * H * 4, cudaMemcpyHostToDevice);
+    free(emb_fp32);
+    return d_emb;
+}
+
 // Batched GEMV: runs gemv_int8_warp with M rows in parallel
 // M = seq_len for prefill, M = 1 for decode
 // Each thread block processes 1 row, warp processes 32 rows cooperatively
@@ -157,13 +189,18 @@ int main(int argc, char** argv) {
     chk(cudaMalloc(&d_mlp_sc, SEQ * (ID / 16) * 4));
     float* d_h_out; chk(cudaMalloc(&d_h_out, SEQ * H * 4));
     printf("All buffers allocated\n"); fflush(stdout);
+    // Load actual token embeddings (real data)
+    int vocab;
+    float* d_emb = load_embeddings(WDIR, SEQ, H, &vocab);
+    printf("Loaded %d token embeddings (vocab=%d)\n", SEQ, vocab); fflush(stdout);
+    // Copy embeddings to d_h
+    cudaMemcpy(d_h, d_emb, SEQ * H * 4, cudaMemcpyDeviceToDevice);
+    cudaFree(d_emb);
+    printf("Input: real token embeddings (not zeros)\n"); fflush(stdout);
     cudaStream_t st;
     cudaError_t e = cudaStreamCreate(&st);
     printf("Stream created: %s\n", cudaGetErrorString(e)); fflush(stdout);
     if (e != cudaSuccess) { printf("Stream create FAIL: %s\n", cudaGetErrorString(e)); return 1; }
-
-    // Zero init
-    cudaMemset(d_h, 0, SEQ * H * 4);
 
     // Warmup
     for (int w = 0; w < 3; w++) {
