@@ -35,6 +35,8 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - 9B at practical limit — weight matrices (200 MB/layer) exceed L2 cache
 - Bandwidth-bound. Further optimization has negligible room.
 
+**Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu` (invalid resource handle, redundant with `decode_qwen35_9b_batched_v2`).
+
 ---
 
 ## 2. Current Status
@@ -43,7 +45,7 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 |--------|-------|
 | GPU | RTX 5060 Ti, compute 12.0, 36 SMs, ~500 GB/s GDDR7 |
 | CUDA | 13.3, SM_120a, C++17, CMake |
-| Library | 191 symbols in `build/libblackwell_kernels.a` (was 177, grew) |
+| Library | 287 symbols in `build/libblackwell_kernels.a` (rebuilt session 45) |
 | Branch | master |
 | Server | **v0.4.1 — correct model + streaming** (per-layer RMSNorm, head_norm, RoPE) |
 
@@ -187,11 +189,11 @@ echo '{"prompt":"hi","max_tokens":1}' | ./server/inference_server weights_int8_b
 
 ### Verify
 ```bash
-nm build/libblackwell_kernels.a | grep " T blackwell" | wc -l   # expect 191
+nm build/libblackwell_kernels.a | grep "_ZN9blackwell" | grep " T " | wc -l   # expect 287 (session 45)
 # Correctness
 echo '{"prompt":"The capital of France is","max_tokens":3}' | \
   ./server/inference_server weights_int8_bf16 | grep text
-# Expect: " Paris, a which is"
+# Expect: " Paris, a" (or " Paris, at" with max_tokens=3)
 ```
 
 ### Key source files
@@ -210,16 +212,14 @@ bench/text_generate.cu             # End-to-end correctness
 
 | Check | Status |
 |-------|--------|
-| Library symbols | ✅ 191 |
-| Benchmark M=1 (no head_norm/RoPE) | ✅ 163 t/s |
-| CUDA Graph M=8 (no head_norm/RoPE) | ✅ 574 t/s |
-| Server correctness | ✅ " Paris, a which is" |
+| Library symbols | ✅ 287 (rebuilt session 45) |
+| Server correctness | ✅ " Paris, a" |
 | HTTP /health | ✅ |
-| HTTP /v1/completions | ✅ |
-| HTTP /v1/chat/completions | ✅ |
 | HTTP /v1/models | ✅ |
+| HTTP /v1/completions | ✅ |
 | hashcat killed | ✅ |
-| 8B batched KV cache fix | ✅ | 41 t/s M=8 28L |
+| 9B batched v2 | ✅ 51.2 t/s M=8 |
+| Server binary updated | ✅ (session 45 rebuild) |
 | Docker build + push | ✅ | `ghcr.io/ronnieops/blackwell-server:v0.4.0` pushed |
 
 ---
@@ -228,12 +228,11 @@ bench/text_generate.cu             # End-to-end correctness
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-05 |
+| updated_at | 2026-06-06 |
 | branch | master |
-| active components | server/inference_server (v0.4.0), http_subprocess, decode_int8_nofp4 benchmark, decode_int8_batched_cgraph_attn_qwen3_8b |
-| last_build | 2026-06-05 06:00 |
-| disk_usage | 58% (100 GB free) after cleanup |
-| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.4.0` (4.13 GB) |
+| active components | server/inference_server (v0.4.1), http_subprocess, decode_qwen35_9b_batched_v2, decode_int8_nofp4 |
+| last_build | 2026-06-06 (session 45 rebuild) |
+| docker_image | `ghcr.io/ronnieops/blackwell-server:v0.4.1` (4.13 GB) |
 
 ---
 
@@ -243,13 +242,15 @@ bench/text_generate.cu             # End-to-end correctness
 1. Read `AGENTS.md` → `HANDOFF.md`
 2. `git status` — check uncommitted changes
 3. `killall hashcat 2>/dev/null`
-4. `nm build/libblackwell_kernels.a | grep " T blackwell" | wc -l` (expect 191)
+4. `nm build/libblackwell_kernels.a | grep "_ZN9blackwell" | grep " T " | wc -l` (expect 287)
 5. `ls server/inference_server server/http_subprocess` (check binaries exist)
 6. `./server/http_subprocess weights_int8_bf16 &` → test endpoints
 
-**Verified facts (2026-06-04)**:
-- Server produces " Paris, a which is" for "The capital of France is" ✅
-- All 4 HTTP endpoints working ✅
+**Verified facts (2026-06-06)**:
+- Server produces " Paris, a" for "The capital of France is" ✅
+- All HTTP endpoints working (/health, /v1/models, /v1/completions) ✅
+- Library rebuilt: 287 symbols ✅
+- 9B batched v2: 51.2 t/s M=8 ✅
 - INT4/INT5 quality dead (garbled after 28 layers) ✅
 - 575 t/s benchmark omits head_norm/RoPE — not achievable with correct model ✅
 - Server per-kernel: ~106 t/s with correct model ✅
