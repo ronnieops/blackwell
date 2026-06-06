@@ -350,3 +350,24 @@ M bench/decode_int8_batched_cgraph_attn_qwen3_8b.cu — KV cache layout fix
 - `M HANDOFF.md` — this update
 
 **Current server state**: Decode-only, correct output. HTTP endpoints working. ~106 t/s.
+
+---
+
+## Next Session: Prefill Refactor
+
+See `docs/PREFILL_REFACTOR_PLAN.md` for full plan.
+
+**Quick summary**:
+1. Root cause: server's `batched_prefill` used `d_residual[m]` as both input AND output buffer. Benchmark uses `d_x` as working buffer. This caused wrong residual flow for intermediate layers.
+
+2. Fix: Add `d_x` working buffer, rewrite `batched_prefill` to use layer-first processing (process all M tokens for layer l before moving to layer l+1), match benchmark's residual handling.
+
+3. Steps:
+   - Add `d_x` buffer to ServerState
+   - Rewrite `batched_prefill` with layer-first pattern
+   - Integrate into server main loop
+   - Verify M=1 match, then M>1
+
+**Estimated time**: 2-3 hours.
+
+**Alternative**: Keep server decode-only. Pre-fill requests fall back to per-token decode (current behavior). Simpler, correct, but no prefill speedup.
