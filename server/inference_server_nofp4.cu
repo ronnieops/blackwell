@@ -103,7 +103,7 @@ struct ServerState {
     int M;
     int8_t* d_xi8; float* d_xi8s;
     float* d_Q, *d_K, *d_V;
-    float* d_attn;
+    float* d_attn, *d_attn_out;
     int8_t* d_attn_i8; float* d_attn_i8s;
     float* d_gate, *d_up, *d_mlp;
     int8_t* d_mlp_i8; float* d_mlp_i8s;
@@ -384,6 +384,94 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
     }
 }
 
+// ── Prefill: process M prompt tokens in parallel through all layers ──
+static void batched_prefill(ServerState& S, int M) {
+    if (M <= 0) return;
+    size_t kv_seq_stride = (size_t)S.nkv * S.hd * S.ms;
+
+    for (int l = 0; l < S.NL; l++) {
+        size_t kv_layer_off = (size_t)l * S.nkv * S.hd * S.ms;
+
+        // ── Input layernorm + quantize (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.d_residual[m], S.d_rn_in[l], S.H, S.eps, S.st);
+        }
+
+        // ── Q/K/V projections (per-sequence, batched) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::gemv_int8_warp(S.d_Q + m * S.Q, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].q.d, S.layers[l].q.sc, S.H, S.Q, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_K + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].k.d, S.layers[l].k.sc, S.H, S.KV, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_V + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.layers[l].v.d, S.layers[l].v.sc, S.H, S.KV, S.st);
+
+            // Q/K head norms
+            head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
+            head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K + m * S.KV, S.layers[l].kn, S.nkv, S.hd, S.eps);
+
+            // RoPE for each position (seq_pos = m)
+            blackwell::kernels::update_decode_seq_pos(m, S.st);
+            cudaStreamSynchronize(S.st);
+            rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q + m * S.Q, S.nqh, S.hd, S.d_seq_pos);
+            rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
+        }
+
+        // ── Attention: batched M sequences attending to all M ──
+        // For prefill, each sequence m attends to all previous tokens
+        // Use batched attention if available, else fallback to loop
+        for (int m = 0; m < M; m++) {
+            // Each batch item attends to all M tokens
+            blackwell::kernels::attention_decode_batched_gqa(
+                S.d_attn, S.d_Q, S.d_K, S.d_V,  // Full K,V for all M
+                m, S.nqh, S.nkv, S.hd, S.ms,
+                M, (int)kv_seq_stride, (int)kv_layer_off, S.st);
+            // Copy attention output for this sequence
+            cudaMemcpyAsync(S.d_attn_out + m * S.Q, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
+        }
+
+        // ── Attention output projection + residual 1 (per-sequence) ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), 
+                S.d_attn_out + m * S.Q, S.Q, S.st);
+            blackwell::kernels::gemv_int8_warp(S.d_proj + m * S.H, S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
+                S.layers[l].o.d, S.layers[l].o.sc, S.Q, S.H, S.st);
+            // Residual 1: proj = attn_out + input
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+            cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+        }
+
+        // ── Post-attention layernorm + quantize ──
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::fused_rmsnorm_quant_int8(
+                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.d_proj + m * S.H, S.d_rn_post[l], S.H, S.eps, S.st);
+        }
+
+        // ── MLP: batched gate/up ──
+        blackwell::kernels::gemv_int8_batched(S.d_gate, S.d_xi8, S.d_xi8s,
+            S.layers[l].gate.d, S.layers[l].gate.sc, S.H, S.ID, M, S.st);
+        blackwell::kernels::gemv_int8_batched(S.d_up, S.d_xi8, S.d_xi8s,
+            S.layers[l].up.d, S.layers[l].up.sc, S.H, S.ID, M, S.st);
+
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::apply_swiglu(S.d_mlp + m * S.ID, S.d_gate + m * S.ID, S.d_up + m * S.ID, S.ID, S.st);
+            blackwell::kernels::quantize_int8(S.d_mlp_i8 + m * S.ID, S.d_mlp_i8s + m * (S.ID / 16), S.d_mlp + m * S.ID, S.ID, S.st);
+        }
+
+        // ── MLP down projection + residual 2 ──
+        blackwell::kernels::gemv_int8_batched(S.d_proj, S.d_mlp_i8, S.d_mlp_i8s,
+            S.layers[l].down.d, S.layers[l].down.sc, S.ID, S.H, M, S.st);
+
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+            cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────
 int main() {
     ServerState S;
@@ -473,6 +561,7 @@ int main() {
     cudaMalloc(&S.d_xi8, S.M * S.H); cudaMalloc(&S.d_xi8s, S.M * (S.H / 16) * 4);
     cudaMalloc(&S.d_Q, S.M * S.Q * 4); cudaMalloc(&S.d_K, S.M * S.KV * 4); cudaMalloc(&S.d_V, S.M * S.KV * 4);
     cudaMalloc(&S.d_attn, S.M * S.Q * 4);
+    cudaMalloc(&S.d_attn_out, S.M * S.Q * 4);  // attention output buffer for prefill
     cudaMalloc(&S.d_attn_i8, S.M * S.Q); cudaMalloc(&S.d_attn_i8s, S.M * (S.Q / 16) * 4);
     cudaMalloc(&S.d_gate, S.M * S.ID * 4); cudaMalloc(&S.d_up, S.M * S.ID * 4); cudaMalloc(&S.d_mlp, S.M * S.ID * 4);
     cudaMalloc(&S.d_mlp_i8, S.M * S.ID); cudaMalloc(&S.d_mlp_i8s, S.M * (S.ID / 16) * 4);
@@ -509,13 +598,15 @@ int main() {
         bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
+        // Process prompt tokens one by one (decode mode)
         for (int s = 0; s < gen_start; s++) {
             embed_batch(S, prompts, s);
             batched_decode_step(S, s);
         }
 
-        // Generate
+        // Generate (after prefill, start from position gen_start)
         std::vector<std::vector<uint32_t>> outputs(M);
+        bool did_prefill = (gen_start > 0 && gen_start <= M);
         for (int s = gen_start; s < gen_start + max_tokens; s++) {
             for (int m = 0; m < M; m++) {
                 // Final norm + lm_head + sample

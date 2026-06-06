@@ -14,10 +14,12 @@
 
 using blackwell::kernels::gemv_int8_warp;
 using blackwell::kernels::gemv_int8_batched;
+using blackwell::kernels::gemm_int8_wmma_fast;
 using blackwell::kernels::quantize_int8;
 using blackwell::kernels::fused_rmsnorm_batched;
 using blackwell::kernels::apply_swiglu;
 using blackwell::kernels::vector_add_fp32;
+using blackwell::kernels::attention_prefill;
 
 static void chk(cudaError_t e, const char* m = "") {
     if (e != cudaSuccess) { printf("FAIL %s: %s\n", m, cudaGetErrorString(e)); exit(1); }
@@ -156,17 +158,18 @@ int main(int argc, char** argv) {
     printf("Model: Qwen3-1.7B INT8, NL=%d, H=%d\n", NL, H);
     printf("Sequence length: %d tokens\n\n", SEQ);
 
-    // Load weights
+    // Load weights (transposed for WMMA GEMM)
     std::vector<LW> layers(NL);
-    printf("Loading weights...\n"); fflush(stdout);
+    printf("Loading weights (transposed for WMMA)...\n"); fflush(stdout);
     for (int l = 0; l < NL; l++) {
         char p[256];
-        snprintf(p, 256, "%d_self_attn.q_proj", l); layers[l].q = load_int8(WDIR, p);
-        snprintf(p, 256, "%d_self_attn.k_proj", l); layers[l].k = load_int8(WDIR, p);
-        snprintf(p, 256, "%d_self_attn.v_proj", l); layers[l].v = load_int8(WDIR, p);
-        snprintf(p, 256, "%d_mlp.gate_proj", l);   layers[l].gate = load_int8(WDIR, p);
-        snprintf(p, 256, "%d_mlp.up_proj", l);     layers[l].up = load_int8(WDIR, p);
-        snprintf(p, 256, "%d_mlp.down_proj", l);   layers[l].down = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.q_proj", l); layers[l].q = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.k_proj", l); layers[l].k = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.v_proj", l); layers[l].v = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.o_proj", l); layers[l].o = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_mlp.gate_proj", l);   layers[l].gate = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_mlp.up_proj", l);     layers[l].up = load_int8_transposed(WDIR, p);
+        snprintf(p, 256, "%d_mlp.down_proj", l);   layers[l].down = load_int8_transposed(WDIR, p);
         snprintf(p, 256, "%d_input_layernorm", l); layers[l].rn_in = load_f32(WDIR, p, H);
         if ((l+1) % 7 == 0) printf("  %d/%d\n", l+1, NL);
     }
