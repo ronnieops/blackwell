@@ -22,6 +22,11 @@ struct GpuTimer {
     void start(cudaStream_t st=0) { cudaEventRecord(s, st); }
     float stop(cudaStream_t st=0) { cudaEventRecord(e, st); cudaEventSynchronize(e); float ms=0; cudaEventElapsedTime(&ms, s, e); return ms; }
 };
+struct CompTimer {
+    float rmsn = 0, quant = 0, latn_gemv = 0, fact_gemv = 0, conv_rec = 0, mlp_gemv = 0, residual = 0;
+};
+#define TICK(t) cudaEventRecord((t).s, st)
+#define TOCK(t, acc) cudaEventRecord((t).e, st); cudaEventSynchronize((t).e); float _et=0; cudaEventElapsedTime(&_et,(t).s,(t).e); acc += _et
 struct Int8W { int K, N; int8_t* d; float* sc; };
 static Int8W load_int8(const char* dir, const char* name) {
     char path[512]; snprintf(path, 512, "%s/%s.int8_t", dir, name);
@@ -187,6 +192,21 @@ int main(int argc, char** argv) {
     printf("Decoding %d tokens (M=%d)...\n", NT, M); fflush(stdout);
     GpuTimer timer; timer.start(st);
     int fai = 0;
+    CompTimer ct;
+    cudaEvent_t ts_rn, te_rn, ts_q, te_q, ts_lg, te_lg, ts_fg, te_fg, ts_cr, te_cr, ts_mg, te_mg, ts_r1, te_r1;
+    cudaEventCreate(&ts_rn); cudaEventCreate(&te_rn);
+    cudaEventCreate(&ts_q); cudaEventCreate(&te_q);
+    cudaEventCreate(&ts_lg); cudaEventCreate(&te_lg);
+    cudaEventCreate(&ts_fg); cudaEventCreate(&te_fg);
+    cudaEventCreate(&ts_cr); cudaEventCreate(&te_cr);
+    cudaEventCreate(&ts_mg); cudaEventCreate(&te_mg);
+    cudaEventCreate(&ts_r1); cudaEventCreate(&te_r1);
+    auto acc = [&](cudaEvent_t s, cudaEvent_t e, float& dst) {
+        float ms; cudaEventSynchronize(e); cudaEventElapsedTime(&ms, s, e); dst += ms;
+    };
+    auto tick = [&](cudaEvent_t e) { cudaEventRecord(e, st); };
+    #define ACC(s, e, f) tick(s); (void)0
+    #define DONE(s, e, f) tick(e); acc(s, e, ct.f)
 
     for (int step = 0; step < NT; step++) {
         h_step = step; cudaMemcpy(d_step, &h_step, 4, cudaMemcpyHostToDevice);
@@ -194,18 +214,27 @@ int main(int argc, char** argv) {
         for (int l = 0; l < 32; l++) {
             bool il = (LTYPE[l][0] == 'l');
             // Batched input RMSNorm for all M sequences
+            tick(ts_rn);
             chk(blackwell::kernels::fused_rmsnorm_batched(d_xn, d_x, lni[l], H, 1e-6f, M, st), "rn");
+            tick(te_rn); acc(ts_rn, te_rn, ct.rmsn);
 
             if (il) {
                 // ── Linear attention layer (GatedDeltaNet) ──
-                // Quantize per-seq, then batched GEMV
+                // Quantize per-seq
+                tick(ts_q);
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_xn + m*H, H, st), "lq");
                 }
+                tick(te_q); acc(ts_q, te_q, ct.quant);
+                // Batched GEMVs
+                tick(ts_lg);
                 chk(gemv_int8_batched(d_qkv, d_ai, d_as, lw[l].qkv.d, lw[l].qkv.sc, H, CD, M, st), "bqkv");
                 chk(gemv_int8_batched(d_g, d_ai, d_as, lw[l].a.d, lw[l].a.sc, H, NV, M, st), "ba");
                 chk(gemv_int8_batched(d_beta, d_ai, d_as, lw[l].b.d, lw[l].b.sc, H, NV, M, st), "bb");
                 chk(gemv_int8_batched(d_z, d_ai, d_as, lw[l].z.d, lw[l].z.sc, H, H, M, st), "bz");
+                tick(te_lg); acc(ts_lg, te_lg, ct.latn_gemv);
+                // Conv + recurrent
+                tick(ts_cr);
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::gated_delta_conv1d_update(
                         d_cs + l * M * CD * (CK-1) + m * CD * (CK-1),
@@ -214,66 +243,85 @@ int main(int argc, char** argv) {
                     cudaMemcpyAsync(d_k_cnt + m*NK*HD, d_qkvc + m*CD + NK*HD, NK*HD*4, cudaMemcpyDeviceToDevice, st);
                     cudaMemcpyAsync(d_v_cnt + m*NV*HD, d_qkvc + m*CD + NK*HD*2, NV*HD*4, cudaMemcpyDeviceToDevice, st);
                 }
-                // Compute g = -A_log.exp() * softplus(a + dt_bias) for all M
                 for (int b = 0; b < M; b++) {
                     compute_g_k<<<(NV+255)/256, 256, 0, st>>>(
                         d_g + b*NV, d_g + b*NV, lw[l].A_log, lw[l].dt_bias, NV);
                 }
-                // Batched recurrent step
                 chk(blackwell::kernels::gated_delta_recurrent_step(
                     d_q_cnt, d_k_cnt, d_v_cnt,
                     d_g, d_beta,
                     d_q_bc, d_k_bc, d_rs + l * M * NV * HD * HD, d_ao,
                     M, st), "lrs");
-                // Batched RMSNormGated
                 chk(blackwell::kernels::gated_delta_rmsnorm_gated(
                     d_proj, d_ao, d_z, lw[l].norm_w, M, 1e-6f, st), "lng");
-                // Quantize + out_proj per-seq
+                tick(te_cr); acc(ts_cr, te_cr, ct.conv_rec);
+                // Quantize + out_proj
+                tick(ts_q);
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_proj + m*H, H, st), "lqo");
                 }
+                tick(te_q); acc(ts_q, te_q, ct.quant);
+                tick(ts_lg);
                 chk(gemv_int8_batched(d_proj, d_ai, d_as, lw[l].out.d, lw[l].out.sc, H, H, M, st), "bout");
+                tick(te_lg); acc(ts_lg, te_lg, ct.latn_gemv);
             } else {
                 // ── Full attention layer ──
+                tick(ts_q);
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_xn + m*H, H, st), "fq");
                 }
+                tick(te_q); acc(ts_q, te_q, ct.quant);
+                tick(ts_fg);
                 chk(gemv_int8_batched(dQ, d_ai, d_as, fw[l].q.d, fw[l].q.sc, H, NQ*HDA, M, st), "bq");
                 chk(gemv_int8_batched(dK, d_ai, d_as, fw[l].k.d, fw[l].k.sc, H, NKV*HDA, M, st), "bk");
                 chk(gemv_int8_batched(dV, d_ai, d_as, fw[l].v.d, fw[l].v.sc, H, NKV*HDA, M, st), "bv");
                 head_norm_k<<<M*NQ, 128, 0, st>>>(dQ, fw[l].qn, M*NQ, HDA, 1e-6f);
                 head_norm_k<<<M*NKV, 128, 0, st>>>(dK, fw[l].kn, M*NKV, HDA, 1e-6f);
-                // RoPE per-seq (has device seq_pos read)
+                // RoPE per-seq
                 for (int m = 0; m < M; m++) {
-                    int* sp = d_step;  // same for all
+                    int* sp = d_step;
                     rope_k<<<NQ, PD/2, 0, st>>>(dQ + m*NQ*HDA, NQ, HDA, sp, PD);
                     rope_k<<<NKV, PD/2, 0, st>>>(dK + m*NKV*HDA, NKV, HDA, sp, PD);
                 }
-                // Update KV cache per-seq
+                // Update KV cache
                 int ko = fai * NKV * MS * HDA;
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::update_kv_cache(d_kc+ko, d_vc+ko,
                         dK + m*NKV*HDA, dV + m*NKV*HDA, 0, step, NKV, HDA, MS, st), "fkvc");
                 }
-                // Batched attention (single kernel, all M)
                 chk(blackwell::kernels::attention_decode_batched_gqa(d_proj, dQ, d_kc, d_vc,
                     step, NQ, NKV, HDA, MS, M, 0, ko, st), "fatt");
                 fai++;
-                // Quantize + O projection per-seq
+                tick(te_fg); acc(ts_fg, te_fg, ct.fact_gemv);
+                // Quantize + O proj
+                tick(ts_q);
                 for (int m = 0; m < M; m++) {
                     chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_proj + m*H, H, st), "fqo");
                 }
+                tick(te_q); acc(ts_q, te_q, ct.quant);
+                tick(ts_fg);
                 chk(gemv_int8_batched(d_proj, d_ai, d_as, fw[l].o.d, fw[l].o.sc, H, H, M, st), "bo");
+                tick(te_fg); acc(ts_fg, te_fg, ct.fact_gemv);
             }
 
             // ── MLP (per-seq) ──
+            tick(ts_r1);
             for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::vector_add_fp32(d_x + m*H, d_x + m*H, d_proj + m*H, H, st), "r1");
             }
+            tick(te_r1); acc(ts_r1, te_r1, ct.residual);
             // Batched post-attention RMSNorm
+            tick(ts_rn);
             chk(blackwell::kernels::fused_rmsnorm_batched(d_xn, d_x, lnp[l], H, 1e-6f, M, st), "rnp");
+            tick(te_rn); acc(ts_rn, te_rn, ct.rmsn);
+            // Quantize + MLP GEMVs per-seq
+            tick(ts_q);
             for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_xn + m*H, H, st), "mq");
+            }
+            tick(te_q); acc(ts_q, te_q, ct.quant);
+            tick(ts_mg);
+            for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::gemv_int8_warp(d_mlp_res, d_ai + m*H, d_as + m*(H/16),
                     mw[l].gate.d, mw[l].gate.sc, H, I, st), "mg");
                 chk(blackwell::kernels::gemv_int8_warp(d_mlp_res + I, d_ai + m*H, d_as + m*(H/16),
@@ -282,13 +330,32 @@ int main(int argc, char** argv) {
                 chk(blackwell::kernels::quantize_int8(d_mlp_ai, d_mlp_as, d_mlp_res, I, st), "mdq");
                 chk(blackwell::kernels::gemv_int8_warp(d_proj + m*H, d_mlp_ai, d_mlp_as,
                     mw[l].down.d, mw[l].down.sc, I, H, st), "md");
+            }
+            tick(te_mg); acc(ts_mg, te_mg, ct.mlp_gemv);
+            tick(ts_r1);
+            for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::vector_add_fp32(d_x + m*H, d_x + m*H, d_proj + m*H, H, st), "r2");
             }
+            tick(te_r1); acc(ts_r1, te_r1, ct.residual);
         }
         if (step % 5 == 0) { cudaStreamSynchronize(st); printf("  %d/%d\n", step+1, NT); fflush(stdout); }
     }
     float ms = timer.stop(), pt = ms / NT, tps = M * 1000.f / pt;
-    printf("\nResults: %.1f ms total, %.2f ms/step, %.1f total t/s (%.0f%% of 71.4)\n", ms, pt, tps, tps/71.4f*100.f);
-    printf("  Per-seq: %.2f ms/seq = %.1f seqs/s\n", pt/M, 1000.f*M/pt);
+    printf("\nResults: %.1f ms total, %.2f ms/step, %.1f total t/s\n", ms, pt, tps);
+    printf("  Per-seq: %.2f ms/seq = %.1f seqs/s\n\n", pt/M, 1000.f*M/pt);
+    // Profile breakdown
+    float total_ct = ct.rmsn + ct.quant + ct.latn_gemv + ct.fact_gemv + ct.conv_rec + ct.mlp_gemv + ct.residual;
+    printf("=== Per-step breakdown (%.1f ms total) ===\n", total_ct);
+    auto pct = [&](const char* name, float v) {
+        printf("  %-12s %6.1f ms  %5.1f%%\n", name, v, v/total_ct*100.f);
+    };
+    pct("RMSNorm", ct.rmsn);
+    pct("Quantize", ct.quant);
+    pct("LinAttn GEMV", ct.latn_gemv);
+    pct("FullAttn GEMV", ct.fact_gemv);
+    pct("Conv+Recurrent", ct.conv_rec);
+    pct("MLP GEMV", ct.mlp_gemv);
+    pct("Residual", ct.residual);
+    printf("  %-12s %6.1f ms\n", "TOTAL", total_ct);
     return 0;
 }
