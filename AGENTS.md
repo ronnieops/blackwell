@@ -114,6 +114,21 @@ killall hashcat 2>/dev/null
 ./bench/text_generate "The capital of France is" 30 # Correctness
 ```
 
+### Prefill benchmarks (GEMM-only, no attention)
+```bash
+./bench/prefill_benchmark 512   # GEMM-only: 13,727 t/s at SEQ=512
+```
+
+### Prefill + Decode pipeline benchmark
+```bash
+./bench/prefill_decode_benchmark 8 20   # Full pipeline comparison
+# Results (8 prompt + 10 decode tokens):
+#   Decode-only: 42-66ms (sequential)
+#   Prefill+Decode: ~5.2ms (parallel prompt)
+#   Speedup: 8-13x for prompt processing
+```
+**Note**: Server prefill disabled — decode cache layout [NL][ms][nkv][hd] incompatible with batched prefill attention. Each layer needs full sequence of KV values, but decode cache writes one layer at a time. Requires separate prefill cache or per-token processing.
+
 ### 8B benchmarks
 ```bash
 ./bench/decode_int8_cgraph_qwen3_8b 36              # M=1: 46 t/s

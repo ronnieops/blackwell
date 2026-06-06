@@ -212,5 +212,121 @@ cudaError_t attention_prefill(
     return cudaPeekAtLastError();
 }
 
+// ── Prefill attention: [M, num_heads, head_dim] layout ──────────────────────
+//
+// Server layout: Q/K/V stored as [M, num_heads, head_dim]
+// For each layer l, position m: Q_m attends to K_0..K_m, V_0..V_m
+//
+// Kernel: 1 block per query head. Each block processes 1 query row m.
+// Each block loads Q[m, head] and computes attention against K[0..m], V[0..m].
+//
+// M = seq_len (prompt length, max 8)
+// head_dim = 64
+
+__global__ void prefill_attention_kernel(
+    float* __restrict__ O_out,    // [M, num_heads, head_dim]
+    const float* __restrict__ Q_in,   // [M, num_heads, head_dim]
+    const float* __restrict__ K_in,   // [M, num_kv_heads, head_dim]
+    const float* __restrict__ V_in,   // [M, num_kv_heads, head_dim]
+    int M, int head_dim, int num_q_heads, int num_kv_heads, int num_q_per_group) {
+
+    int q_head = blockIdx.x;
+    int m = blockIdx.y;  // query position
+    if (q_head >= num_q_heads || m >= M) return;
+
+    int kv_head = q_head / num_q_per_group;
+    float scale = rsqrtf((float)head_dim);
+
+    extern __shared__ char smem_base[];
+    float* K_s = (float*)smem_base;
+    float* S_s = K_s + M * head_dim;  // scores for m-th query
+
+    // Load Q[m, head] into registers
+    float q[64];
+    const float* Q_row = Q_in + (size_t)m * num_q_heads * head_dim + q_head * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        q[i] = Q_row[i];
+    }
+    __syncthreads();
+
+    // Load K[0..M-1, kv_head] into shared memory
+    const float* K_head = K_in + kv_head * M * head_dim;
+    for (int i = threadIdx.x; i < M * head_dim; i += blockDim.x) {
+        K_s[i] = K_head[i];
+    }
+    __syncthreads();
+
+    // Compute scores S[j] = Q[m] · K[j] for j=0..m
+    // Only need to compute up to position m (causal mask)
+    float max_s = -1e9f;
+    float sum_s = 0.0f;
+    float score[8];  // max M=8
+
+    for (int j = 0; j <= m; j++) {
+        float s = 0.0f;
+        int k_base = j * head_dim;
+        #pragma unroll
+        for (int d = 0; d < 64; d++) {
+            s += q[d] * K_s[k_base + d];
+        }
+        s *= scale;
+        score[j] = s;
+        max_s = fmaxf(max_s, s);
+    }
+
+    // Reduce max across threads
+    for (int off = 16; off > 0; off >>= 1) {
+        max_s = fmaxf(max_s, __shfl_xor_sync(0xffffffff, max_s, off));
+    }
+    max_s = __shfl_sync(0xffffffff, max_s, 0);
+
+    // Online softmax
+    float sum_exp = 0.0f;
+    for (int j = 0; j <= m; j++) {
+        score[j] = expf(score[j] - max_s);
+        sum_exp += score[j];
+    }
+
+    // Store output O[m, head]
+    float* O_row = O_out + (size_t)m * num_q_heads * head_dim + q_head * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        // O = sum_j(softmax_score[j] * V[j])
+        float o = 0.0f;
+        const float* V_head = V_in + kv_head * M * head_dim;
+        for (int j = 0; j <= m; j++) {
+            o += score[j] * V_head[j * head_dim + i];
+        }
+        O_row[i] = o / sum_exp;
+    }
+}
+
+// Prefill attention wrapper (handles [M, num_heads, head_dim] layout)
+cudaError_t attention_prefill_v2(
+    float* output,      // [M, num_heads, head_dim]
+    const float* Q,     // [M, num_heads, head_dim]
+    const float* K,     // [M, num_kv_heads, head_dim]
+    const float* V,     // [M, num_kv_heads, head_dim]
+    int M, int head_dim, int num_q_heads, int num_kv_heads,
+    int num_q_per_group, cudaStream_t stream) {
+
+    // Grid: (num_q_heads, M) blocks, 64 threads per block
+    dim3 grid(num_q_heads, M);
+    int threads = 64;
+    int smem = M * head_dim * sizeof(float) + M * sizeof(float);
+
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaError_t e = cudaFuncSetAttribute(prefill_attention_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+        attr_set = true;
+    }
+
+    prefill_attention_kernel<<<grid, threads, smem, stream>>>(
+        output, Q, K, V, M, head_dim, num_q_heads, num_kv_heads, num_q_per_group);
+
+    return cudaPeekAtLastError();
+}
+
 } // namespace kernels
 } // namespace blackwell

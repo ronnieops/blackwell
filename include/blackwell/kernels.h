@@ -246,6 +246,19 @@ cudaError_t attention_prefill(
     float           scale,
     cudaStream_t    stream = 0);
 
+// Prefill attention for [M, num_heads, head_dim] layout (server layout)
+cudaError_t attention_prefill_v2(
+    float*          output,
+    const float*    Q,
+    const float*    K,
+    const float*    V,
+    int             M,
+    int             head_dim,
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             num_q_per_group,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Prefill layer orchestration
 // ---------------------------------------------------------------------------
