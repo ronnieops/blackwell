@@ -8,7 +8,7 @@ bench/text_generate_fp32
 bench/text_generate_bf16
 bench/bench_*
 bench/verify_*
-weights_int8_qwen3_*
+weights_int8_qwen3_1.7b*
 weights_int8_bf16_06b/
 weights_int8_qwen3_06b/
 .git/

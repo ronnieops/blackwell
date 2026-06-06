@@ -485,7 +485,11 @@ int main(int argc, char** argv) {
     S.eps = 1e-6f; S.M = 8;
 
     const char* wdir;  // weights directory
-    if (strstr(model, "8b")) {
+    if (strstr(model, "8b_instruct")) {
+        S.NL = 36; S.H = 4096; S.Q = 4096; S.KV = 1024; S.ID = 12288;
+        S.nqh = 32; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
+        wdir = "weights_int8_qwen3_8b_instruct";
+    } else if (strstr(model, "8b")) {
         S.NL = 36; S.H = 4096; S.Q = 4096; S.KV = 1024; S.ID = 12288;
         S.nqh = 32; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
         wdir = "weights_int8_qwen3_8b";
@@ -524,18 +528,12 @@ int main(int argc, char** argv) {
     }
     S.emb = upload_int8((std::string(wdir) + "/embed_tokens").c_str());
 
-    // Load separate lm_head if exists (INT8, for non-tied models)
+    // Load lm_head if exists (separate from embed_tokens)
     {
         char plm[256]; snprintf(plm, 256, "%s/lm_head.int8_t", wdir);
         FILE* flm = fopen(plm, "rb");
-        if (flm) {
-            fclose(flm);
-            S.lm_head = upload_int8((std::string(wdir) + "/lm_head").c_str());
-            fprintf(stderr, "  lm_head: separate (INT8)\n");
-        } else {
-            S.lm_head.d = nullptr;
-            fprintf(stderr, "  lm_head: tied to embeddings\n");
-        }
+        if (flm) { fclose(flm); S.lm_head = upload_int8((std::string(wdir) + "/lm_head").c_str()); fprintf(stderr, "  lm_head: separate (INT8)\n"); }
+        else { S.lm_head.d = nullptr; }
     }
 
     // Host-side embed copies
