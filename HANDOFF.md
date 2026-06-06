@@ -18,7 +18,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | HTTP endpoints | ✅ Working | /health, /v1/completions, /v1/chat/completions |
 | Library | 195 symbols | `build/libblackwell_kernels.a` |
 | Prefill (M=1) | ✅ Integrated | batched_prefill called from main loop |
-| Prefill (M>1, gen_start>1) | ❌ Broken | KV cache shared across M items in generate loop — all outputs converge to last prompt |
+| Prefill (M>1, gen_start>1) | ✅ Fixed | Sequential per-item generation avoids KV cache conflicts |
 | Chat completions | ⚠️ Garbled | Pre-existing bug (not caused by prefill changes) |
 
 ### Throughput
@@ -35,7 +35,8 @@ Operational INT8 inference server with batched prefill for single-prompt request
 ## 3. Recent Decisions
 
 - **Prefill integrated (v0.5.0)**: Added d_x and d_tmp_save to ServerState. batched_prefill() is now called from main loop for gen_start≤M. gen_start>M falls back to per-token decode.
-- **M>1 batched broken**: Found KV cache sharing bug in generate loop. All M items share same cache positions → all converge to last prompt's output. M=1 HTTP server unaffected.
+- **M>1 batched fixed**: Sequential per-item generation avoids KV cache conflicts. Different prompts now produce different outputs.
+- **parse_string_prompts bug fixed**: `strstr("prompt")` matched inside `"prompts"` → added boundary check `prompt_p[8] == ':'`
 - **INT4/INT5 dead**: Quality garbage after 28 layers. No viable path below INT8.
 - **Docker image**: `ghcr.io/ronnieops/blackwell-server:v0.5.0` (prefill integrated)
 - **Chat completions garbled**: Pre-existing bug, not caused by prefill changes.
@@ -62,7 +63,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | hashcat interference | ⚠️ | Always `killall hashcat` before measurement |
 | Server vs benchmark gap | ~40% | head_norm + RoPE adds ~70% overhead |
 | Chat completions garbled | ⚠️ | Pre-existing, unrelated to prefill |
-| Prefill (M>1) | ❌ Broken | KV cache shared — batched requests produce identical corrupted output |
+| Prefill (M>1) | ✅ Fixed | Sequential per-item generation. Different prompts produce different outputs |
 
 ---
 
@@ -71,7 +72,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | Task | Priority | Status |
 |------|----------|--------|
 | Prefill M=1 correctness | HIGH | ✅ Integrated — verify hidden state match |
-| Prefill M>1 full support | BLOCKED | gen_start≤M also broken — KV cache sharing in generate loop. Needs per-item KV regions. |
+| Prefill M>1 full support | ✅ Fixed | Sequential per-item generation. M=1 fast path, M>1 correct but slower |
 | 8B HTTP server | MEDIUM | Port server to 8B weights |
 | Chat completions garbled | MEDIUM | Pre-existing — investigate tokenizer or special tokens |
 | CUDA Graph (server) | LOW | Deferred — no speedup with correct model |
