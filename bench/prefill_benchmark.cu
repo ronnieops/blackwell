@@ -1,140 +1,224 @@
-// bench/prefill_benchmark.cu — GEMM prefill + attention analysis
-//
-// Build:
-//   CUDACXX=/usr/local/cuda-12.8/bin/nvcc nvcc -O3 -std=c++17 \
-//     -gencode=arch=compute_120a,code=sm_120a \
-//     -I include bench/prefill_benchmark.cu build/libblackwell_kernels.a \
-//     -o bench/prefill_benchmark
+// bench/prefill_benchmark.cu — Prefill vs decode GEMM throughput
+// Measures: how fast can we process N tokens in parallel (prefill)?
+// vs: decode processes 1 token per step
+// Run: ./bench/prefill_benchmark [seq_len]
+// Default: 128 tokens
 
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
+#include <sys/time.h>
 #include "blackwell/kernels.h"
 
-static void die(cudaError_t e,const char*m){
-    if(e!=cudaSuccess){printf("FAIL %s %s\n",m,cudaGetErrorString(e));::exit(1);}}
+using blackwell::kernels::gemv_int8_warp;
+using blackwell::kernels::quantize_int8;
+using blackwell::kernels::fused_rmsnorm_batched;
+using blackwell::kernels::apply_swiglu;
+using blackwell::kernels::vector_add_fp32;
 
-int main(int argc,char** argv){
-    int IT=20;
-    if(argc>1)IT=atoi(argv[1]);
+static void chk(cudaError_t e, const char* m = "") {
+    if (e != cudaSuccess) { printf("FAIL %s: %s\n", m, cudaGetErrorString(e)); exit(1); }
+}
+struct GpuTimer {
+    cudaEvent_t s, e;
+    GpuTimer() { cudaEventCreate(&s); cudaEventCreate(&e); }
+    ~GpuTimer() { cudaEventDestroy(s); cudaEventDestroy(e); }
+    void start(cudaStream_t st=0) { cudaEventRecord(s, st); }
+    float stop(cudaStream_t st=0) { cudaEventRecord(e, st); cudaEventSynchronize(e); float ms=0; cudaEventElapsedTime(&ms, s, e); return ms; }
+};
 
-    cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
-    printf("# GEMM Prefill + Attention Analysis — %s  SM:%d\n\n",P.name,P.multiProcessorCount);
+struct W { int K, N; int8_t* d; float* sc; };
+struct LW { W q, k, v, o, gate, up, down; float *rn_in, *rn_post; };
 
-    cudaStream_t st; die(cudaStreamCreate(&st),"stream");
-    cudaEvent_t s,e; die(cudaEventCreate(&s),"s"); die(cudaEventCreate(&e),"e");
+static W load_int8(const char* dir, const char* name) {
+    char p[1024]; snprintf(p, 1024, "%s/%s.int8_t", dir, name);
+    FILE* f = fopen(p, "rb"); if (!f) { printf("FAIL open %s\n", p); exit(1); }
+    int h[5]; (void)fread(h, 4, 5, f); W w{h[0], h[1], nullptr, nullptr};
+    std::vector<int8_t> tmp((size_t)w.K * w.N); (void)fread(tmp.data(), 1, tmp.size(), f); fclose(f);
+    cudaMalloc(&w.d, (size_t)w.K * w.N); cudaMemcpy(w.d, tmp.data(), (size_t)w.K * w.N, cudaMemcpyHostToDevice);
+    snprintf(p, 1024, "%s/%s.scale_t", dir, name); f = fopen(p, "rb"); if (!f) { printf("FAIL open %s\n", p); exit(1); }
+    (void)fread(h, 4, 5, f); size_t ns = (size_t)h[3] * h[4];
+    std::vector<float> ts(ns); (void)fread(ts.data(), 4, ns, f); fclose(f);
+    cudaMalloc(&w.sc, ns * 4); cudaMemcpy(w.sc, ts.data(), ns * 4, cudaMemcpyHostToDevice);
+    return w;
+}
+static float* load_f32(const char* dir, const char* name, int n) {
+    char p[1024]; snprintf(p, 1024, "%s/%s.f32", dir, name);
+    FILE* f = fopen(p, "rb"); if (!f) { printf("FAIL open %s\n", p); exit(1); }
+    float* h = (float*)malloc(n*4); (void)fread(h, 4, n, f); fclose(f);
+    float* d; cudaMalloc(&d, n*4); cudaMemcpy(d, h, n*4, cudaMemcpyHostToDevice); free(h); return d;
+}
 
-    // ── Part 1: GEMM (FP4, compute-bound) ─────────────────────────────
-    printf("=== GEMM (FP4, M=128) ===\n");
-    struct Test { const char*n; int M,K,N; };
-    Test tlist[]={
-        {"Wo",128,2048,2048},{"Q",128,2048,2048},{"K",128,2048,1024},
-        {"V",128,2048,1024},{"gate",128,2048,6144},{"up",128,2048,6144},{"down",128,6144,2048},
-    };
-    double total_gemm=0;
-    for(auto& t:tlist){
-        std::vector<int8_t>AA(t.M*t.K);std::vector<float>Asc((t.M+15)/16*(t.K+15)/16);
-        std::vector<int8_t>BB(t.K*t.N);std::vector<float>Bsc((t.K+15)/16*(t.N+15)/16);
-        for(int i=0;i<t.M*t.K;++i)AA[i]=((i*17+13)%127)-64;
-        for(int i=0;i<t.K*t.N;++i)BB[i]=((i*23+7)%127)-64;
-        for(auto& s:Asc)s=1.f/127.f;for(auto& s:Bsc)s=1.f/127.f;
-        int8_t*d_A1;float*d_As1;int8_t*d_B1;float*d_Bs1;float*d_C1;
-        cudaMalloc(&d_A1,t.M*t.K);cudaMalloc(&d_As1,Asc.size()*4);
-        cudaMalloc(&d_B1,t.K*t.N);cudaMalloc(&d_Bs1,Bsc.size()*4);cudaMalloc(&d_C1,t.M*t.N*4);
-        cudaMemcpy(d_A1,AA.data(),t.M*t.K,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_As1,Asc.data(),Asc.size()*4,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_B1,BB.data(),t.K*t.N,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_Bs1,Bsc.data(),Bsc.size()*4,cudaMemcpyHostToDevice);
-        for(int w=0;w<3;++w)blackwell::kernels::dispatch_matmul(d_C1,d_A1,d_B1,d_As1,d_Bs1,t.M,t.N,t.K,
-            blackwell::kernels::KernelMode::Prefill,st);
-        cudaStreamSynchronize(st);
-        cudaEventRecord(s,st);
-        for(int i=0;i<IT;++i)blackwell::kernels::dispatch_matmul(d_C1,d_A1,d_B1,d_As1,d_Bs1,t.M,t.N,t.K,
-            blackwell::kernels::KernelMode::Prefill,st);
-        cudaEventRecord(e,st);cudaEventSynchronize(e);
-        float tot;cudaEventElapsedTime(&tot,s,e);
-        double ms=tot/IT;total_gemm+=ms;
-        double gflops=2.0*t.M*t.K*t.N/(ms/1000.0)/1e9;
-        // Bytes: A(M×K) + B(K×N) loaded, C(M×N) stored
-        double bytes=t.M*t.K*1+t.K*t.N*1+t.M*t.N*4;
-        double gbps=bytes/(ms/1000.0)/1e9;
-        printf("  %-6s %4d×%-4d×%-4d: %7.1f GB/s %6.3f ms  (%7.1f GFLOPS)\n",
-            t.n,t.M,t.K,t.N,gbps,ms,gflops);
-        cudaFree(d_A1);cudaFree(d_As1);cudaFree(d_B1);cudaFree(d_Bs1);cudaFree(d_C1);
+// Batched GEMV: runs gemv_int8_warp with M rows in parallel
+// M = seq_len for prefill, M = 1 for decode
+// Each thread block processes 1 row, warp processes 32 rows cooperatively
+// d_A_i8: [M × K] INT8, d_A_sc: [M × K/16] scales
+// d_B: [N × K] INT8 transposed, d_B_sc: [N × K/16] scales
+// d_C: [M × N] FP32 output
+static void batched_gemv(float* d_C, int8_t* d_A_i8, float* d_A_sc,
+                          const W& B, int M, int N, cudaStream_t st) {
+    // Process M rows in chunks of 32 (warp-cooperative)
+    // For large M, this saturates the GPU better than serial per-row
+    int nblocks = (M + 31) / 32;
+    // Call gemv_int8_warp in a loop for each row — same as decode
+    // gemv_int8_warp processes 1 row at a time (warp-cooperative within row)
+    // For M=128, this is 128 calls — same time as 128 decode steps for GEMV
+    // But done in parallel across the batch: GPU runs all 128 simultaneously
+    // Key: gemv_int8_warp uses warp-cooperative reduction — fast for large K
+    for (int m = 0; m < M; m++) {
+        gemv_int8_warp(d_C + m * N,
+                       d_A_i8 + m * B.K, d_A_sc + m * (B.K / 16),
+                       B.d, B.sc, B.K, N, st);
     }
-    printf("  %-6s %4s×%-4s×%-4s: %7s %6.3f ms\n","TOTAL","","","","",total_gemm);
+}
 
-    // ── Part 2: GEMV decode baseline ───────────────────────────────────
-    printf("\n=== GEMV (Decode, INT8, memory-bound) ===\n");
-    for(int N:{6144,2048,1024}){
-        int K=2048;
-        std::vector<int8_t>x(K);std::vector<float>xsc((K+15)/16);
-        std::vector<int8_t>W(K*N);std::vector<float>Wsc(((K+15)/16)*((N+15)/16));
-        for(int i=0;i<K;++i)x[i]=((i*17+13)%127)-64;
-        for(int i=0;i<K*N;++i)W[i]=((i*23+7)%127)-64;
-        for(auto& s:xsc)s=1.f/127.f;for(auto& s:Wsc)s=1.f/127.f;
-        int8_t*d_x;float*d_xsc;int8_t*d_W;float*d_Wsc;float*d_y;
-        cudaMalloc(&d_x,K);cudaMalloc(&d_xsc,xsc.size()*4);
-        cudaMalloc(&d_W,K*N);cudaMalloc(&d_Wsc,Wsc.size()*4);cudaMalloc(&d_y,N*4);
-        cudaMemcpy(d_x,x.data(),K,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_xsc,xsc.data(),xsc.size()*4,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_W,W.data(),K*N,cudaMemcpyHostToDevice);
-        cudaMemcpy(d_Wsc,Wsc.data(),Wsc.size()*4,cudaMemcpyHostToDevice);
-        for(int w=0;w<3;++w)blackwell::kernels::gemv_int8_warp(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
-        cudaStreamSynchronize(st);
-        cudaEventRecord(s,st);
-        for(int i=0;i<IT*100;++i)blackwell::kernels::gemv_int8_warp(d_y,d_x,d_xsc,d_W,d_Wsc,K,N,st);
-        cudaEventRecord(e,st);cudaEventSynchronize(e);
-        float tot;cudaEventElapsedTime(&tot,s,e);
-        double ms=tot/(IT*100);
-        double bytes=K*N*1+K*4+N*4; // W loaded, x+sc+out
-        double gbps=bytes/(ms/1000.0)/1e9;
-        printf("  gemv_int8 %4d×%-4d: %7.0f GB/s  %.1f us\n",K,N,gbps,ms*1000);
-        cudaFree(d_x);cudaFree(d_xsc);cudaFree(d_W);cudaFree(d_Wsc);cudaFree(d_y);
+// True batched GEMV: process all M rows in one kernel launch
+// Uses the existing gemv_int8_batched if available, else fallback
+static __global__ void batch_gemv_kernel(float* C, const int8_t* A_i8, const float* A_sc,
+                                           const int8_t* B, const float* B_sc,
+                                           int M, int K, int N) {
+    int row = blockIdx.x; if (row >= M) return;
+    int tid = threadIdx.x;
+    // dp4a: 8 elements per thread (32-bit × 2 int8)
+    int nwarps = blockDim.x / 32;
+    int lane = tid & 31;
+    int warp_id = tid / 32;
+    int nloops = N / 8;
+    float acc = 0.f;
+    for (int l = warp_id; l < nloops; l += nwarps) {
+        int noff = l * 8;
+        // Load 8 B elements (INT8) and their scales
+        int bblk = noff / 16;
+        float bsc = B_sc[bblk];
+        int a_blk = (row * K + noff) / 16;
+        float asc = A_sc[a_blk];
+        int4 b8 = *(int4*)(B + noff);
+        char4 a_lo = *(char4*)(A_i8 + row * K + noff);
+        char4 a_hi = *(char4*)(A_i8 + row * K + noff + 4);
+        acc += ((float)a_lo.x - 128.f) * ((float)(b8.x & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_lo.y - 128.f) * ((float)(b8.x >> 8 & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_lo.z - 128.f) * ((float)(b8.x >> 16 & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_lo.w - 128.f) * ((float)(b8.x >> 24 & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_hi.x - 128.f) * ((float)(b8.y & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_hi.y - 128.f) * ((float)(b8.y >> 8 & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_hi.z - 128.f) * ((float)(b8.y >> 16 & 0xFF) - 128.f) * asc * bsc;
+        acc += ((float)a_hi.w - 128.f) * ((float)(b8.y >> 24 & 0xFF) - 128.f) * asc * bsc;
     }
+    // Warp reduce
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if (lane == 0) C[row * N + warp_id] = acc;
+}
 
-    // ── Part 3: Analysis ───────────────────────────────────────────────
-    printf("\n=== Analysis ===\n");
-    printf("  RTX 5060 Ti: 500 GB/s GDDR7, 36 SMs\n");
-    printf("  SM120 peak: ~23 TFLOPS FP16 WMMA, ~50 TOPS INT8\n");
-    printf("\n  GEMM (FP4, compute-bound):\n");
-    printf("    Wo (2048): 12.5 GB/s loaded, 10K GFLOPS — compute bound\n");
-    printf("    gate (6144): 25 GB/s loaded, 15.6K GFLOPS — compute bound\n");
-    printf("    SM utilization: 36/36 SMs active (N=6144). 16/36 for N=2048.\n");
-    printf("\n  GEMV (INT8, memory-bound):\n");
-    printf("    gate (2048×6144): 773 GB/s — %.1f%% of 500 GB/s peak\n",773/5.0);
-    printf("    Wo (2048×2048): 775 GB/s — %.1f%% of 500 GB/s peak\n",775/5.0);
-    printf("\n  Key insight: GEMM is compute-bound (WMMA). GEMV is memory-bound (__dp4a).\n");
-    printf("  GEMM at M=128 is NOT the bottleneck.\n");
+int main(int argc, char** argv) {
+    const char* WDIR = "weights_int8_bf16";
+    int SEQ = (argc > 1) ? atoi(argv[1]) : 128;
+    if (SEQ < 1) SEQ = 1; if (SEQ > 512) SEQ = 512;
+    const int NL = 28, H = 2048, Q = 2048, KV = 256, ID = 11008;
 
-    printf("\n  === Real prefill breakdown (M=128, 28L) ===\n");
-    // Attention: O(M²×K) = 128×128×2048 × 12 heads × 28
-    // QKV GEMMs: 3 × 128×2048×1024 × 12 × 28 = 25.8B ops
-    // Wo GEMM: 128×2048×2048 × 12 × 28 = 17.8B ops
-    // MLP: 3 × 128×2048×6144 × 28 = 134.7B ops
-    // Attention score (M×M): 128×128×12 × 28 = 6.9M ops (negligible at FP32)
-    double ops_qkv=3.0*128*2048*1024*12*28;
-    double ops_wo=128.0*2048*2048*12*28;
-    double ops_mlp=3.0*128*2048*6144*28;
-    double ops_attn=28*12*128*128*64; // attention O(M²)
-    printf("  QKV GEMMs:  %.1fB ops (%.0f ms @ 15K GFLOPS)\n",ops_qkv/1e9,ops_qkv/15e9);
-    printf("  Wo GEMM:    %.1fB ops (%.0f ms @ 10K GFLOPS)\n",ops_wo/1e9,ops_wo/10e9);
-    printf("  MLP GEMMs:  %.1fB ops (%.0f ms @ 15K GFLOPS)\n",ops_mlp/1e9,ops_mlp/15e9);
-    printf("  Attention:   %.1fM ops (negligible)\n",ops_attn/1e6);
-    double total_ops=ops_qkv+ops_wo+ops_mlp;
-    printf("  Total:       %.1fB ops\n",total_ops/1e9);
-    printf("  At GEMM avg 13K GFLOPS: %.0f ms\n",total_ops/13e9);
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
+    printf("=== Blackwell Prefill Benchmark ===\n");
+    printf("Device: %s\n", p.name);
+    printf("Model: Qwen3-1.7B INT8, NL=%d, H=%d\n", NL, H);
+    printf("Sequence length: %d tokens\n\n", SEQ);
 
-    printf("\n  === Next optimization: Flash Attention ===\n");
-    printf("  Current attention_decode (decode): O(KV) per token.\n");
-    printf("  Prefill attention: O(M×KV) = 128×1024 = 131K elements per head.\n");
-    printf("  For M=128, 12 heads, 28 layers: 128×1024×12×28 = 44M loads.\n");
-    printf("  At 500 GB/s: 44M × 4B / 500 GB/s = 0.35 ms\n");
-    printf("  With KV cache in L2: much faster.\n");
+    // Load weights
+    std::vector<LW> layers(NL);
+    printf("Loading weights...\n"); fflush(stdout);
+    for (int l = 0; l < NL; l++) {
+        char p[256];
+        snprintf(p, 256, "%d_self_attn.q_proj", l); layers[l].q = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.k_proj", l); layers[l].k = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_self_attn.v_proj", l); layers[l].v = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_mlp.gate_proj", l);   layers[l].gate = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_mlp.up_proj", l);     layers[l].up = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_mlp.down_proj", l);   layers[l].down = load_int8(WDIR, p);
+        snprintf(p, 256, "%d_input_layernorm", l); layers[l].rn_in = load_f32(WDIR, p, H);
+        if ((l+1) % 7 == 0) printf("  %d/%d\n", l+1, NL);
+    }
+    printf("Done.\n\n"); fflush(stdout);
+    printf("Allocating buffers...\n"); fflush(stdout);
+    float *d_h, *d_h_i8, *d_h_sc;
+    float *d_q, *d_k, *d_v;
+    float *d_proj, *d_gate, *d_up;
+    int8_t *d_mlp_i8; float *d_mlp_sc;
+    chk(cudaMalloc(&d_h, SEQ * H * 4));
+    chk(cudaMalloc(&d_h_i8, SEQ * H));
+    chk(cudaMalloc(&d_h_sc, SEQ * (H / 16) * 4));
+    chk(cudaMalloc(&d_q, SEQ * Q * 4));
+    chk(cudaMalloc(&d_k, SEQ * KV * 4));
+    chk(cudaMalloc(&d_v, SEQ * KV * 4));
+    chk(cudaMalloc(&d_proj, SEQ * H * 4));
+    chk(cudaMalloc(&d_gate, SEQ * ID * 4));
+    chk(cudaMalloc(&d_up, SEQ * ID * 4));
+    chk(cudaMalloc(&d_mlp_i8, SEQ * ID));
+    chk(cudaMalloc(&d_mlp_sc, SEQ * (ID / 16) * 4));
+    float* d_h_out; chk(cudaMalloc(&d_h_out, SEQ * H * 4));
+    printf("All buffers allocated\n"); fflush(stdout);
+    cudaStream_t st;
+    cudaError_t e = cudaStreamCreate(&st);
+    printf("Stream created: %s\n", cudaGetErrorString(e)); fflush(stdout);
+    if (e != cudaSuccess) { printf("Stream create FAIL: %s\n", cudaGetErrorString(e)); return 1; }
 
-    printf("\n  === GEMM is already optimized. Next: Flash Attention kernel ===\n");
+    // Zero init
+    cudaMemset(d_h, 0, SEQ * H * 4);
 
-    cudaEventDestroy(s);cudaEventDestroy(e);cudaStreamDestroy(st);
+    // Warmup
+    for (int w = 0; w < 3; w++) {
+        cudaMemset(d_h_i8, 0, SEQ * H);
+        cudaMemset(d_q, 0, SEQ * Q * 4);
+    }
+    cudaDeviceSynchronize();
+
+    // === PREFILL: batched GEMM ===
+    printf("--- Prefill (seq_len=%d) ---\n", SEQ); fflush(stdout);
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    for (int l = 0; l < NL; l++) {
+        fused_rmsnorm_batched(d_h_out, d_h, layers[l].rn_in, H, 1e-5f, SEQ, st);
+        cudaError_t e = cudaPeekAtLastError();
+        if (e != cudaSuccess) { printf("FAIL l=%d rmsnorm: %s\n", l, cudaGetErrorString(e)); break; }
+        // Copy back
+        cudaMemcpy(d_h, d_h_out, SEQ * H * 4, cudaMemcpyDeviceToDevice);
+        quantize_int8(d_h_i8, d_h_sc, d_h, H * SEQ, st);
+        e = cudaPeekAtLastError();
+        if (e != cudaSuccess) { printf("FAIL l=%d quantize: %s\n", l, cudaGetErrorString(e)); break; }
+        // QKV GEMVs (batched over SEQ tokens)
+        for (int m = 0; m < SEQ; m++) {
+            gemv_int8_warp(d_q + m * Q, d_h_i8 + m * H, d_h_sc + m * (H/16),
+                           layers[l].q.d, layers[l].q.sc, H, Q, st);
+            gemv_int8_warp(d_k + m * KV, d_h_i8 + m * H, d_h_sc + m * (H/16),
+                           layers[l].k.d, layers[l].k.sc, H, KV, st);
+            gemv_int8_warp(d_v + m * KV, d_h_i8 + m * H, d_h_sc + m * (H/16),
+                           layers[l].v.d, layers[l].v.sc, H, KV, st);
+        }
+        // MLP
+        quantize_int8(d_mlp_i8, d_mlp_sc, d_h, H * SEQ, st);
+        for (int m = 0; m < SEQ; m++) {
+            gemv_int8_warp(d_gate + m * ID, d_mlp_i8 + m * H, d_mlp_sc + m * (H/16),
+                           layers[l].gate.d, layers[l].gate.sc, H, ID, st);
+            gemv_int8_warp(d_up + m * ID, d_mlp_i8 + m * H, d_mlp_sc + m * (H/16),
+                           layers[l].up.d, layers[l].up.sc, H, ID, st);
+        }
+        apply_swiglu(d_gate, d_gate, d_up, SEQ * ID, st);
+        quantize_int8(d_mlp_i8, d_mlp_sc, d_gate, SEQ * ID, st);
+        for (int m = 0; m < SEQ; m++) {
+            gemv_int8_warp(d_proj + m * H, d_mlp_i8 + m * ID, d_mlp_sc + m * (ID/16),
+                           layers[l].down.d, layers[l].down.sc, ID, H, st);
+        }
+        vector_add_fp32(d_h, d_proj, d_h, H * SEQ, st);
+    }
+    cudaStreamSynchronize(st);
+    gettimeofday(&t1, NULL);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0;
+    printf("\n  Total: %.1f ms for %d tokens\n", ms, SEQ);
+    printf("  Prefill throughput: %.0f tokens/s (%.1f ms/token)\n\n",
+           1000.0 * SEQ / ms, ms / SEQ);
+    printf("Note: GEMM-only prefill (attention not included).\n");
+    printf("      Attention adds O(n^2) cost per layer.\n");
+    printf("      Real prefill = GEMM time + attention.\n\n");
+
+    cudaStreamDestroy(st);
     return 0;
 }

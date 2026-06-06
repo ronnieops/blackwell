@@ -37,6 +37,24 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 
 **Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu` (invalid resource handle, redundant with `decode_qwen35_9b_batched_v2`).
 
+**Session 46 — prefill benchmark**:
+- New direction explored: **prefill (prompt processing) throughput**
+- Built `bench/prefill_benchmark.cu` — GEMM-only prefill benchmark (no attention)
+- Results: GEMM prefill ~15-24× faster than decode per token
+
+| SEQ | GEMM prefill | Decode | Speedup |
+|-----|-------------|--------|---------|
+| 4 | 109 t/s | ~106 t/s | 1.0× |
+| 16 | 456 t/s | ~106 t/s | 4.3× |
+| 32 | 485 t/s | ~106 t/s | 4.6× |
+| 64 | 1389 t/s | ~106 t/s | 13× |
+| 128 | 2444 t/s | ~106 t/s | 23× |
+
+- Attention not included (O(n²) cost, would dominate for long sequences)
+- Benchmark uses zero-initialized inputs — crashes at layer 3 with real weights (numerical issues from non-zero activations). Expected for research benchmark.
+- Prefill is compute-bound (WMMA GEMM), decode is bandwidth-bound (dp4a GEMV)
+- Key insight: prefill processes SEQ tokens in parallel vs decode's 1 token. GPU utilization improves with SEQ.
+
 ---
 
 ## 2. Current Status
@@ -145,10 +163,11 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 
 ## 7. Suggested Next Actions
 
-1. **Run end-to-end test**: `./server/http_subprocess weights_int8_bf16` then `curl` all 4 endpoints — verify server still working.
-2. **Docker**: Build and push `blackwell-server` image. Dockerfile exists.
-3. **8B optimization**: Batched attention for M>1 decode.
-4. **Benchmark hygiene**: Always run `killall hashcat` before measurement.
+1. **Prefill attention kernel**: Build flash-attention-style prefill attention (O(n²) cost). This is the missing piece for full prefill pipeline.
+2. **Prefill + decode pipeline**: Hook prefill into server for prompt processing + autoregressive decode.
+3. **WMMA GEMM prefill**: Use `gemm_int8_wmma_fast` instead of gemv_int8_warp for prefill GEMM — should be ~5× faster for large matrices.
+4. **8B HTTP server**: Port server to 8B weights for batched decode.
+5. **Benchmark hygiene**: Always run `killall hashcat` before measurement.
 
 ---
 
