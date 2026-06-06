@@ -372,3 +372,12 @@ Per-kernel path fast enough (~106 t/s). Deferred until head_norm+RoPE can be fus
 ### HTTP timeout (2026-06-04) — FIXED
 httplib default read timeout = 5s. Inference takes ~7s for 30 tokens.
 Fix: `svr.set_read_timeout(300)` in http_subprocess.cpp.
+### Server prefill integration (2026-06-06) — ABANDONED
+Attempted to integrate batched prefill into server. Multiple issues found:
+1. Cache layout incompatibility: decode cache `[NL][ms][nkv][hd]` can't serve batched attention.
+   Each layer's attention needs full sequence of K/V values simultaneously.
+2. Even for M=1, prefill produced different hidden states than decode.
+   Root causes: residual add order bug, attention kernel mismatch, KV write offset mismatch.
+3. Correct residual order: save d_proj (attn+input) BEFORE MLP overwrites it, then add MLP_out + saved.
+Server remains decode-only. `bench/prefill_decode_benchmark.cu` is standalone benchmark only.
+Alternative: allocate separate prefill cache with `[ms][NL][nkv][hd]` layout + `attention_prefill_v2` kernel.
