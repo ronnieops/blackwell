@@ -100,6 +100,10 @@ struct ServerState {
     // Per-seq FP32 residual state
     float* d_residual[8];
 
+    // Prefill working buffers
+    float* d_x;           // [M][H] combined residual (attn+input+MLP)
+    float* d_tmp_save;    // [H] temp save for attn+input before MLP
+
     int M;
     int8_t* d_xi8; float* d_xi8s;
     float* d_Q, *d_K, *d_V;
@@ -420,15 +424,15 @@ static void batched_prefill(ServerState& S, int M) {
         }
 
         // ── Attention: batched M sequences attending to all M ──
-        // For prefill, each sequence m attends to all previous tokens
-        // Use batched attention if available, else fallback to loop
+        // For prefill, each sequence m attends to all previous tokens in this layer
         for (int m = 0; m < M; m++) {
-            // Each batch item attends to all M tokens
+            // Each batch item attends to all M tokens in this layer
+            // Note: all kernels write to S.d_attn (shared buffer) — sync before copy
             blackwell::kernels::attention_decode_batched_gqa(
                 S.d_attn, S.d_Q, S.d_K, S.d_V,  // Full K,V for all M
                 m, S.nqh, S.nkv, S.hd, S.ms,
                 M, (int)kv_seq_stride, (int)kv_layer_off, S.st);
-            // Copy attention output for this sequence
+            cudaStreamSynchronize(S.st);  // ensure kernel completes before copy
             cudaMemcpyAsync(S.d_attn_out + m * S.Q, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
         }
 
@@ -480,7 +484,7 @@ int main() {
     S.eps = 1e-6f; S.M = 8;
 
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.4.1 (streaming)\n");
+    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.5.0 (streaming, batched prefill)\n");
     fprintf(stderr, "Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
 
     die(cudaStreamCreate(&S.st), "stream");
@@ -567,6 +571,7 @@ int main() {
     cudaMalloc(&S.d_mlp_i8, S.M * S.ID); cudaMalloc(&S.d_mlp_i8s, S.M * (S.ID / 16) * 4);
     cudaMalloc(&S.d_proj, S.M * S.H * 4);
     cudaMalloc(&S.d_logits, S.V * 4); cudaMalloc(&S.d_next_id, sizeof(int));
+    cudaMalloc(&S.d_x, S.M * S.H * 4); cudaMalloc(&S.d_tmp_save, S.H * 4);
 
     size_t kv_sz = (size_t)S.NL * S.M * S.nkv * S.ms * S.hd * 4;
     cudaMalloc(&S.d_kc, kv_sz); cudaMalloc(&S.d_vc, kv_sz);
@@ -598,10 +603,21 @@ int main() {
         bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
-        // Process prompt tokens one by one (decode mode)
-        for (int s = 0; s < gen_start; s++) {
-            embed_batch(S, prompts, s);
-            batched_decode_step(S, s);
+        // Prefill: load all M tokens and process through all layers
+        if (gen_start > 0 && gen_start <= M) {
+            embed_batch(S, prompts, 0);  // load all M tokens' embeddings to d_residual[m]
+            batched_prefill(S, gen_start);
+            // Copy last token's hidden state to d_residual[0] for decode continuation
+            if (gen_start > 1) {
+                cudaMemcpyAsync(S.d_residual[0], S.d_residual[gen_start - 1], S.H * 4,
+                    cudaMemcpyDeviceToDevice, S.st);
+            }
+        } else if (gen_start > M) {
+            // gen_start > M: fall back to token-by-token decode (no batched prefill overflow)
+            for (int s = 0; s < gen_start; s++) {
+                embed_batch(S, prompts, s);
+                batched_decode_step(S, s);
+            }
         }
 
         // Generate (after prefill, start from position gen_start)

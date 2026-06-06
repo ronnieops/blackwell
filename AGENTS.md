@@ -10,7 +10,7 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 
 **Server (production)**: 1.7B INT8 M=1 per-kernel at **~106 t/s**. Correct model (per-layer RMSNorm, head_norm, RoPE). All HTTP endpoints working.
 **Benchmark (nofp4, CUDA Graph)**: 1.7B INT8 M=8 at **575 t/s** (196% of Q4_K_M). **Does not include head_norm/RoPE** — not achievable with correct model.
-**Benchmark (nofp4, per-kernel)**: 1.7B INT8 M=1 at **~163 t/s** (no head_norm/RoPE).
+**Benchmark (nofp4, per-kernel)**: 1.7B INT8 M=1 at **~181.5 t/s** (no head_norm/RoPE).
 **Legacy (FP4)**: 1.7B INT8 M=8 at **324 t/s** (111% of Q4_K_M). FP4 state.
 **8B INT8**: 31-46 t/s. Quality upgrade path, bandwidth-bound.
 
@@ -35,7 +35,7 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 191 symbols in `build/libblackwell_kernels.a`
+**Library**: 195 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -109,7 +109,7 @@ curl -X POST http://localhost:8123/v1/chat/completions \
 ### 1.7B benchmarks (research/validation)
 ```bash
 killall hashcat 2>/dev/null
-./bench/decode_int8_cgraph 28                       # M=1: 163 t/s (no head_norm/RoPE)
+./bench/decode_int8_cgraph 28                       # M=1: 181.5 t/s (no head_norm/RoPE)
 ./bench/decode_int8_nofp4 28 8                     # M=8: 575 t/s CUDA Graph (no head_norm/RoPE)
 ./bench/text_generate "The capital of France is" 30 # Correctness
 ```
@@ -143,7 +143,7 @@ killall hashcat 2>/dev/null
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 191
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 195
 ```
 
 ### Docker server
@@ -202,7 +202,7 @@ server/
 | Finding | Value |
 |---------|-------|
 | **Server (production, correct model)** | **~106 t/s (36% of Q4_K_M)** |
-| 1.7B INT8 M=1 benchmark (no head_norm/RoPE) | 163 t/s |
+| 1.7B INT8 M=1 benchmark (no head_norm/RoPE) | 181.5 t/s |
 | 1.7B INT8 M=8 CUDA Graph benchmark (no head_norm/RoPE) | 575 t/s (196% of Q4_K_M) |
 | 1.7B INT8 M=8 FP4 | 324 t/s (111% of Q4_K_M) |
 | 8B INT8 M=1 | 46 t/s (56% of Q4_K_M) |
@@ -295,7 +295,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (M=1 benchmark)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 191)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 195)
 HTTP test: `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":1}'`
 
 ---
