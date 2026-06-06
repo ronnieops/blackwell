@@ -18,7 +18,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | HTTP endpoints | ✅ Working | /health, /v1/completions, /v1/chat/completions |
 | Library | 195 symbols | `build/libblackwell_kernels.a` |
 | Prefill (M=1) | ✅ Integrated | batched_prefill called from main loop |
-| Prefill (M>1, gen_start>1) | ⚠️ Fallback | gen_start>M uses per-token decode |
+| Prefill (M>1, gen_start>1) | ❌ Broken | KV cache shared across M items in generate loop — all outputs converge to last prompt |
 | Chat completions | ⚠️ Garbled | Pre-existing bug (not caused by prefill changes) |
 
 ### Throughput
@@ -35,10 +35,10 @@ Operational INT8 inference server with batched prefill for single-prompt request
 ## 3. Recent Decisions
 
 - **Prefill integrated (v0.5.0)**: Added d_x and d_tmp_save to ServerState. batched_prefill() is now called from main loop for gen_start≤M. gen_start>M falls back to per-token decode.
-- **Server decode-only**: Reverted to session 50 state (commit 0069b35). Correct output verified.
+- **M>1 batched broken**: Found KV cache sharing bug in generate loop. All M items share same cache positions → all converge to last prompt's output. M=1 HTTP server unaffected.
 - **INT4/INT5 dead**: Quality garbage after 28 layers. No viable path below INT8.
 - **Docker image**: `ghcr.io/ronnieops/blackwell-server:v0.5.0` (prefill integrated)
-- **Chat completions garbled**: Pre-existing bug, not caused by prefill changes. Investigate separately.
+- **Chat completions garbled**: Pre-existing bug, not caused by prefill changes.
 
 ---
 
@@ -51,6 +51,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 - M>8 not viable (register pressure)
 - Weight matrices exceed L2 cache (32 MB)
 - batched_prefill: gen_start≤M uses batched path; gen_start>M falls back to decode
+- M>1 batched CORRUPTED: generate loop shares KV cache across M batch items. All items produce identical (last prompt's) output. HTTP server unaffected (M=1 only).
 
 ---
 
@@ -61,7 +62,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | hashcat interference | ⚠️ | Always `killall hashcat` before measurement |
 | Server vs benchmark gap | ~40% | head_norm + RoPE adds ~70% overhead |
 | Chat completions garbled | ⚠️ | Pre-existing, unrelated to prefill |
-| Prefill (M>1) | ⚠️ Fallback | gen_start>M uses per-token decode |
+| Prefill (M>1) | ❌ Broken | KV cache shared — batched requests produce identical corrupted output |
 
 ---
 
@@ -70,7 +71,7 @@ Operational INT8 inference server with batched prefill for single-prompt request
 | Task | Priority | Status |
 |------|----------|--------|
 | Prefill M=1 correctness | HIGH | ✅ Integrated — verify hidden state match |
-| Prefill M>1 full support | MEDIUM | gen_start≤M works, gen_start>M decode fallback |
+| Prefill M>1 full support | BLOCKED | gen_start≤M also broken — KV cache sharing in generate loop. Needs per-item KV regions. |
 | 8B HTTP server | MEDIUM | Port server to 8B weights |
 | Chat completions garbled | MEDIUM | Pre-existing — investigate tokenizer or special tokens |
 | CUDA Graph (server) | LOW | Deferred — no speedup with correct model |
@@ -79,10 +80,9 @@ Operational INT8 inference server with batched prefill for single-prompt request
 
 ## 7. Suggested Next Actions
 
-1. **Verify M=1 prefill hidden state**: Confirm batched_prefill hidden state exactly matches decode hidden state for token 0. Use GPU memory comparison.
-2. **Test M>1**: Send batched requests to verify gen_start≤M path works.
-3. **Investigate chat completions**: Garbled output for `<|im_start|>` / `<|im_end|>` token handling.
-4. **Update AGENTS.md**: Fix stale symbol count (191→195) and benchmark numbers (163→181.5).
+1. **M>1 batched KV cache fix**: Generate loop shares KV cache across M batch items. All items converge to last prompt's output. Fix: allocate separate KV regions per batch item OR process M>1 requests sequentially.
+2. **Investigate chat completions**: Garbled output for `<|im_start|>` / `<|im_end|>` token handling.
+3. **8B HTTP server**: Port server to 8B weights (weights_int8_qwen3_8b/).
 
 ---
 
