@@ -201,7 +201,7 @@ static std::vector<uint32_t> encode_with_special(const std::string& s, blackwell
             pos = next_sp;
         }
     }
-    return result;
+        return result;
 }
 
 static std::vector<std::vector<uint32_t>> parse_string_prompts(
@@ -209,7 +209,7 @@ static std::vector<std::vector<uint32_t>> parse_string_prompts(
     std::vector<std::vector<uint32_t>> result;
     // Try "prompt" key first (OpenAI API style)
     const char* prompt_p = strstr(json.c_str(), "\"prompt\"");
-    if (prompt_p) {
+    if (prompt_p && prompt_p[8] == ':') {
         const char* p = strchr(prompt_p, ':'); if (!p) return result; p++;
         while (*p == ' ' || *p == '\t') p++;
         if (*p != '"') return result; p++;
@@ -222,7 +222,7 @@ static std::vector<std::vector<uint32_t>> parse_string_prompts(
             else { s += *p; p++; }
         }
         result.push_back(encode_with_special(s, tokenizer));
-        return result;
+                    return result;
     }
     // Try "prompts" array (batch style)
     const char* p = strstr(json.c_str(), "\"prompts\"");
@@ -246,7 +246,7 @@ static std::vector<std::vector<uint32_t>> parse_string_prompts(
         result.push_back(ids);
         while (*p && (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n')) p++;
     }
-    return result;
+        return result;
 }
 
 static void server_write_results(const std::vector<std::vector<uint32_t>>& tokens,
@@ -621,22 +621,21 @@ int main() {
         }
 
         // Generate (after prefill, start from position gen_start)
+        // For M=1: batched path (single batched_decode_step call per token)
+        // For M>1: sequential per-item path (avoids KV cache position conflicts)
         std::vector<std::vector<uint32_t>> outputs(M);
-        bool did_prefill = (gen_start > 0 && gen_start <= M);
-        for (int s = gen_start; s < gen_start + max_tokens; s++) {
-            for (int m = 0; m < M; m++) {
-                // Final norm + lm_head + sample
-                blackwell::kernels::fused_rmsnorm(S.d_residual[m], S.d_residual[m], S.d_fn, S.H, S.eps, S.st);
-                blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[m], S.H, S.st);
+        if (M == 1) {
+            // Batched decode: one batched_decode_step call per token
+            for (int s = gen_start; s < gen_start + max_tokens; s++) {
+                blackwell::kernels::fused_rmsnorm(S.d_residual[0], S.d_residual[0], S.d_fn, S.H, S.eps, S.st);
+                blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[0], S.H, S.st);
                 blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
                     S.emb.d, S.emb.sc, S.H, S.V, S.st);
                 blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
                     S.d_next_id, 0xdeadbeefLL, s, S.st);
                 uint32_t next_id;
                 cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
-                outputs[m].push_back(next_id);
-
-                // Stream token if enabled
+                outputs[0].push_back(next_id);
                 if (stream) {
                     std::string tok_txt = tokenizer.decode(next_id);
                     printf("data: {\x22token\x22:%u,\x22text\x22:\x22", next_id); fflush(stdout);
@@ -648,18 +647,60 @@ int main() {
                         else if (c == '\r') printf("\\r");
                         else printf("%c", c);
                     }
-                    printf("}\\n\\n"); fflush(stdout);
+                    printf("}\n\n"); fflush(stdout);
                 }
-
                 if (next_id == 151643) break;
-
-                // Embed next token
                 std::vector<float> h_hidden(S.H);
                 for (int d = 0; d < S.H; d++)
                     h_hidden[d] = (float)S.h_emb_int8[next_id * S.H + d] * S.h_emb_scale[next_id * (S.H / 16) + d / 16];
-                cudaMemcpy(S.d_residual[m], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
+                cudaMemcpy(S.d_residual[0], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
+                batched_decode_step(S, s);
             }
-            batched_decode_step(S, s);
+        } else {
+            // Sequential per-item generation (M>1): each item's tokens processed
+            // sequentially through all layers. Avoids KV cache position conflicts.
+            std::vector<int> item_pos(M, gen_start);
+            std::vector<bool> item_done(M, false);
+            for (int t = 0; t < max_tokens; t++) {
+                for (int m = 0; m < M; m++) {
+                    if (item_done[m]) continue;
+                    blackwell::kernels::fused_rmsnorm(S.d_residual[m], S.d_residual[m], S.d_fn, S.H, S.eps, S.st);
+                    blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[m], S.H, S.st);
+                    blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
+                        S.emb.d, S.emb.sc, S.H, S.V, S.st);
+                    blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
+                        S.d_next_id, 0xdeadbeefLL, item_pos[m], S.st);
+                    uint32_t next_id;
+                    cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
+                    outputs[m].push_back(next_id);
+                    if (stream) {
+                        std::string tok_txt = tokenizer.decode(next_id);
+                        printf("data: {\x22token\x22:%u,\x22text\x22:\x22", next_id); fflush(stdout);
+                        for (size_t i = 0; i < tok_txt.size(); i++) {
+                            char c = tok_txt[i];
+                            if (c == '"') printf("\\\"");
+                            else if (c == '\\') printf("\\\\");
+                            else if (c == '\n') printf("\\n");
+                            else if (c == '\r') printf("\\r");
+                            else printf("%c", c);
+                        }
+                        printf("}\n\n"); fflush(stdout);
+                    }
+                    if (next_id == 151643) { item_done[m] = true; continue; }
+                    std::vector<float> h_hidden(S.H);
+                    for (int d = 0; d < S.H; d++)
+                        h_hidden[d] = (float)S.h_emb_int8[next_id * S.H + d] * S.h_emb_scale[next_id * (S.H / 16) + d / 16];
+                    cudaMemcpy(S.d_residual[0], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
+                    int orig_M = S.M; S.M = 1;
+                    batched_decode_step(S, item_pos[m]);
+                    S.M = orig_M;
+                    cudaMemcpyAsync(S.d_residual[m], S.d_residual[0], S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+                    item_pos[m]++;
+                }
+                bool all_done = true;
+                for (int m = 0; m < M; m++) if (!item_done[m]) { all_done = false; break; }
+                if (all_done) break;
+            }
         }
 
         if (stream) {
