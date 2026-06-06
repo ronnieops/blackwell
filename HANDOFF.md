@@ -37,20 +37,24 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 
 **Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu` (invalid resource handle, redundant with `decode_qwen35_9b_batched_v2`).
 
-**Session 46 — prefill benchmark**:
-- New direction explored: **prefill (prompt processing) throughput**
-- Built `bench/prefill_benchmark.cu` — GEMM-only prefill benchmark (no attention)
-- Results: GEMM prefill ~15-24× faster than decode per token
+**Session 46-49 — prefill benchmark**:
+- Explored prefill (prompt processing) throughput as new direction
+- Built `bench/prefill_benchmark.cu` with real token embeddings (not zeros)
+- Batched GEMV (M=8) beats WMMA at most SEQ; quantization overhead limits WMMA gains
 
-| SEQ | GEMM prefill (warp) | GEMM prefill (batched M=8) | WMMA GEMM | Decode | Speedup (batched) |
-|-----|---------------------|------------------------------|---------|--------|-------------------|
-| 32 | 485 t/s | 910 t/s | 554 t/s | ~106 t/s | 8.6× |
-| 64 | 1389 t/s | 1517 t/s | **1803 t/s** | ~106 t/s | 14× |
-| 128 | 2444 t/s | **3953 t/s** | 3596 t/s | ~106 t/s | **37×** |
-| 256 | ~3100 t/s | 4007 t/s | **6576 t/s** | ~106 t/s | 38× |
-| 512 | ~4000 t/s | **13688 t/s** | 8348 t/s | ~106 t/s | **129×** |
+**Real benchmark (warmup, real embeddings)**:
 
-WMMA only wins at SEQ=64,256. Batched is better at most SEQ. Quantization overhead dominates at large SEQ.
+| SEQ | t/s | ms/token | vs Decode (106 t/s) |
+|-----|-----|---------|---------------------|
+| 8 | 216 | 4.6 | 2.0× |
+| 16 | 424 | 2.4 | 4.0× |
+| 32 | 534 | 1.9 | 5.0× |
+| 64 | 1753 | 0.6 | 16.5× |
+| 128 | 2582 | 0.4 | 24× |
+| 256 | 4047 | 0.2 | 38× |
+| 512 | **13,727** | 0.07 | **129×** |
+
+GEMM prefill is 2-129× faster than decode. Attention (O(n²)) not included — would dominate for long SEQ.
 
 - Attention not included (O(n²) cost, would dominate for long sequences)
 - Benchmark uses zero-initialized inputs — crashes at layer 3 with real weights (numerical issues from non-zero activations). Expected for research benchmark.
