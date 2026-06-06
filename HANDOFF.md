@@ -142,7 +142,7 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 |-------|-------|
 | updated_at | 2026-06-06 |
 | branch | master |
-| repo_state | Modified: server/inference_server_nofp4.cu, server/inference_server |
+| repo_state | Clean (committed: 7f5d823 — batched prefill v0.5.0) |
 | active components | server (prefill), bench/*, lib |
 | last_session | 53 |
 | server_version | v0.5.0 (batched prefill) |
@@ -154,7 +154,7 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 
 **Boot sequence**:
 1. Read `AGENTS.md` → `HANDOFF.md`
-2. `git status` — check uncommitted changes
+2. `git status` — check uncommitted changes (should be clean)
 3. `killall hashcat 2>/dev/null`
 4. `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 195)
 5. `./server/http_subprocess &` → test `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":3,"temperature":0}'`
@@ -163,7 +163,6 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 1. Verify M=1 prefill hidden state matches decode (GPU memory comparison)
 2. Test M>1 batched requests
 3. Investigate chat completions garbled output
-4. Update AGENTS.md stale data (symbols: 191→195, t/s: 163→181.5)
 
 **Verified facts**:
 - Server produces " Paris, a which is" (greedy, temp=0) ✅
@@ -171,6 +170,7 @@ bench/prefill_decode_benchmark.cu   # Standalone prefill benchmark
 - Prefill integrated for gen_start≤M ✅
 - gen_start>M falls back to per-token decode ✅
 - Chat completions garbled: pre-existing bug ✅
+- Changes committed: 7f5d823 ✅
 
 **DO NOT**:
 - Use benchmark numbers without noting head_norm/RoPE context
