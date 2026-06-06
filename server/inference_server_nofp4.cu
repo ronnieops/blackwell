@@ -94,6 +94,7 @@ struct ServerState {
 
     // Embed tokens (host-side for CPU dequant)
     DevW emb;
+    DevW lm_head;  // separate lm_head (empty if tied)
     int8_t* h_emb_int8;
     float* h_emb_scale;
 
@@ -477,14 +478,27 @@ static void batched_prefill(ServerState& S, int M) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────
-int main() {
+int main(int argc, char** argv) {
+    const char* model = (argc > 1) ? argv[1] : "1.7b";
+
     ServerState S;
-    S.NL = 28; S.H = 2048; S.Q = 2048; S.KV = 1024; S.ID = 6144;
-    S.nqh = 16; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
     S.eps = 1e-6f; S.M = 8;
 
+    const char* wdir;  // weights directory
+    if (strstr(model, "8b")) {
+        S.NL = 36; S.H = 4096; S.Q = 4096; S.KV = 1024; S.ID = 12288;
+        S.nqh = 32; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
+        wdir = "weights_int8_qwen3_8b";
+    } else {
+        S.NL = 28; S.H = 2048; S.Q = 2048; S.KV = 1024; S.ID = 6144;
+        S.nqh = 16; S.nkv = 8; S.hd = 128; S.ms = 2048; S.V = 151936;
+        wdir = "weights_int8_bf16";
+    }
+
+    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.6.0 (model=%s, %d layers, H=%d)\n", model, S.NL, S.H);
+
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.5.0 (streaming, batched prefill)\n");
+    fprintf(stderr, "  Streaming, batched prefill\n");
     fprintf(stderr, "Device: %s (CC %d.%d)\n", p.name, p.major, p.minor);
 
     die(cudaStreamCreate(&S.st), "stream");
@@ -499,24 +513,38 @@ int main() {
     S.layers.resize(S.NL);
     for (int l = 0; l < S.NL; l++) {
         char p[256];
-        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.q_proj", l); S.layers[l].q = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.k_proj", l); S.layers[l].k = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.v_proj", l); S.layers[l].v = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_self_attn.o_proj", l); S.layers[l].o = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_mlp.gate_proj", l);  S.layers[l].gate = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_mlp.up_proj", l);    S.layers[l].up = upload_int8(p);
-        snprintf(p, 256, "weights_int8_bf16/%d_mlp.down_proj", l);  S.layers[l].down = upload_int8(p);
+        snprintf(p, 256, "%s/%d_self_attn.q_proj", wdir, l); S.layers[l].q = upload_int8(p);
+        snprintf(p, 256, "%s/%d_self_attn.k_proj", wdir, l); S.layers[l].k = upload_int8(p);
+        snprintf(p, 256, "%s/%d_self_attn.v_proj", wdir, l); S.layers[l].v = upload_int8(p);
+        snprintf(p, 256, "%s/%d_self_attn.o_proj", wdir, l); S.layers[l].o = upload_int8(p);
+        snprintf(p, 256, "%s/%d_mlp.gate_proj", wdir, l);  S.layers[l].gate = upload_int8(p);
+        snprintf(p, 256, "%s/%d_mlp.up_proj", wdir, l);    S.layers[l].up = upload_int8(p);
+        snprintf(p, 256, "%s/%d_mlp.down_proj", wdir, l);  S.layers[l].down = upload_int8(p);
         if (l % 7 == 0) fprintf(stderr, "  layer %d/%d\n", l, S.NL);
     }
-    S.emb = upload_int8("weights_int8_bf16/embed_tokens");
+    S.emb = upload_int8((std::string(wdir) + "/embed_tokens").c_str());
+
+    // Load separate lm_head if exists (INT8, for non-tied models)
+    {
+        char plm[256]; snprintf(plm, 256, "%s/lm_head.int8_t", wdir);
+        FILE* flm = fopen(plm, "rb");
+        if (flm) {
+            fclose(flm);
+            S.lm_head = upload_int8((std::string(wdir) + "/lm_head").c_str());
+            fprintf(stderr, "  lm_head: separate (INT8)\n");
+        } else {
+            S.lm_head.d = nullptr;
+            fprintf(stderr, "  lm_head: tied to embeddings\n");
+        }
+    }
 
     // Host-side embed copies
     {
-        char p[256]; snprintf(p, 256, "weights_int8_bf16/embed_tokens.int8_t");
+        char p[256]; snprintf(p, 256, "%s/embed_tokens.int8_t", wdir);
         FILE* f = fopen(p, "rb"); int h[5]; (void)fread(h, 4, 5, f);
         size_t num = (size_t)h[0] * h[1];
         S.h_emb_int8 = (int8_t*)malloc(num); (void)fread(S.h_emb_int8, 1, num, f); fclose(f);
-        snprintf(p, 256, "weights_int8_bf16/embed_tokens.scale_t");
+        snprintf(p, 256, "%s/embed_tokens.scale_t", wdir);
         f = fopen(p, "rb"); (void)fread(h, 4, 5, f);
         size_t ns = (size_t)h[3] * h[4];
         S.h_emb_scale = (float*)malloc(ns * 4); (void)fread(S.h_emb_scale, 4, ns, f); fclose(f);
@@ -527,10 +555,10 @@ int main() {
     for (int l = 0; l < S.NL; l++) {
         float* w = (float*)malloc(S.H * 4);
         char p[256];
-        snprintf(p, 256, "weights_int8_bf16/%d_input_layernorm.f32", l);
+        snprintf(p, 256, "%s/%d_input_layernorm.f32", wdir, l);
         FILE* f = fopen(p, "rb"); (void)fread(w, 4, S.H, f); fclose(f);
         cudaMalloc(&S.d_rn_in[l], S.H * 4); cudaMemcpy(S.d_rn_in[l], w, S.H * 4, cudaMemcpyHostToDevice);
-        snprintf(p, 256, "weights_int8_bf16/%d_post_attention_layernorm.f32", l);
+        snprintf(p, 256, "%s/%d_post_attention_layernorm.f32", wdir, l);
         f = fopen(p, "rb"); (void)fread(w, 4, S.H, f); fclose(f);
         cudaMalloc(&S.d_rn_post[l], S.H * 4); cudaMemcpy(S.d_rn_post[l], w, S.H * 4, cudaMemcpyHostToDevice);
         free(w);
@@ -539,7 +567,7 @@ int main() {
     // ── Per-layer Q/K norms ──
     {
         float* qk_h = (float*)malloc(28 * 2 * 128 * 4);
-        FILE* f = fopen("weights_int8_bf16/qk_norms.f32", "rb");
+        FILE* f = fopen((std::string(wdir) + "/qk_norms.f32").c_str(), "rb");
         (void)fread(qk_h, 4, 28 * 2 * 128, f); fclose(f);
         for (int l = 0; l < S.NL; l++) {
             cudaMalloc(&S.layers[l].qn, 128 * 4);
@@ -553,7 +581,7 @@ int main() {
     // ── Final norm ──
     {
         float* w = (float*)malloc(S.H * 4);
-        FILE* f = fopen("weights_int8_bf16/final_norm.f32", "rb");
+        FILE* f = fopen((std::string(wdir) + "/final_norm.f32").c_str(), "rb");
         (void)fread(w, 4, S.H, f); fclose(f);
         cudaMalloc(&S.d_fn, S.H * 4); cudaMemcpy(S.d_fn, w, S.H * 4, cudaMemcpyHostToDevice);
         free(w);
@@ -630,7 +658,7 @@ int main() {
                 blackwell::kernels::fused_rmsnorm(S.d_residual[0], S.d_residual[0], S.d_fn, S.H, S.eps, S.st);
                 blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[0], S.H, S.st);
                 blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
-                    S.emb.d, S.emb.sc, S.H, S.V, S.st);
+                    (S.lm_head.d ? S.lm_head.d : S.emb.d), (S.lm_head.d ? S.lm_head.sc : S.emb.sc), S.H, S.V, S.st);
                 blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
                     S.d_next_id, 0xdeadbeefLL, s, S.st);
                 uint32_t next_id;
@@ -667,7 +695,7 @@ int main() {
                     blackwell::kernels::fused_rmsnorm(S.d_residual[m], S.d_residual[m], S.d_fn, S.H, S.eps, S.st);
                     blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[m], S.H, S.st);
                     blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
-                        S.emb.d, S.emb.sc, S.H, S.V, S.st);
+                        (S.lm_head.d ? S.lm_head.d : S.emb.d), (S.lm_head.d ? S.lm_head.sc : S.emb.sc), S.H, S.V, S.st);
                     blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
                         S.d_next_id, 0xdeadbeefLL, item_pos[m], S.st);
                     uint32_t next_id;
