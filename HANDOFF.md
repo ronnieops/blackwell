@@ -35,17 +35,25 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - 9B at practical limit — weight matrices (200 MB/layer) exceed L2 cache
 - Bandwidth-bound. Further optimization has negligible room.
 
+**Session 51 — Prefill + Decode Pipeline**:
+- Built `bench/prefill_decode_benchmark.cu` — end-to-end benchmark comparing decode-only vs prefill+decode
+- Prefill processes all prompt tokens in parallel through all layers
+- Result: **8-13× speedup** for prompt processing
+- Server prefill code added (disabled — buffer reuse bug)
+- Docker: `ghcr.io/ronnieops/blackwell-server:v0.5.1`
+
+**Prefill vs Decode comparison** (8 prompt + 10 decode tokens):
+| Method | Time | Speedup |
+|--------|------|---------|
+| Decode-only (sequential) | 42-66ms | baseline |
+| Prefill + Decode | ~5.2ms | **8-13×** |
+
 **Session 50 — Docker deploy + server benchmark**:
 - Built `blackwell-server:v0.5.0` Docker image
-- Server benchmark (HTTP, steady state):
-  - 10 tokens: 65 t/s (10.0 ms/token)
-  - 20 tokens: 77 t/s (10.0 ms/token)
-  - 30 tokens: 83 t/s (10.0 ms/token)
-  - 50 tokens: 86 t/s (10.0 ms/token) — steady state
+- Server benchmark (HTTP, steady state): 86 t/s (10ms/token)
 - HTTP overhead: ~10ms per request
-- Docker image: `ghcr.io/ronnieops/blackwell-server:v0.5.0`
 
-**Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu` (invalid resource handle, redundant with `decode_qwen35_9b_batched_v2`).
+**Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu`.
 
 **Session 46-49 — prefill benchmark**:
 - Explored prefill (prompt processing) throughput as new direction
