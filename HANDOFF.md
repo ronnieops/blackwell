@@ -35,6 +35,16 @@ Operational C++ inference server with correct Qwen3-1.7B model. All HTTP endpoin
 - 9B at practical limit — weight matrices (200 MB/layer) exceed L2 cache
 - Bandwidth-bound. Further optimization has negligible room.
 
+**Session 50 — Docker deploy + server benchmark**:
+- Built `blackwell-server:v0.5.0` Docker image
+- Server benchmark (HTTP, steady state):
+  - 10 tokens: 65 t/s (10.0 ms/token)
+  - 20 tokens: 77 t/s (10.0 ms/token)
+  - 30 tokens: 83 t/s (10.0 ms/token)
+  - 50 tokens: 86 t/s (10.0 ms/token) — steady state
+- HTTP overhead: ~10ms per request
+- Docker image: `ghcr.io/ronnieops/blackwell-server:v0.5.0`
+
 **Session 45 (boot)**: Library rebuilt (287 symbols, was corrupt). Server verified. HTTP endpoints working. Removed crashing `decode_qwen35_9b_batched_opt.cu` (invalid resource handle, redundant with `decode_qwen35_9b_batched_v2`).
 
 **Session 46-49 — prefill benchmark**:
