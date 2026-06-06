@@ -112,9 +112,18 @@ cudaError_t coalesced_copy(
     int             num_elements,
     cudaStream_t    stream = 0);
 
-// ---------------------------------------------------------------------------
-// Fused epilogues
-// ---------------------------------------------------------------------------
+// Batched RMSNorm: processes M sequences of H elements each (same weight per seq).
+// Saves M-1 kernel launches vs calling fused_rmsnorm M times.
+cudaError_t fused_rmsnorm_batched(
+    float*          out,
+    const float*    inp,
+    const float*    weight,
+    int             H,        // elements per sequence (e.g. 4096)
+    float           eps,
+    int             M,        // number of sequences
+    cudaStream_t    stream = 0);
+
+
 cudaError_t fused_rmsnorm(
     float*          out,
     const float*    inp,

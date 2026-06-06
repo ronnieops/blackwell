@@ -24,7 +24,7 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 | Qwen3-1.7B | Q4_K_M | 293.4 | 1.7B M=8 FP4 324 t/s (111%) |
 | Qwen3-1.7B | Q4_K_M | 293.4 | 1.7B M=1 per-kernel ~106 t/s (36%) — correct model |
 | Qwen3-8B | Q4_K_M | 82.66 | 8B M=1 46 t/s (56%) |
-| Qwen3.5-9B | Q3_K_M | 71.4 | 9B M=8 50.9 t/s (71%) |
+| Qwen3.5-9B | Q3_K_M | 71.4 | 9B M=8 52.1 t/s (73%) |
 
 ⚠️ 574 t/s benchmark omits head_norm and RoPE. Realistic per-kernel server throughput with correct model is ~106 t/s.
 
@@ -122,8 +122,8 @@ killall hashcat 2>/dev/null
 
 ### Qwen3.5-9B GatedDeltaNet
 ```bash
-./bench/decode_qwen35_9b weights_int8_qwen35_9b 20        # M=1: 45 t/s
-./bench/decode_qwen35_9b_batched 8 20                      # M=8: 50 t/s
+./bench/decode_qwen35_9b weights_int8_qwen35_9b 20        # M=1: 45.7 t/s
+./bench/decode_qwen35_9b_batched_v2 8 20                   # M=8: 52.1 t/s (batched GEMV + RMSNorm)
 ```
 
 ### Diagnostics
@@ -191,7 +191,7 @@ server/
 | 1.7B INT8 M=8 CUDA Graph benchmark (no head_norm/RoPE) | 575 t/s (196% of Q4_K_M) |
 | 1.7B INT8 M=8 FP4 | 324 t/s (111% of Q4_K_M) |
 | 8B INT8 M=1 | 46 t/s (56% of Q4_K_M) |
-| 9B GatedDeltaNet M=8 | 50.9 | 71% of Q3_K_M (batched GEMV) |
+| 9B GatedDeltaNet M=8 | 52.1 | 73% of Q3_K_M (batched GEMV + RMSNorm) |
 | Effective BW (1.7B) | 260 GB/s (52% of 500 GB/s peak) |
 | Sub-8-bit quality | ❌ Dead. Attention softmax amplifies noise. |
 | Batched GEMV vs serial | 2-2.7× slower per call |

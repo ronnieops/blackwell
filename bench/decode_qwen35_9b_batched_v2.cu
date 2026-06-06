@@ -193,10 +193,8 @@ int main(int argc, char** argv) {
         fai = 0;
         for (int l = 0; l < 32; l++) {
             bool il = (LTYPE[l][0] == 'l');
-            // RMSNorm from FP32 state for all M
-            for (int m = 0; m < M; m++) {
-                chk(blackwell::kernels::fused_rmsnorm(d_xn + m*H, d_x + m*H, lni[l], H, 1e-6f, st), "rn");
-            }
+            // Batched input RMSNorm for all M sequences
+            chk(blackwell::kernels::fused_rmsnorm_batched(d_xn, d_x, lni[l], H, 1e-6f, M, st), "rn");
 
             if (il) {
                 // ── Linear attention layer (GatedDeltaNet) ──
@@ -271,7 +269,10 @@ int main(int argc, char** argv) {
             // ── MLP (per-seq) ──
             for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::vector_add_fp32(d_x + m*H, d_x + m*H, d_proj + m*H, H, st), "r1");
-                chk(blackwell::kernels::fused_rmsnorm(d_xn + m*H, d_x + m*H, lnp[l], H, 1e-6f, st), "rnp");
+            }
+            // Batched post-attention RMSNorm
+            chk(blackwell::kernels::fused_rmsnorm_batched(d_xn, d_x, lnp[l], H, 1e-6f, M, st), "rnp");
+            for (int m = 0; m < M; m++) {
                 chk(blackwell::kernels::quantize_int8(d_ai + m*H, d_as + m*(H/16), d_xn + m*H, H, st), "mq");
                 chk(blackwell::kernels::gemv_int8_warp(d_mlp_res, d_ai + m*H, d_as + m*(H/16),
                     mw[l].gate.d, mw[l].gate.sc, H, I, st), "mg");

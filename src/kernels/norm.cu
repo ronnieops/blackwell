@@ -111,15 +111,67 @@ __global__ void swiglu_kernel(
 // Public API
 // ===========================================================================
 
+__launch_bounds__(128, 1)
+__global__ void rmsnorm_batched_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ inp,
+    const float* __restrict__ weight,
+    int num_elements,
+    float eps) {
+
+    __shared__ float smem_rstd[4];
+    const int tid = threadIdx.x;
+    const int seq = blockIdx.x;  // which sequence
+    const float* inp_seq = inp + seq * num_elements;
+    float* out_seq = out + seq * num_elements;
+    const int ElementsPerThread = 32;
+
+    float sum_sq = 0.0f;
+    int start = tid * ElementsPerThread;
+    int end   = min(start + ElementsPerThread, num_elements);
+
+    for (int i = start; i < end; ++i) {
+        float v = inp_seq[i];
+        sum_sq += v * v;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+
+    if ((tid & 31) == 0) smem_rstd[tid >> 5] = sum_sq;
+    __syncthreads();
+
+    float block_sum = (tid < 4) ? smem_rstd[tid] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+    __syncthreads();
+
+    if (tid == 0) {
+        smem_rstd[0] = rsqrtf(block_sum / static_cast<float>(num_elements) + eps);
+    }
+    __syncthreads();
+
+    float rstd = smem_rstd[0];
+    for (int i = start; i < end; ++i) {
+        out_seq[i] = inp_seq[i] * weight[i] * rstd;
+    }
+}
+
 cudaError_t fused_rmsnorm(
     float* out, const float* inp, const float* weight,
     int num_elements, float eps, cudaStream_t stream) {
-
-    // One block (max 4096 elements).  For larger: caller should tile externally.
     dim3 block(128);
     dim3 grid(1);
     rmsnorm_kernel<<<grid, block, 0, stream>>>(
         out, inp, weight, num_elements, eps);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t fused_rmsnorm_batched(
+    float* out, const float* inp, const float* weight,
+    int H, float eps, int M, cudaStream_t stream) {
+
+    dim3 block(128);
+    dim3 grid(M);  // one block per sequence
+    rmsnorm_batched_kernel<<<grid, block, 0, stream>>>(
+        out, inp, weight, H, eps);
 
     return cudaPeekAtLastError();
 }
