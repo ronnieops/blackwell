@@ -325,3 +325,28 @@ M bench/decode_int8_batched_cgraph_attn_qwen3_8b.cu — KV cache layout fix
 ```
 
 **Update rule**: Keep HANDOFF.md concise — deduplicate with AGENTS.md, prefer bullets, remove stale sections on update. Only store operational truth and verified facts.
+---
+
+## Session 52 (2026-06-06) — Prefill Integration Attempt — ABANDONED
+
+**Goal**: Integrate batched prefill into server HTTP endpoints for faster prompt processing.
+
+**Findings**:
+1. **Cache layout incompatible**: Decode cache `[NL][ms][nkv][hd]` writes one layer at a time. Batched prefill needs each layer to see full K/V sequence simultaneously. These are fundamentally incompatible.
+2. **M=1 prefill produces wrong hidden states**: Even for single token, prefill hidden state `[9.14, 22.76, 40.01, 7.59]` != decode `[6.23, 13.34, 2.46, -25.15]`. 
+   - Bug 1: Residual add order — saved `d_proj` (attn+input) AFTER MLP overwrote it, not before. Fix: save BEFORE MLP.
+   - Bug 2: `attention_decode_batched_gqa` different from `attention_decode_gqa` for single-seq.
+   - Bug 3: KV cache write offset mismatch.
+3. **Server reverted to decode-only**: `server/inference_server_nofp4.cu` restored to session 50 state (0069b35). Produces correct " Paris, at the apex".
+4. **Library: 195 symbols** (was 287 in session 45-50, now consistent after rebuild). Server verified correct.
+
+**Decision**: Abandon server prefill integration. Cache layout incompatibility requires multi-hour refactor. Server decode-only path works correctly at ~106 t/s.
+
+**Alternative**: `bench/prefill_decode_benchmark.cu` is standalone benchmark only. Measures prefill+decode pipeline speedup (8-13x for prompt processing vs decode-only). Does NOT integrate with server HTTP.
+
+**Files changed**:
+- `M server/inference_server_nofp4.cu` — reverted to decode-only
+- `M AGENTS.md` — added prefill abandonment notes
+- `M HANDOFF.md` — this update
+
+**Current server state**: Decode-only, correct output. HTTP endpoints working. ~106 t/s.
