@@ -13,6 +13,7 @@
 #include "blackwell/kernels.h"
 
 using blackwell::kernels::gemv_int8_warp;
+using blackwell::kernels::gemv_int8_batched;
 using blackwell::kernels::quantize_int8;
 using blackwell::kernels::fused_rmsnorm_batched;
 using blackwell::kernels::apply_swiglu;
@@ -172,40 +173,43 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
 
     // === PREFILL: batched GEMM ===
-    printf("--- Prefill (seq_len=%d) ---\n", SEQ); fflush(stdout);
+    const int M_BATCH = 8;  // gemv_int8_batched max M
+    printf("--- Prefill (seq_len=%d, batch=%d) ---\n", SEQ, M_BATCH); fflush(stdout);
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
     for (int l = 0; l < NL; l++) {
         fused_rmsnorm_batched(d_h_out, d_h, layers[l].rn_in, H, 1e-5f, SEQ, st);
         cudaError_t e = cudaPeekAtLastError();
         if (e != cudaSuccess) { printf("FAIL l=%d rmsnorm: %s\n", l, cudaGetErrorString(e)); break; }
-        // Copy back
         cudaMemcpy(d_h, d_h_out, SEQ * H * 4, cudaMemcpyDeviceToDevice);
         quantize_int8(d_h_i8, d_h_sc, d_h, H * SEQ, st);
         e = cudaPeekAtLastError();
         if (e != cudaSuccess) { printf("FAIL l=%d quantize: %s\n", l, cudaGetErrorString(e)); break; }
-        // QKV GEMVs (batched over SEQ tokens)
-        for (int m = 0; m < SEQ; m++) {
-            gemv_int8_warp(d_q + m * Q, d_h_i8 + m * H, d_h_sc + m * (H/16),
-                           layers[l].q.d, layers[l].q.sc, H, Q, st);
-            gemv_int8_warp(d_k + m * KV, d_h_i8 + m * H, d_h_sc + m * (H/16),
-                           layers[l].k.d, layers[l].k.sc, H, KV, st);
-            gemv_int8_warp(d_v + m * KV, d_h_i8 + m * H, d_h_sc + m * (H/16),
-                           layers[l].v.d, layers[l].v.sc, H, KV, st);
+        // QKV GEMVs (batched in groups of M_BATCH)
+        for (int mb = 0; mb < SEQ; mb += M_BATCH) {
+            int M = (SEQ - mb < M_BATCH) ? (SEQ - mb) : M_BATCH;
+            gemv_int8_batched(d_q + mb * Q, d_h_i8 + mb * H, d_h_sc + mb * (H/16),
+                              layers[l].q.d, layers[l].q.sc, H, Q, M, st);
+            gemv_int8_batched(d_k + mb * KV, d_h_i8 + mb * H, d_h_sc + mb * (H/16),
+                              layers[l].k.d, layers[l].k.sc, H, KV, M, st);
+            gemv_int8_batched(d_v + mb * KV, d_h_i8 + mb * H, d_h_sc + mb * (H/16),
+                              layers[l].v.d, layers[l].v.sc, H, KV, M, st);
         }
         // MLP
         quantize_int8(d_mlp_i8, d_mlp_sc, d_h, H * SEQ, st);
-        for (int m = 0; m < SEQ; m++) {
-            gemv_int8_warp(d_gate + m * ID, d_mlp_i8 + m * H, d_mlp_sc + m * (H/16),
-                           layers[l].gate.d, layers[l].gate.sc, H, ID, st);
-            gemv_int8_warp(d_up + m * ID, d_mlp_i8 + m * H, d_mlp_sc + m * (H/16),
-                           layers[l].up.d, layers[l].up.sc, H, ID, st);
+        for (int mb = 0; mb < SEQ; mb += M_BATCH) {
+            int M = (SEQ - mb < M_BATCH) ? (SEQ - mb) : M_BATCH;
+            gemv_int8_batched(d_gate + mb * ID, d_mlp_i8 + mb * H, d_mlp_sc + mb * (H/16),
+                              layers[l].gate.d, layers[l].gate.sc, H, ID, M, st);
+            gemv_int8_batched(d_up + mb * ID, d_mlp_i8 + mb * H, d_mlp_sc + mb * (H/16),
+                              layers[l].up.d, layers[l].up.sc, H, ID, M, st);
         }
         apply_swiglu(d_gate, d_gate, d_up, SEQ * ID, st);
         quantize_int8(d_mlp_i8, d_mlp_sc, d_gate, SEQ * ID, st);
-        for (int m = 0; m < SEQ; m++) {
-            gemv_int8_warp(d_proj + m * H, d_mlp_i8 + m * ID, d_mlp_sc + m * (ID/16),
-                           layers[l].down.d, layers[l].down.sc, ID, H, st);
+        for (int mb = 0; mb < SEQ; mb += M_BATCH) {
+            int M = (SEQ - mb < M_BATCH) ? (SEQ - mb) : M_BATCH;
+            gemv_int8_batched(d_proj + mb * H, d_mlp_i8 + mb * ID, d_mlp_sc + mb * (ID/16),
+                              layers[l].down.d, layers[l].down.sc, ID, H, M, st);
         }
         vector_add_fp32(d_h, d_proj, d_h, H * SEQ, st);
     }
