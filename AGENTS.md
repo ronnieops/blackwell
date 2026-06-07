@@ -12,8 +12,18 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 HTTP | `http_subprocess 8b` | **~20** | ~50 | Semi-coherent, INT8 noise ⚠️ |
-| 9B GDN INT8 | `http_subprocess 9b` | **~28** | ~35 | Garbled (32-layer INT8 noise) ❌ |
+| 8B INT8 Direct | `inference_server 8b` | **~20** | ~50 | Garbled ❌ |
+| 8B Mixed (8 FP16) | `inference_server 8b` | **~18** | ~55 | Semi-coherent! "Paris. The capital of France is..." ✅ |
+| 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled (32-layer INT8 noise) ❌ |
+
+**How to use mixed-precision**:
+```bash
+# Create mixed-precision weights (first 8 layers FP16, rest INT8)
+python3 scripts/extract_fp16_layers.py weights_int8_qwen3_8b weights_int8_qwen3_8b_mixed 8
+# Point server to mixed dir
+ln -sf weights_int8_qwen3_8b_mixed weights_int8_qwen3_8b
+./server/inference_server 8b
+```
 
 **Benchmarks (no head_norm/RoPE)**
 | Model | M= | Method | t/s | ms/tok | vs llama.cpp |
