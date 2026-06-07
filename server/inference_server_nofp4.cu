@@ -11,6 +11,7 @@
 //     -o server/inference_server
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -80,10 +81,53 @@ static DevW upload_int8(const char* prefix) {
     return dw;
 }
 
-struct LW { DevW q, k, v, o, gate, up, down; float* qn; float* kn; };
+
+struct Fp16W { int K, N; __half* d; };
+static Fp16W upload_fp16(const char* prefix) {
+    char p[256]; snprintf(p, 256, "%s.fp16", prefix);
+    FILE* f = fopen(p, "rb"); if (!f) { fprintf(stderr, "Cannot open %s\n", p); exit(1); }
+    int h[2]; (void)fread(h, 4, 2, f);
+    Fp16W w{h[0], h[1], nullptr};
+    size_t sz = (size_t)h[0] * h[1] * 2;
+    std::vector<uint8_t> tmp(sz); (void)fread(tmp.data(), 1, sz, f); fclose(f);
+    cudaMalloc(&w.d, sz); cudaMemcpy(w.d, tmp.data(), sz, cudaMemcpyHostToDevice);
+    return w;
+}
+
+struct LW { 
+    DevW q, k, v, o, gate, up, down; 
+    float* qn; float* kn;
+    bool is_fp16;
+    __half *fp16_q, *fp16_k, *fp16_v, *fp16_o;
+    __half *fp16_gate, *fp16_up, *fp16_down;
+};
+
+// Dispatch helper: call gemv_int8_warp or gemv_fp16_warp_launch based on layer type
+static void gemv_dispatch(float* y, const LW& layer, const DevW& w, __half* fp16_w,
+    const int8_t* x_i8, const float* x_sc, int K, int N, cudaStream_t st) {
+    if (layer.is_fp16) {
+        blackwell::kernels::gemv_fp16_warp_launch(y, (void*)fp16_w, x_i8, x_sc, K, N, st);
+    } else {
+        blackwell::kernels::gemv_int8_warp(y, x_i8, x_sc, w.d, w.sc, K, N, st);
+    }
+}
+
+// Batched gemv dispatch: loops for FP16, uses gemv_int8_batched for INT8.
+static void gemv_batched_dispatch(float* y, const LW& layer, const DevW& w, __half* fp16_w,
+    const int8_t* x_i8, const float* x_sc, int K, int N, int M, cudaStream_t st) {
+    if (layer.is_fp16) {
+        for (int m = 0; m < M; m++) {
+            blackwell::kernels::gemv_fp16_warp_launch(y + m * N, (void*)fp16_w,
+                x_i8 + m * K, x_sc + m * (K / 16), K, N, st);
+        }
+    } else {
+        blackwell::kernels::gemv_int8_batched(y, x_i8, x_sc, w.d, w.sc, K, N, M, st);
+    }
+}
 
 struct ServerState {
     int NL, H, Q, KV, ID, nqh, nkv, hd, ms, V;
+    int fp16_first_n;
     float eps;
 
     std::vector<LW> layers;
@@ -311,12 +355,15 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
 
         // ── Q/K/V projections + head_norm + RoPE (per-sequence) ──
         for (int m = 0; m < M; m++) {
-            blackwell::kernels::gemv_int8_warp(S.d_Q + m * S.Q, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].q.d, S.layers[l].q.sc, S.H, S.Q, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_K + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].k.d, S.layers[l].k.sc, S.H, S.KV, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_V + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].v.d, S.layers[l].v.sc, S.H, S.KV, S.st);
+            gemv_dispatch(S.d_Q + m * S.Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.Q, S.st);
+            gemv_dispatch(S.d_K + m * S.KV, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.KV, S.st);
+            gemv_dispatch(S.d_V + m * S.KV, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.KV, S.st);
 
             // Q/K head norms
             head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
@@ -351,8 +398,9 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
         // ── Attention output projection + residual 1 (per-sequence) ──
         for (int m = 0; m < M; m++) {
             blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), S.d_attn + m * S.Q, S.Q, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_proj + m * S.H, S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
-                S.layers[l].o.d, S.layers[l].o.sc, S.Q, S.H, S.st);
+            gemv_dispatch(S.d_proj + m * S.H, S.layers[l], S.layers[l].o, S.layers[l].fp16_o,
+    S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
+                S.Q, S.H, S.st);
             // Residual 1: proj = attn_out + input (before RMSNorm)
             blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
             // Save attention output for MLP residual
@@ -367,10 +415,12 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
         }
 
         // ── MLP: batched gate/up ──
-        blackwell::kernels::gemv_int8_batched(S.d_gate, S.d_xi8, S.d_xi8s,
-            S.layers[l].gate.d, S.layers[l].gate.sc, S.H, S.ID, M, S.st);
-        blackwell::kernels::gemv_int8_batched(S.d_up, S.d_xi8, S.d_xi8s,
-            S.layers[l].up.d, S.layers[l].up.sc, S.H, S.ID, M, S.st);
+        gemv_batched_dispatch(S.d_gate, S.layers[l], S.layers[l].gate, S.layers[l].fp16_gate,
+    S.d_xi8, S.d_xi8s,
+             S.H, S.ID, M, S.st);
+        gemv_batched_dispatch(S.d_up, S.layers[l], S.layers[l].up, S.layers[l].fp16_up,
+    S.d_xi8, S.d_xi8s,
+             S.H, S.ID, M, S.st);
 
         for (int m = 0; m < M; m++) {
             blackwell::kernels::apply_swiglu(S.d_mlp + m * S.ID, S.d_gate + m * S.ID, S.d_up + m * S.ID, S.ID, S.st);
@@ -378,8 +428,9 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
         }
 
         // ── MLP down projection (batched) ──
-        blackwell::kernels::gemv_int8_batched(S.d_proj, S.d_mlp_i8, S.d_mlp_i8s,
-            S.layers[l].down.d, S.layers[l].down.sc, S.ID, S.H, M, S.st);
+        gemv_batched_dispatch(S.d_proj, S.layers[l], S.layers[l].down, S.layers[l].fp16_down,
+    S.d_mlp_i8, S.d_mlp_i8s,
+             S.ID, S.H, M, S.st);
 
         // ── Residual 2: down + attention output (per-sequence) ──
         for (int m = 0; m < M; m++) {
@@ -406,12 +457,15 @@ static void batched_prefill(ServerState& S, int M) {
 
         // ── Q/K/V projections (per-sequence, batched) ──
         for (int m = 0; m < M; m++) {
-            blackwell::kernels::gemv_int8_warp(S.d_Q + m * S.Q, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].q.d, S.layers[l].q.sc, S.H, S.Q, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_K + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].k.d, S.layers[l].k.sc, S.H, S.KV, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_V + m * S.KV, S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.layers[l].v.d, S.layers[l].v.sc, S.H, S.KV, S.st);
+            gemv_dispatch(S.d_Q + m * S.Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.Q, S.st);
+            gemv_dispatch(S.d_K + m * S.KV, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.KV, S.st);
+            gemv_dispatch(S.d_V + m * S.KV, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
+    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
+                S.H, S.KV, S.st);
 
             // Q/K head norms
             head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
@@ -451,8 +505,9 @@ static void batched_prefill(ServerState& S, int M) {
         for (int m = 0; m < M; m++) {
             blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), 
                 S.d_attn_out + m * S.Q, S.Q, S.st);
-            blackwell::kernels::gemv_int8_warp(S.d_proj + m * S.H, S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
-                S.layers[l].o.d, S.layers[l].o.sc, S.Q, S.H, S.st);
+            gemv_dispatch(S.d_proj + m * S.H, S.layers[l], S.layers[l].o, S.layers[l].fp16_o,
+    S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
+                S.Q, S.H, S.st);
             // Residual 1: proj = attn_out + input
             blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
             cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
@@ -466,10 +521,12 @@ static void batched_prefill(ServerState& S, int M) {
         }
 
         // ── MLP: batched gate/up ──
-        blackwell::kernels::gemv_int8_batched(S.d_gate, S.d_xi8, S.d_xi8s,
-            S.layers[l].gate.d, S.layers[l].gate.sc, S.H, S.ID, M, S.st);
-        blackwell::kernels::gemv_int8_batched(S.d_up, S.d_xi8, S.d_xi8s,
-            S.layers[l].up.d, S.layers[l].up.sc, S.H, S.ID, M, S.st);
+        gemv_batched_dispatch(S.d_gate, S.layers[l], S.layers[l].gate, S.layers[l].fp16_gate,
+    S.d_xi8, S.d_xi8s,
+             S.H, S.ID, M, S.st);
+        gemv_batched_dispatch(S.d_up, S.layers[l], S.layers[l].up, S.layers[l].fp16_up,
+    S.d_xi8, S.d_xi8s,
+             S.H, S.ID, M, S.st);
 
         for (int m = 0; m < M; m++) {
             blackwell::kernels::apply_swiglu(S.d_mlp + m * S.ID, S.d_gate + m * S.ID, S.d_up + m * S.ID, S.ID, S.st);
@@ -477,8 +534,9 @@ static void batched_prefill(ServerState& S, int M) {
         }
 
         // ── MLP down projection + residual 2 ──
-        blackwell::kernels::gemv_int8_batched(S.d_proj, S.d_mlp_i8, S.d_mlp_i8s,
-            S.layers[l].down.d, S.layers[l].down.sc, S.ID, S.H, M, S.st);
+        gemv_batched_dispatch(S.d_proj, S.layers[l], S.layers[l].down, S.layers[l].fp16_down,
+    S.d_mlp_i8, S.d_mlp_i8s,
+             S.ID, S.H, M, S.st);
 
         for (int m = 0; m < M; m++) {
             blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
@@ -527,14 +585,37 @@ int main(int argc, char** argv) {
     S.layers.resize(S.NL);
     for (int l = 0; l < S.NL; l++) {
         char p[256];
-        snprintf(p, 256, "%s/%d_self_attn.q_proj", wdir, l); S.layers[l].q = upload_int8(p);
-        snprintf(p, 256, "%s/%d_self_attn.k_proj", wdir, l); S.layers[l].k = upload_int8(p);
-        snprintf(p, 256, "%s/%d_self_attn.v_proj", wdir, l); S.layers[l].v = upload_int8(p);
-        snprintf(p, 256, "%s/%d_self_attn.o_proj", wdir, l); S.layers[l].o = upload_int8(p);
-        snprintf(p, 256, "%s/%d_mlp.gate_proj", wdir, l);  S.layers[l].gate = upload_int8(p);
-        snprintf(p, 256, "%s/%d_mlp.up_proj", wdir, l);    S.layers[l].up = upload_int8(p);
-        snprintf(p, 256, "%s/%d_mlp.down_proj", wdir, l);  S.layers[l].down = upload_int8(p);
-        if (l % 7 == 0) fprintf(stderr, "  layer %d/%d\n", l, S.NL);
+        bool is_fp16 = false;
+        // Check if FP16 file exists
+        snprintf(p, 256, "%s/%d_self_attn.q_proj.fp16", wdir, l);
+        FILE* tst = fopen(p, "rb");
+        if (tst) { is_fp16 = true; fclose(tst); }
+        S.layers[l].is_fp16 = is_fp16;
+        
+        if (is_fp16) {
+            auto lfp16 = [&](const char* nm, DevW& dw, __half*& dst) {
+                snprintf(p, 256, "%s/%d_%s.fp16", wdir, l, nm);
+                auto w = upload_fp16(p);
+                dw.K = w.K; dw.N = w.N; dw.d = nullptr; dw.sc = nullptr;
+                dst = w.d;
+            };
+            lfp16("self_attn.q_proj", S.layers[l].q, S.layers[l].fp16_q);
+            lfp16("self_attn.k_proj", S.layers[l].k, S.layers[l].fp16_k);
+            lfp16("self_attn.v_proj", S.layers[l].v, S.layers[l].fp16_v);
+            lfp16("self_attn.o_proj", S.layers[l].o, S.layers[l].fp16_o);
+            lfp16("mlp.gate_proj", S.layers[l].gate, S.layers[l].fp16_gate);
+            lfp16("mlp.up_proj", S.layers[l].up, S.layers[l].fp16_up);
+            lfp16("mlp.down_proj", S.layers[l].down, S.layers[l].fp16_down);
+        } else {
+            snprintf(p, 256, "%s/%d_self_attn.q_proj", wdir, l); S.layers[l].q = upload_int8(p);
+            snprintf(p, 256, "%s/%d_self_attn.k_proj", wdir, l); S.layers[l].k = upload_int8(p);
+            snprintf(p, 256, "%s/%d_self_attn.v_proj", wdir, l); S.layers[l].v = upload_int8(p);
+            snprintf(p, 256, "%s/%d_self_attn.o_proj", wdir, l); S.layers[l].o = upload_int8(p);
+            snprintf(p, 256, "%s/%d_mlp.gate_proj", wdir, l);  S.layers[l].gate = upload_int8(p);
+            snprintf(p, 256, "%s/%d_mlp.up_proj", wdir, l);    S.layers[l].up = upload_int8(p);
+            snprintf(p, 256, "%s/%d_mlp.down_proj", wdir, l);  S.layers[l].down = upload_int8(p);
+        }
+        if (l % 7 == 0) fprintf(stderr, "  layer %d/%d%s\n", l, S.NL, is_fp16 ? " (FP16)" : "");
     }
     S.emb = upload_int8((std::string(wdir) + "/embed_tokens").c_str());
 

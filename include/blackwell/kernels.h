@@ -658,6 +658,21 @@ cudaError_t gemv_int8_gate_up(
     int             N,
     cudaStream_t   stream = 0);
 
+// FP16 GEMV with INT8 quantized activations (block-16 scales).
+// For mixed-precision inference: early layers use FP16 weights for better quality.
+// W_fp16: __half[N][K] row-major
+// x_i8: int8[K] quantized activations
+// x_scales: float[K/16] block scales
+// y_out: float[N] result
+cudaError_t gemv_fp16_warp_launch(
+    float*          y_out,
+    const void*     W_fp16,
+    const int8_t*   x_i8,
+    const float*    x_scales,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // Packed FP4 warp GEMV — 2 E2M1 values per byte, 2× less bandwidth than INT8.
 // Packed FP4 activations × packed FP4 weights, per-row scales.
 // x_packed: [K/2] bytes, x_scale: [K/16] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32

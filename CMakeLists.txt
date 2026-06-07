@@ -63,6 +63,7 @@ set(KERNEL_SOURCES
     src/kernels/gemv_v2.cu
     src/kernels/gemv_int8.cu
     src/kernels/gemv_fp8.cu
+    src/kernels/gemv_fp16.cu
     src/kernels/gemv_int8_per_row.cu
     src/kernels/gemv_int8_pdl.cu
     src/kernels/gemv_int8_fp16sc.cu
