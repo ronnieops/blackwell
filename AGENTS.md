@@ -12,8 +12,8 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 Direct | `inference_server 8b` | **?** | ? | Dims verified correct, needs re-bench |
-| 9B GDN INT8 | `inference_server_9b` | **?** | ? | attn_output_gate added, needs re-bench |
+| 8B INT8 HTTP | `http_subprocess 8b` | **~20** | ~50 | Semi-coherent, INT8 noise ⚠️ |
+| 9B GDN INT8 | `http_subprocess 9b` | **~28** | ~35 | Garbled (32-layer INT8 noise) ❌ |
 
 **Benchmarks (no head_norm/RoPE)**
 | Model | M= | Method | t/s | ms/tok | vs llama.cpp |
