@@ -424,15 +424,25 @@ static void batched_prefill(ServerState& S, int M) {
             rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
         }
 
+        // ── Write K,V to persistent KV cache (needed by decode step later) ──
+        for (int m = 0; m < M; m++) {
+            size_t kb = kv_layer_off + (size_t)m * S.nkv * S.hd;
+            blackwell::kernels::update_kv_cache(
+                S.d_kc + kb, S.d_vc + kb, S.d_K + m * S.KV, S.d_V + m * S.KV,
+                0, 0, S.nkv, S.hd, S.ms, S.st);
+        }
+
         // ── Attention: batched M sequences attending to all M ──
-        // For prefill, each sequence m attends to all previous tokens in this layer
+        // For prefill, each sequence m attends to all M tokens' K/V (just projected)
+        // NOTE: d_K/d_V are per-layer temp buffers, NOT the persistent KV cache.
+        // Pass kv_layer_elems=0 because K/V for layer l start at d_K+0 (re-written each layer).
         for (int m = 0; m < M; m++) {
             // Each batch item attends to all M tokens in this layer
             // Note: all kernels write to S.d_attn (shared buffer) — sync before copy
             blackwell::kernels::attention_decode_batched_gqa(
                 S.d_attn, S.d_Q, S.d_K, S.d_V,  // Full K,V for all M
                 m, S.nqh, S.nkv, S.hd, S.ms,
-                M, (int)kv_seq_stride, (int)kv_layer_off, S.st);
+                M, (int)kv_seq_stride, 0, S.st);
             cudaStreamSynchronize(S.st);  // ensure kernel completes before copy
             cudaMemcpyAsync(S.d_attn_out + m * S.Q, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
         }
@@ -499,7 +509,7 @@ int main(int argc, char** argv) {
         wdir = "weights_int8_bf16";
     }
 
-    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.6.0 (model=%s, %d layers, H=%d)\n", model, S.NL, S.H);
+    fprintf(stderr, "Blackwell INT8 NOFP4 Server v0.6.2 (model=%s, %d layers, H=%d)\n", model, S.NL, S.H);
 
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
     fprintf(stderr, "  Streaming, batched prefill\n");
@@ -629,10 +639,11 @@ int main(int argc, char** argv) {
         bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
-        // Prefill: load all M tokens and process through all layers
+        // Prefill: load all M tokens if they fit in batch size, else token-by-token
         if (gen_start > 0 && gen_start <= M) {
             embed_batch(S, prompts, 0);  // load all M tokens' embeddings to d_residual[m]
             batched_prefill(S, gen_start);
+            cudaStreamSynchronize(S.st);  // ensure prefill done before gen loop
             // Copy last token's hidden state to d_residual[0] for decode continuation
             if (gen_start > 1) {
                 cudaMemcpyAsync(S.d_residual[0], S.d_residual[gen_start - 1], S.H * 4,

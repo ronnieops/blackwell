@@ -1,0 +1,53 @@
+# docker-compose.yml — Blackwell multi-model inference server
+# Run: docker compose up -d
+# Each model on a different port.
+# Weights directories must be available on host at given paths.
+#
+# For a single model:
+#   docker compose up blackwell-1.7b
+#
+# All three:
+#   docker compose up -d
+
+services:
+  blackwell-1.7b:
+    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
+    container_name: blackwell-1.7b
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./weights_int8_bf16:/app/weights_int8_bf16
+      - ./tokenizer_data.bin:/app/tokenizer_data.bin
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: ["8080", "1.7b"]
+    runtime: nvidia
+    restart: unless-stopped
+
+  blackwell-8b:
+    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
+    container_name: blackwell-8b
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b
+      - ./tokenizer_data.bin:/app/tokenizer_data.bin
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: ["8080", "8b"]
+    runtime: nvidia
+    restart: unless-stopped
+
+  blackwell-9b:
+    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
+    container_name: blackwell-9b
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./weights_int8_qwen35_9b:/app/weights_int8_qwen35_9b
+      - ./tokenizer_data_9b.bin:/app/tokenizer_data_9b.bin
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: ["8080", "9b"]
+    runtime: nvidia
+    restart: unless-stopped

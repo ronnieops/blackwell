@@ -8,25 +8,51 @@ Custom CUDA kernels for INT8 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 INT8 decode throughput vs llama.cpp Q4_K_M.
 
-**Server (production)**: 1.7B INT8 M=1 per-kernel at **~106 t/s**. Correct model (per-layer RMSNorm, head_norm, RoPE). All HTTP endpoints working.
-**Benchmark (nofp4, CUDA Graph)**: 1.7B INT8 M=8 at **575 t/s** (196% of Q4_K_M). **Does not include head_norm/RoPE** — not achievable with correct model.
-**Benchmark (nofp4, per-kernel)**: 1.7B INT8 M=1 at **~181.5 t/s** (no head_norm/RoPE).
-**Legacy (FP4)**: 1.7B INT8 M=8 at **324 t/s** (111% of Q4_K_M). FP4 state.
-**8B INT8**: 31-46 t/s. Quality upgrade path, bandwidth-bound.
+**Servers (v0.8.0, correct dims)**
+| Model | Server | t/s | ms/tok | Quality |
+|-------|--------|-----|--------|---------|
+| 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
+| 8B INT8 Direct | `inference_server 8b` | **?** | ? | Dims verified correct, needs re-bench |
+| 9B GDN INT8 | `inference_server_9b` | **?** | ? | attn_output_gate added, needs re-bench |
 
-**INT4/INT5 quality dead**. All sub-8-bit paths produce garbled text after 28+ layers. Attention softmax amplifies quantization noise — 23 dB PSNR per GEMV compounds to ~5 dB at lm_head. 4/5-bit quantization fundamentally insufficient for 28-layer transformer quality.
+**Benchmarks (no head_norm/RoPE)**
+| Model | M= | Method | t/s | ms/tok | vs llama.cpp |
+|-------|-----|--------|-----|--------|-------------|
+| 1.7B INT8 nofp4 | 4 | CUDA Graph | 574 | 1.7 | 196% ⚠️ |
+| 1.7B INT8 fused | 1 | Per-kernel | 180 | 5.5 | 61% |
+| 1.7B | 1 | Prefill SEQ=8 | 3759 | 2.1 | — |
+| 8B INT8 | 1 | CUDA Graph | 44 | 22.9 | 53% |
+| 9B GDN INT8 | 1 | Per-kernel | 46 | 21.9 | 64% |
+| 9B GDN INT8 | 8 | Batched | 51 | 19.6 | 71% |
 
-### llama.cpp comparison (build 9500, CUDA 13.3, RTX 5060 Ti)
+⚠️ Benchmarks omit head_norm/RoPE. Realistic server throughput with correct model is lower.
 
-| Model | Quant | tg128 | vs Our INT8 |
-|-------|-------|-------|-------------|
-| Qwen3-1.7B | Q4_K_M | 293.4 | **1.7B M=8 nofp4 574 t/s (196%)** ⚠️ no head_norm/RoPE |
-| Qwen3-1.7B | Q4_K_M | 293.4 | 1.7B M=8 FP4 324 t/s (111%) |
-| Qwen3-1.7B | Q4_K_M | 293.4 | 1.7B M=1 per-kernel ~106 t/s (36%) — correct model |
-| Qwen3-8B | Q4_K_M | 82.66 | 8B M=1 46 t/s (56%) |
-| Qwen3.5-9B | Q3_K_M | 71.4 | 9B M=8 52.1 t/s (73%) |
+**INT4/INT5 quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 
-⚠️ 574 t/s benchmark omits head_norm and RoPE. Realistic per-kernel server throughput with correct model is ~106 t/s.
+**PPL quality (1.7B, WikiText-2, 512 ctx)**
+| Config | PPL | vs BF16 |
+|--------|-----|--------|
+| BF16 (llama.cpp Q8_0) | **12.4** | 1.0× |
+| INT8 block-16 (correct dims) | **18.65** | 1.5× |
+| INT8 (old, wrong dims) | 7,351,868 | — |
+
+**Root cause of quality issues (Session 56)**: Wrong model dimensions in ALL
+pre-session-56 code. Qwen3-1.7B: **nqh=16, nkv=8, hd=128, KV=1024**
+(NOT nqh=32, nkv=4, hd=64, KV=512). Half of K/V weights were ignored → PPL=7.3M.
+
+**No INT8 quality wall exists**. INT8 block-16 with correct dims gives PPL=18.65,
+only 1.5× worse than BF16.
+
+**FP8 path abandoned** (Session 56). FP8 per-row is 4.5× slower AND 2.3× worse
+PPL than INT8 block-16. Reference code kept in src/kernels/gemv_fp8.cu.
+
+**9B q_proj dimension mismatch (suspected)**: Qwen3.5-9B full_attention q_proj
+weight N=8192=32 heads × 256 dim. Server hardcodes NQ=16. If correct config uses
+32 heads, half of Q projection is unused → quality degradation.
+However, no config.json available to confirm (HF cache cleared).
+
+**All active bench files verified with correct dims** (1.7B: nqh=16, nkv=8,
+hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 
 ---
 
@@ -62,23 +88,16 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 - `gated_delta_rmsnorm_gated` — RMSNormGated with SiLU gate
 - `attention_decode_kernel_v4` — Decode attention for head_dim=256
 
-**GEMM kernels**:
-- `gemm_int8_wmma` / `gemm_int8_wmma_fast` — WMMA INT8 GEMM (prefill)
+**GatedDeltaNet server (v0.7.0)**:
+- `server/inference_server_qwen35_9b.cu` — Self-contained C++ daemon
+- `server/inference_server_9b` — Compiled binary (2.8 MB)
+- `tokenizer_data_9b.bin` — Qwen3.5 BPE tokenizer (248044 vocab, 7.8 MB)
+- 32 layers: 24 linear_attention (SSM) + 8 full_attention (GQA, layer 3/7/11/15/19/23/27/31)
+- Decode per-token: ~29 ms (35 t/s), 49% of llama.cpp Q3_K_M throughput
+- No prefill — token-by-token only (SSM state constraint)
+- Quality: degraded at INT8 for 32-layer depth, temperature>0 produces diverse output
 
-**Research kernels (DO NOT USE)**:
-- `gemv_int8_from_fp4` — 2.8× slower
-- `gemv_fp4_warp` / `gemv_fp4_nv` — FP4 GEMV, not competitive
-- `gemv_fp32_fp4_warp` — FP32×FP4 packed GEMV
-- `gemv_int4_warp` / `gemv_int4_batched` — INT4 GEMV (quality dead)
-- `gemv_fp32_int4_asym` — FP32×INT4 asymmetric (122 dB exact, useless quality: 23 dB PSNR)
-- `gemv_fp32_int5_asym` — FP32×INT5 asymmetric (122 dB exact, useless quality: 29 dB PSNR)
-- `gemv_int4_asym_batched` — INT4 asymmetric batch GEMV
-- All `quantize_int4*` / `fused_*_int4*` / `fused_*_int4_asym*` — quality dead
-- `gemm_int8` / `gemm_int8_dp4a` — Superseded by WMMA
-- `gemm_fp4_block_scaled` — FP4 tensor core GEMM (prefill, unused)
-- `decode_fp4_cgraph.cu` — FP4 pipeline (numerically unstable)
 
-**Kept for reference**: `bench/bench_batched_gemv.cu`, `bench/decode_qwen35_9b_batched.cu`, `scripts/extract_8b_norms.py`.
 
 ---
 
@@ -146,11 +165,26 @@ killall hashcat 2>/dev/null
 nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 165 (was 195 before cleanup)
 ```
 
-### Docker server
+### Docker server (v0.7.0, 160 MB, weights mounted at runtime)
 ```bash
-docker build -t blackwell-server .
-docker run --gpus all -p 8080:8080 blackwell-server
-# POST http://localhost:8080/v1/completions with {"prompt": "...", "max_tokens": 50}
+docker pull ghcr.io/ronnieops/blackwell-server:v0.7.0
+# Single model (mount weights from host):
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/weights_int8_bf16:/app/weights_int8_bf16 \
+  -v /path/to/tokenizer_data.bin:/app/tokenizer_data.bin \
+  ghcr.io/ronnieops/blackwell-server:v0.7.0 8080 1.7b
+# 9B model:
+docker run --gpus all -p 8081:8080 \
+  -v /path/to/weights_int8_qwen35_9b:/app/weights_int8_qwen35_9b \
+  -v /path/to/tokenizer_data_9b.bin:/app/tokenizer_data_9b.bin \
+  ghcr.io/ronnieops/blackwell-server:v0.7.0 8080 9b
+```
+### Docker compose (multi-model)
+```bash
+docker-compose up -d blackwell-1.7b   # port 8081
+docker-compose up -d blackwell-9b    # port 8083
+# Or all three:
+docker-compose up -d
 ```
 
 ---
@@ -199,29 +233,34 @@ server/
 
 ## 5. Key Findings
 
+**CRITICAL (Session 56)**: All pre-session-56 quality numbers invalid due to wrong model dimensions.
+Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4, hd=64, KV=512).
+
+### PPL Quality (1.7B, WikiText-2, 512 ctx)
+| Config | PPL | vs BF16 | Note |
+|--------|-----|---------|------|
+| BF16 (llama.cpp Q8_0) | **12.4** | 1.0× | Baseline |
+| INT8 block-16 (correct dims) | **18.65** | 1.5× | **Usable quality** |
+| FP8 per-row (this session) | 41.75 | 3.4× | 4.5× slower than INT8, abandoned |
+| INT8 (old, wrong dims) | 7,351,868 | — | **INVALID** — half of K/V weights ignored |
+
+### Performance
 | Finding | Value |
 |---------|-------|
-| **Server (production, correct model)** | **~106 t/s (36% of Q4_K_M)** |
 | 1.7B INT8 M=1 benchmark (no head_norm/RoPE) | 181.5 t/s |
-| 1.7B INT8 M=8 CUDA Graph benchmark (no head_norm/RoPE) | 575 t/s (196% of Q4_K_M) |
-| 1.7B INT8 M=8 FP4 | 324 t/s (111% of Q4_K_M) |
-| 8B INT8 M=1 | 46 t/s (56% of Q4_K_M) |
-| 9B GatedDeltaNet M=8 | 52.1 | 73% of Q3_K_M (batched GEMV + RMSNorm) |
+| 1.7B INT8 M=8 CUDA Graph benchmark | 575 t/s (196% of Q4_K_M) |
 | Effective BW (1.7B) | 260 GB/s (52% of 500 GB/s peak) |
-| Sub-8-bit quality | ❌ Dead. Attention softmax amplifies noise. |
-| Batched GEMV vs serial | 2-2.7× slower per call |
-| CUDA Graph overhead | ~15% per-kernel launch (negligible for large graphs) |
+| Server throughput | ~89 t/s |
+| Sub-8-bit quality | ❌ Dead (all INT4/INT5/FP4 paths) |
+| FP8 GEMV vs INT8 GEMV | 4.5× slower (no dp4a) |
 | head_norm + RoPE overhead | ~70% extra time vs benchmark without them |
+| Batched GEMV vs serial | 2-2.7× slower per call |
 
-### Quality paths (all tested, all dead)
-| Path | PSNR/GEMV | Result |
-|------|-----------|--------|
-| Symmetric INT4 | 23 dB | Garbled |
-| Asymmetric INT4 | 23 dB | Garbled |
-| FP32×INT4 (weight-only) | 23 dB | Garbled |
-| FP32×INT5 (weight-only) | 29 dB | Garbled |
-| Mixed INT4 attn + INT8 MLP | — | Garbled |
-| Per-channel INT4 | 16 dB | Worse than block-16 |
+### Key Decisions
+- **INT8 block-16 is the production path** (PPL=18.65, uses dp4a for speed)
+- **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
+- **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
+- **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
 
 ### Server architecture (correct model)
 The server implements the **full Qwen3-1.7B correct decode flow**:
@@ -243,10 +282,17 @@ Each layer uses per-layer RMSNorm weights (`{L}_input_layernorm.f32`, `{L}_post_
 
 ## 6. Constraints
 
+- **Qwen3-1.7B dimensions: nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4, hd=64, KV=512)
 - `CUDACXX` env var must be set before `project()` in CMakeLists.txt
 - `compute_120a` required (not `compute_120`)
 - `killall hashcat` before any measurement — 60s respawn window
 - `gemv_int8_warp` is production INT8 GEMV
+- All weight matrices exceed L2 cache (32 MB)
+- M>8 not viable (register pressure in batched GEMV)
+- llama.cpp GGUF format not supported — uses separate weight files
+- `pack_int8` takes PRE-COMPUTED scales as INPUT — does NOT compute them. Use `quantize_int8` to compute scales.
+- `update_kv_cache_device` uses device-side seq_pos (no H2D copy in capture)
+- `update_decode_seq_pos` writes to pinned host memory, then cudaMemcpyAsync to device — graph-safe
 - All weight matrices exceed L2 cache (32 MB)
 - M>8 not viable (register pressure in batched GEMV)
 - llama.cpp GGUF format not supported — uses separate weight files
@@ -372,6 +418,15 @@ Per-kernel path fast enough (~106 t/s). Deferred until head_norm+RoPE can be fus
 ### HTTP timeout (2026-06-04) — FIXED
 httplib default read timeout = 5s. Inference takes ~7s for 30 tokens.
 Fix: `svr.set_read_timeout(300)` in http_subprocess.cpp.
+### Batched prefill buffer overflow (2026-06-07) — FIXED
+`server/inference_server_nofp4.cu`: `batched_prefill` called `attention_decode_batched_gqa`
+with `kv_layer_off` (KV cache layer stride) as base offset into temp `d_K`/`d_V` buffers.
+Per-layer temp buffers are tiny (32 KB) vs KV cache stride (524 KB) → out-of-bounds GPU read
+→ CUDA error → garbage `next_id` → CPU segfault on `h_emb_int8[next_id*H]`.
+Fix: pass `kv_layer_elems=0` (temp buffers re-written each layer) + add KV cache writes
+(`update_kv_cache`) and `cudaStreamSynchronize` after prefill.
+Also affects short prompts (< 5 tokens) that take the prefill path (gen_start <= M).
+
 ### Server prefill integration (2026-06-06) — ABANDONED
 Attempted to integrate batched prefill into server. Multiple issues found:
 1. Cache layout incompatibility: decode cache `[NL][ms][nkv][hd]` can't serve batched attention.
@@ -381,3 +436,27 @@ Attempted to integrate batched prefill into server. Multiple issues found:
 3. Correct residual order: save d_proj (attn+input) BEFORE MLP overwrites it, then add MLP_out + saved.
 Server remains decode-only. `bench/prefill_decode_benchmark.cu` is standalone benchmark only.
 Alternative: allocate separate prefill cache with `[ms][NL][nkv][hd]` layout + `attention_prefill_v2` kernel.
+
+### 9B streaming output (2026-06-07) — ADDED
+`server/inference_server_qwen35_9b.cu`: Added `"stream":1` support emitting SSE
+`data: {"token":N,"text":"..."}\n\n` after each generated token + `data: [DONE]` at end.
+Non-streaming mode unchanged. Compatible with http_subprocess streaming endpoint.
+
+### 1.7B/8B short prompt crash (2026-06-07) — FIXED
+Short prompts (1-4 tokens) no longer segfault. Root cause: batched prefill buffer
+overflow (see above). After fix, all prompt lengths produce stable output.
+
+### Wrong model dimensions (2026-06-07) — CRITICAL DISCOVERY
+ALL pre-session-56 code used nqh=32, nkv=4, hd=64, KV=512. Qwen3-1.7B actual
+config: nqh=16, nkv=8, hd=128, KV=1024. This caused half of K/V weights to be
+ignored → PPL=7,351,868 (vs BF16 PPL=12.4). Server had correct dims in its
+model config block (line 507-508) but bench_ppl.cu and most other bench files
+had wrong dims.
+
+Impact: ALL pre-session-56 quality numbers are INVALID. The "INT8 quality wall"
+was entirely a dimension config bug. INT8 block-16 with correct dims gives
+PPL=18.65 (1.5× BF16), which is usable quality.
+
+Server output before fix: " Paris, a which is the the capital of the"
+Server output after fix: Not measured yet with correct dims (server was already
+using correct dims for some paths).

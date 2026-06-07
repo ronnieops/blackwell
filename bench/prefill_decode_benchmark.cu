@@ -45,7 +45,7 @@ __global__ void rope_kernel(float* data, int nh, int hd, const int* seq_pos) {
     int head = h / (hd / 2);
     int dim = h % (hd / 2);
     int pos = *seq_pos;
-    float theta = powf(10000.0f, -2.0f * dim / hd);
+    float theta = powf(1000000.0f, -2.0f * dim / hd);
     float cos_ = cosf(pos * theta);
     float sin_ = sinf(pos * theta);
     float* x = data + head * hd;
@@ -358,8 +358,8 @@ int main(int argc, char** argv) {
     if (DEC_TOKENS < 1) DEC_TOKENS = 1; if (DEC_TOKENS > 50) DEC_TOKENS = 50;
 
     // Qwen3-1.7B config
-    const int NL = 28, H = 2048, Q = 2048, KV = 256, ID = 11008;
-    const int nqh = 32, nkv = 4, hd = 64, ms = 2048;
+    const int NL = 28, H = 2048, Q = 2048, KV = 1024, ID = 6144;
+    const int nqh = 16, nkv = 8, hd = 128, ms = 2048;
     const int V = 151936;
 
     cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);

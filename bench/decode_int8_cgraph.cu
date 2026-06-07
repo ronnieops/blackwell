@@ -176,12 +176,10 @@ int main(int argc, char** argv) {
             // Fused: unpack FP4 → INT8 quant (replaces 2 kernels)
             blackwell::kernels::fused_unpack_fp4_quant(b.d_x_int8, b.d_x_int8_s,
                 d_x_fp4, d_xs, b.d_x_int8_s, H);
-            chk(blackwell::kernels::gemv_int8_gate_up(
-                b.d_gate, b.d_up,
-                b.d_x_int8, b.d_x_int8_s,
-                lw[l].g.d, lw[l].g.sc,
-                lw[l].u.d, lw[l].u.sc,
-                H, I, 0), "gate_up");
+            chk(blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
+                lw[l].g.d, lw[l].g.sc, H, I, 0), "gate");
+            chk(blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
+                lw[l].u.d, lw[l].u.sc, H, I, 0), "up");
             // Fused: SwiGLU + INT8 quant (replaces 2 kernels)
             blackwell::kernels::fused_swiglu_quant(b.d_mlp_i8, b.d_mlp_i8s, b.d_gate, b.d_up, I);
             chk(blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
@@ -282,12 +280,10 @@ int main(int argc, char** argv) {
             // Fused: unpack FP4 → INT8 quant (replaces 2 kernels)
             blackwell::kernels::fused_unpack_fp4_quant(b.d_x_int8, b.d_x_int8_s,
                 d_x_fp4, d_xs, b.d_x_int8_s, H);
-            blackwell::kernels::gemv_int8_gate_up(
-                b.d_gate, b.d_up,
-                b.d_x_int8, b.d_x_int8_s,
-                lw[l].g.d, lw[l].g.sc,
-                lw[l].u.d, lw[l].u.sc,
-                H, I, 0);
+            blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
+                lw[l].g.d, lw[l].g.sc, H, I, 0);
+            blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
+                lw[l].u.d, lw[l].u.sc, H, I, 0);
             // Fused: SwiGLU + INT8 quant
         blackwell::kernels::fused_swiglu_quant(b.d_mlp_i8, b.d_mlp_i8s, b.d_gate, b.d_up, I);
             blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
@@ -372,12 +368,10 @@ int main(int argc, char** argv) {
         blackwell::kernels::fused_rmsnorm_pack(d_x_fp4, d_xs, b.d_proj, d_rn, H, 1e-6f, graph_stream);
         blackwell::kernels::fused_unpack_fp4_quant(b.d_x_int8, b.d_x_int8_s,
             d_x_fp4, d_xs, b.d_x_int8_s, H);
-        blackwell::kernels::gemv_int8_gate_up(
-            b.d_gate, b.d_up,
-            b.d_x_int8, b.d_x_int8_s,
-            lw[0].g.d, lw[0].g.sc,
-            lw[0].u.d, lw[0].u.sc,
-            H, I, graph_stream);
+        blackwell::kernels::gemv_int8_warp(b.d_gate, b.d_x_int8, b.d_x_int8_s,
+            lw[0].g.d, lw[0].g.sc, H, I, graph_stream);
+        blackwell::kernels::gemv_int8_warp(b.d_up, b.d_x_int8, b.d_x_int8_s,
+            lw[0].u.d, lw[0].u.sc, H, I, graph_stream);
         blackwell::kernels::fused_swiglu_quant(b.d_mlp_i8, b.d_mlp_i8s, b.d_gate, b.d_up, I);
         blackwell::kernels::gemv_int8_warp(b.d_proj, b.d_mlp_i8, b.d_mlp_i8s,
             lw[0].d.d, lw[0].d.sc, I, H, graph_stream);

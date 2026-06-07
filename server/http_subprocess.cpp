@@ -31,10 +31,10 @@ public:
 
     bool start(const char* model) {
         std::lock_guard<std::mutex> g(lock);
-        // Create named pipe for response
-        char resp_fifo[64];
-        snprintf(resp_fifo, sizeof(resp_fifo), "/tmp/inf_resp_%d", getpid());
-        mkfifo(resp_fifo, 0600);
+        // Determine binary path
+        const char* bin = "./server/inference_server";
+        std::string bin9b = "./server/inference_server_9b";
+        if(strstr(model,"9b")) bin = bin9b.c_str();
 
         int pin[2], pout[2];
         if(pipe(pin)==-1 || pipe(pout)==-1) return false;
@@ -43,7 +43,7 @@ public:
             close(pin[1]); close(pout[0]);
             dup2(pin[0], STDIN_FILENO); close(pin[0]);
             dup2(pout[1], STDOUT_FILENO); close(pout[1]);
-            execl("./server/inference_server", "inference_server", model, (char*)nullptr);
+            execl(bin, "inference_server", model, (char*)nullptr);
             _exit(1);
         }
         close(pin[0]); close(pout[1]);
@@ -51,7 +51,7 @@ public:
         from_f = fdopen(pout[0], "r");
         setvbuf(from_f, nullptr, _IONBF, 0);
         ready = true;
-        fprintf(stderr, "SubprocessEngine: pid=%d model=%s\n", pid, model);
+        fprintf(stderr, "SubprocessEngine: pid=%d model=%s bin=%s\n", pid, model, bin);
         return true;
     }
 
@@ -116,6 +116,7 @@ public:
             if(!fgets(line, sizeof(line), from_f)) return false;
 
             tokens.clear(); text.clear();
+            // Try batch format "tokens":[[...]] (1.7B/8B) then single "tokens":[...] (9B)
             char* t = strstr(line, "\"tokens\":[[");
             if(t) {
                 t += 10;
@@ -126,10 +127,28 @@ public:
                         tokens.push_back((uint32_t)v);
                     }
                 }
+            } else {
+                t = strstr(line, "\"tokens\":[");
+                if(t) {
+                    t += 9;
+                    while(*t && *t!=']') {
+                        while(*t && (*t<'0' || *t>'9') && *t!='-') t++;
+                        if(*t && ( (*t>='0' && *t<='9') || *t=='-')) {
+                            long v = strtol(t, &t, 10);
+                            tokens.push_back((uint32_t)v);
+                        }
+                    }
+                }
             }
+            // Try batch "text":["..."] then single "text":"..."
             char* s = strstr(line, "\"text\":[\"");
             if(s) {
                 s += 9; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s);
+            } else {
+                s = strstr(line, "\"text\":\"");
+                if(s) {
+                    s += 8; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s);
+                }
             }
             return !tokens.empty();
         } else {
@@ -175,9 +194,9 @@ public:
         if(pid > 0) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); }
         if(wfd >= 0) close(wfd);
         if(from_f) fclose(from_f);
-        wfd = rfd = -1; pid = -1; ready = false;
+        wfd = -1; pid = -1; ready = false;
     }
-    int rfd{-1};
+
 };
 
 static SubprocessEngine g_engine;

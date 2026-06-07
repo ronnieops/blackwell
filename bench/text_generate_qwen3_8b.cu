@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
         // ══ 36-layer decode ══
         for(int l=0;l<NL;++l){
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res");
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_in,H,eps,st),"rmsnorm_in");
+            cudaError_t _prerr=cudaGetLastError(); if(_prerr!=cudaSuccess) { printf("PRE-ERROR: %s\n", cudaGetErrorString(_prerr)); } die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_in,H,eps,st),"rmsnorm_in");
 
             // Quantize normed input
             die(blackwell::kernels::quantize_int8(d_x_i8,d_x_s,d_xi_f,H,st),"quant_in");

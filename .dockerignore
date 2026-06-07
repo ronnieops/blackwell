@@ -1,19 +1,26 @@
 # .dockerignore
 build/
-bench/*.cu
-bench/*.h
-bench/decode_*
-bench/text_generate_cublas
-bench/text_generate_fp32
-bench/text_generate_bf16
-bench/bench_*
-bench/verify_*
-weights_int8_qwen3_1.7b*
-weights_int8_bf16_06b/
-weights_int8_qwen3_06b/
-.git/
+bench/
+scripts/
+CMakeLists.txt
+src/
+include/
+
+# Exclude dead weight dirs
+weights_int8_qwen3_1.7b*/
+
+# Exclude source files — only need built binaries
+server/*.cu
+server/*.cpp
+server/*.py
+
+# Exclude docs/code
 *.md
+*.md~
 *.pyc
 __pycache__/
+.git/
 .vscode/
 .idea/
+
+# Keep: weights/, binaries, tokenizer data

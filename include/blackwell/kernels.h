@@ -488,6 +488,47 @@ cudaError_t quantize_int8(
     int             num_elements,
     cudaStream_t    stream = 0);
 
+// ---------------------------------------------------------------------------
+// FP8 E4M3 GEMV — per-row-scaled weights, FP32 activations
+// ---------------------------------------------------------------------------
+// Weight format: W_fp8 [N×K] as uint8_t (FP8 E4M3 values, 1 byte/weight).
+// Scale format:  W_scale [N] FP32 (one scale per output row).
+// Activation:    x_fp32 [K] FP32.
+// 1 warp per output row. FP8→FP32 dequant on the fly.
+
+cudaError_t gemv_fp8_fp32act(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_fp8,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// FP8 GEMV with INT8 activation input (drop-in for gemv_int8_warp)
+// Activation: INT8 block-16. Weight: FP8 per-row. Output: FP32.
+
+cudaError_t gemv_fp8_int8act(
+    float*          y_out,
+    const void*     x_int8,
+    const float*    x_scale,
+    const void*     W_fp8,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
+// FP32 → FP8 E4M3 per-row quantization (GPU kernel)
+// out_fp8: [N×K] uint8, out_scale: [N] float (one per row)
+
+cudaError_t quantize_fp8_row(
+    void*           out_fp8,
+    float*          out_scale,
+    const float*    x_fp32,
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
+
 // INT8 block-scaled GEMV Split-K (K split into K_splits, AtomicAdd reduction)
 // Caller MUST zero y_out before launch. Grid: (N/256, K_splits).
 // Targets large N with wave quantization (e.g., N=6144: 24 blocks < 36 SMs).
@@ -566,6 +607,18 @@ cudaError_t gemv_int8_warp(
 // Warp-cooperative FP32×INT8 per-row GEMV — 1 warp/row, shuffle reduce.
 // FP32 activations × INT8 per-row scaled weights. Same coalescing benefit.
 cudaError_t gemv_fp32_int8_per_row_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_t_int8,
+    const float*    W_t_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
+// Per-row INT8 GEMV with FP32 activations — 1 scale per output row.
+// Scale format: W_scale [N] FP32 (per-row max), int8 data same block-16 layout.
+
+cudaError_t gemv_int8_per_row(
     float*          y_out,
     const float*    x_fp32,
     const void*     W_t_int8,
