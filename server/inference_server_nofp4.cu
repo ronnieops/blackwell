@@ -574,14 +574,14 @@ int main(int argc, char** argv) {
 
     // ── Per-layer Q/K norms ──
     {
-        float* qk_h = (float*)malloc(28 * 2 * 128 * 4);
+        float* qk_h = (float*)malloc(S.NL * 2 * S.hd * 4);
         FILE* f = fopen((std::string(wdir) + "/qk_norms.f32").c_str(), "rb");
-        (void)fread(qk_h, 4, 28 * 2 * 128, f); fclose(f);
-        for (int l = 0; l < S.NL; l++) {
-            cudaMalloc(&S.layers[l].qn, 128 * 4);
-            cudaMemcpy(S.layers[l].qn, qk_h + l * 2 * 128, 128 * 4, cudaMemcpyHostToDevice);
-            cudaMalloc(&S.layers[l].kn, 128 * 4);
-            cudaMemcpy(S.layers[l].kn, qk_h + l * 2 * 128 + 128, 128 * 4, cudaMemcpyHostToDevice);
+        size_t n_read = fread(qk_h, 4, S.NL * 2 * S.hd, f); fclose(f);
+        for (int l = 0; l < S.NL && l < (int)(n_read / (2 * S.hd)); l++) {
+            cudaMalloc(&S.layers[l].qn, S.hd * 4);
+            cudaMemcpy(S.layers[l].qn, qk_h + l * 2 * S.hd, S.hd * 4, cudaMemcpyHostToDevice);
+            cudaMalloc(&S.layers[l].kn, S.hd * 4);
+            cudaMemcpy(S.layers[l].kn, qk_h + l * 2 * S.hd + S.hd, S.hd * 4, cudaMemcpyHostToDevice);
         }
         free(qk_h);
     }
