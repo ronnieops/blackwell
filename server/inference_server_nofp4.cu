@@ -167,8 +167,15 @@ struct ServerState {
     // Device-side seq_pos for graph-compatible RoPE
     int* d_seq_pos;
 
+    // Repetition penalty
+    int* d_recent_tokens;        // [M * MAX_RECENT] device buffer
+    int max_recent;             // how many recent tokens to track
+    float repetition_penalty;   // penalty > 1.0
+
     cudaStream_t st;
 };
+
+enum { MAX_RECENT = 64 };  // tokens to track for repetition penalty
 
 // ── JSON helpers ──────────────────────────────────────────────────────
 static std::string read_stdin_line() {
@@ -700,6 +707,12 @@ int main(int argc, char** argv) {
     cudaMemcpyAsync(S.d_seq_pos, &zero, sizeof(int), cudaMemcpyHostToDevice, S.st);
     S.kv_stride = (size_t)S.nkv * S.hd * S.ms;
 
+    // Repetition penalty buffers
+    cudaMalloc(&S.d_recent_tokens, S.M * MAX_RECENT * sizeof(int));
+    cudaMemset(S.d_recent_tokens, 0, S.M * MAX_RECENT * sizeof(int));
+    S.max_recent = MAX_RECENT;
+    S.repetition_penalty = 1.0f;  // default: no penalty
+
     fprintf(stderr, "Ready.\n");
 
     // ── Main request loop ──
@@ -717,6 +730,10 @@ int main(int argc, char** argv) {
         int max_tokens = find_int(line, "max_tokens", 30);
         float temperature = find_float(line, "temperature", 0);
         int top_k = find_int(line, "top_k", 0);
+        float rep_pen = find_float(line, "repetition_penalty", 1.0f);
+        if (rep_pen < 1.0f) rep_pen = 1.0f;
+        if (rep_pen > 2.0f) rep_pen = 2.0f;
+        S.repetition_penalty = rep_pen;
         bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
@@ -742,6 +759,11 @@ int main(int argc, char** argv) {
         // For M=1: batched path (single batched_decode_step call per token)
         // For M>1: sequential per-item path (avoids KV cache position conflicts)
         std::vector<std::vector<uint32_t>> outputs(M);
+        // Repetition penalty: host-side recent tokens buffer
+        std::vector<int> h_recent(MAX_RECENT, 0);
+        int recent_head = 0;
+        int num_recent = 0;
+
         if (M == 1) {
             // Batched decode: one batched_decode_step call per token
             for (int s = gen_start; s < gen_start + max_tokens; s++) {
@@ -749,10 +771,19 @@ int main(int argc, char** argv) {
                 blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[0], S.H, S.st);
                 blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
                     (S.lm_head.d ? S.lm_head.d : S.emb.d), (S.lm_head.d ? S.lm_head.sc : S.emb.sc), S.H, S.V, S.st);
+                // Apply repetition penalty before sampling
+                if (S.repetition_penalty > 1.0f && num_recent > 0) {
+                    cudaMemcpy(S.d_recent_tokens, h_recent.data(), num_recent * sizeof(int), cudaMemcpyHostToDevice);
+                    blackwell::kernels::apply_repetition_penalty(S.d_logits, S.d_recent_tokens, num_recent, S.repetition_penalty, S.V, S.st);
+                }
                 blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
                     S.d_next_id, 0xdeadbeefLL, s, S.st);
                 uint32_t next_id;
                 cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
+                // Update recent tokens (circular buffer)
+                if (recent_head >= MAX_RECENT) recent_head = 0;
+                h_recent[recent_head++] = (int)next_id;
+                if (num_recent < MAX_RECENT) num_recent++;
                 outputs[0].push_back(next_id);
                 if (stream) {
                     std::string tok_txt = tokenizer.decode(next_id);
@@ -779,6 +810,11 @@ int main(int argc, char** argv) {
             // sequentially through all layers. Avoids KV cache position conflicts.
             std::vector<int> item_pos(M, gen_start);
             std::vector<bool> item_done(M, false);
+            std::vector<std::vector<int>> item_recent(M, std::vector<int>(MAX_RECENT, 0));
+            std::vector<int> item_recent_head(M, 0);
+            std::vector<int> item_num_recent(M, 0);
+            std::vector<int> h_recent(MAX_RECENT);
+
             for (int t = 0; t < max_tokens; t++) {
                 for (int m = 0; m < M; m++) {
                     if (item_done[m]) continue;
@@ -786,10 +822,21 @@ int main(int argc, char** argv) {
                     blackwell::kernels::quantize_int8(S.d_xi8, S.d_xi8s, S.d_residual[m], S.H, S.st);
                     blackwell::kernels::gemv_int8_warp(S.d_logits, S.d_xi8, S.d_xi8s,
                         (S.lm_head.d ? S.lm_head.d : S.emb.d), (S.lm_head.d ? S.lm_head.sc : S.emb.sc), S.H, S.V, S.st);
+                    // Apply repetition penalty for this sequence
+                    if (S.repetition_penalty > 1.0f && item_num_recent[m] > 0) {
+                        for (int i = 0; i < item_num_recent[m]; i++)
+                            h_recent[i] = item_recent[m][i];
+                        cudaMemcpy(S.d_recent_tokens, h_recent.data(), item_num_recent[m] * sizeof(int), cudaMemcpyHostToDevice);
+                        blackwell::kernels::apply_repetition_penalty(S.d_logits, S.d_recent_tokens, item_num_recent[m], S.repetition_penalty, S.V, S.st);
+                    }
                     blackwell::kernels::sample_gpu(S.d_logits, S.V, temperature, top_k,
                         S.d_next_id, 0xdeadbeefLL, item_pos[m], S.st);
                     uint32_t next_id;
                     cudaMemcpy(&next_id, S.d_next_id, sizeof(int), cudaMemcpyDeviceToHost);
+                    // Update recent tokens for this sequence
+                    if (item_recent_head[m] >= MAX_RECENT) item_recent_head[m] = 0;
+                    item_recent[m][item_recent_head[m]++] = (int)next_id;
+                    if (item_num_recent[m] < MAX_RECENT) item_num_recent[m]++;
                     outputs[m].push_back(next_id);
                     if (stream) {
                         std::string tok_txt = tokenizer.decode(next_id);

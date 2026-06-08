@@ -1047,6 +1047,18 @@ cudaError_t sample_gpu(
     int             step,       // step counter (for rng state)
     cudaStream_t    stream = 0);
 
+// Apply repetition penalty to logits before sampling.
+// logits: [V] in-place
+// recent: [num_recent] recent token IDs (circular buffer, newest last)
+// penalty: > 1.0, e.g. 1.1 = 10% penalty
+cudaError_t apply_repetition_penalty(
+    float*          logits,      // [V] in-place
+    const int*     recent,      // [num_recent] recent token IDs
+    int             num_recent,
+    float           penalty,
+    int             vocab,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // GatedDeltaNet (linear attention) for Qwen3.5-9B
 // ---------------------------------------------------------------------------

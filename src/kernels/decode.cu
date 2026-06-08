@@ -609,5 +609,49 @@ cudaError_t load_kv_cache_qkgv(
     return cudaPeekAtLastError();
 }
 
+// ===========================================================================
+// Repetition penalty: divide/penalize logits of recently generated tokens
+// Before softmax: if logit > 0: logit /= penalty; else: logit *= penalty
+// This reduces probability of repeating tokens.
+// ===========================================================================
+__global__ void repetition_penalty_kernel(
+    float* logits,        // [V] in-place logits
+    const int* recent,   // [num_recent] recent token IDs
+    int num_recent,      // number of recent tokens to penalize
+    float penalty,       // penalty > 1.0 (e.g., 1.1)
+    int V)               // vocabulary size
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= V) return;
+
+    float logit = logits[tid];
+    // Check if this vocab ID is in recent tokens
+    for (int i = 0; i < num_recent; ++i) {
+        if (tid == recent[i]) {
+            if (logit > 0) {
+                logits[tid] = logit / penalty;
+            } else {
+                logits[tid] = logit * penalty;
+            }
+            break;
+        }
+    }
+}
+
+cudaError_t apply_repetition_penalty(
+    float* logits,        // [V] in-place logits
+    const int* recent,   // [num_recent] recent token IDs
+    int num_recent,
+    float penalty,
+    int V,
+    cudaStream_t stream)
+{
+    if (penalty <= 1.0f || num_recent == 0) return cudaSuccess;
+    int threads = 256;
+    int blocks = (V + threads - 1) / threads;
+    repetition_penalty_kernel<<<blocks, threads, 0, stream>>>(logits, recent, num_recent, penalty, V);
+    return cudaPeekAtLastError();
+}
+
 } // namespace kernels
 } // namespace blackwell
