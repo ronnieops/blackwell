@@ -27,7 +27,14 @@
 FROM ubuntu:24.04
 
 LABEL description="Blackwell INT8 — RTX 5060 Ti, multi-model (1.7B/8B/9B GDN)"
-LABEL version="0.7.0"
+LABEL version="0.8.1"
+
+# v0.8.1 features:
+# - Repetition penalty (repetition_penalty param, 1.0-2.0)
+# - Batched QKV optimization (reduced kernel launches for M>1)
+# - Mixed-precision auto-detection (.fp16 files per layer)
+# - Critical bug fixes (seq_pos sync, empty prompt, prefill cache)
+# - 1.7B: ~23 t/s, 8B: ~3.7 t/s
 
 RUN apt-get update \
     -o Acquire::Check-Valid-Until=false \
