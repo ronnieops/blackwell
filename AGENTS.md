@@ -8,21 +8,28 @@ Custom CUDA kernels for INT8 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 INT8 decode throughput vs llama.cpp Q4_K_M.
 
-**Servers (v0.8.0, correct dims)**
+**Servers (v0.8.1, correct dims)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
 | 8B INT8 (correct dims) | `inference_server 8b` | **~20** | ~50 | Coherent ✅ |
 | 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled ❌ |
 
-**8B quality with correct dims**: INT8 produces coherent text. 
-Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8 
-and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier 
+**Server v0.8.1 features**:
+- Repetition penalty: `repetition_penalty` parameter (1.0-2.0, default 1.0=off)
+  Reduces token looping. 8B output: "Paris... Paris..." (no pen) → "Paris... the city that has..." (rep=1.3)
+- Batched QKV: M sequences batched through QKV in 3 calls (vs M×3 sequential)
+- Mixed-precision: auto-detects `.fp16` files per layer, dispatches to FP16 GEMV
+
+**8B quality with correct dims**: INT8 produces coherent text.
+Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8
+and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier
 "garbled 8B INT8" observation was from WRONG model dimensions.
 
-**9B quality remains blocked**: Even 16 FP16 layers produces same 
-garbled output as 8 FP16 layers. GatedDeltaNet SSM state accumulates 
-noise across ALL 32 layers regardless of early-layer precision.
+**9B quality BLOCKED**: Produces garbled output even with ALL-FP16 weights!
+Root cause: SSM instability (A_log > 0 for 68.8% of layer-4 channels,
+A > 1 → exponential hidden state growth). A_log stored as FP32 (not quantized).
+This is NOT a quantization issue — architectural/inference problem.
 
 **Benchmarks (no head_norm/RoPE)**
 | Model | M= | Method | t/s | ms/tok | vs llama.cpp |
@@ -222,7 +229,9 @@ weights_int8_qwen35_9b_mixed/ # 9B mixed: 8 FP16 + 24 INT8 (NO quality improveme
 Mixed precision does NOT help 8B. Use `weights_int8_qwen3_8b/` (all-INT8, simpler).
 
 **9B weight status**: Mixed precision (8 or 16 FP16 layers) does NOT fix quality.
-Even all-FP16 crashes with RMSNorm error. 9B quality remains blocked.
+Even all-FP16 produces garbled output "The-Fi-Fi..." (same as INT8). Root cause:
+SSM instability (A_log > 0 for 68.8% of layer-4 channels → A > 1 → exponential
+state growth). A_log stored as FP32 (not quantized). 9B quality BLOCKED.
 
 ### Key source files
 ```
