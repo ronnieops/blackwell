@@ -16,6 +16,24 @@
 // Uses temp-file IPC: writes request JSON to /tmp/inf_{pid}.req,
 // inference_server reads from that file instead of stdin.
 
+#include "blackwell/bpe_tokenizer.h"
+
+class LocalTokenizer {
+    blackwell::BpeTokenizer tok_;
+    bool ok_{false};
+public:
+    LocalTokenizer(const char* weight_dir) {
+        std::string td = "./tokenizer_data.bin";
+        ok_ = tok_.load(td.c_str()) == 0;
+    }
+    std::string decode(const std::vector<uint32_t>& ids) {
+        std::string s;
+        for(uint32_t id : ids) s += tok_.decode(id);
+        return s;
+    }
+    explicit operator bool() const { return ok_; }
+};
+
 class SubprocessEngine {
     pid_t pid{-1};
     int wfd{-1};
@@ -25,6 +43,7 @@ public:
     int get_write_fd() { return wfd; }
     std::mutex lock;
     bool ready{false};
+    LocalTokenizer* local_tok_{nullptr};
 public:
     SubprocessEngine() {}
     ~SubprocessEngine() { stop(); }
@@ -51,6 +70,7 @@ public:
         from_f = fdopen(pout[0], "r");
         setvbuf(from_f, nullptr, _IONBF, 0);
         ready = true;
+        local_tok_ = new LocalTokenizer(model);
         fprintf(stderr, "SubprocessEngine: pid=%d model=%s bin=%s\n", pid, model, bin);
         return true;
     }
@@ -113,7 +133,8 @@ public:
             if(sel <= 0) return false;
 
             char line[16384];
-            if(!fgets(line, sizeof(line), from_f)) return false;
+            // Loop until we get a non-empty line starting with '{' (skip "Ready." etc.)
+            do { if(!fgets(line, sizeof(line), from_f)) return false; } while(line[0] != '{');
 
             tokens.clear(); text.clear();
             // Try batch format "tokens":[[...]] (1.7B/8B) then single "tokens":[...] (9B)
@@ -141,14 +162,12 @@ public:
                 }
             }
             // Try batch "text":["..."] then single "text":"..."
-            char* s = strstr(line, "\"text\":[\"");
-            if(s) {
-                s += 9; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s);
+            // For single generate, decode tokens locally
+            if(!tokens.empty() && local_tok_) {
+                text = local_tok_->decode(tokens);
             } else {
-                s = strstr(line, "\"text\":\"");
-                if(s) {
-                    s += 8; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s);
-                }
+                char* s = strstr(line, "\"text\":\"");
+                if(s) { s += 8; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s); }
             }
             return !tokens.empty();
         } else {
@@ -189,11 +208,96 @@ public:
         }
     }
 
+    bool generate_batch(const std::vector<std::string>& prompts_in, int max_tok, float temp, int top_k,
+                  std::vector<std::vector<uint32_t>>& all_tokens, std::vector<std::string>& all_text) {
+        std::lock_guard<std::mutex> g(lock);
+        if(!ready) return false;
+
+        // Build batch JSON: {"prompts":["p1","p2",...],"max_tokens":N,...}
+        std::string ep;
+        for(size_t pi = 0; pi < prompts_in.size(); pi++) {
+            if(pi > 0) ep += ",";
+            ep += "\"";
+            for(size_t i = 0; i < prompts_in[pi].size(); i++) {
+                char c = prompts_in[pi][i];
+                if(c=='\\') { ep += "\\\\"; }
+                else if(c=='"') { ep += "\\\""; }
+                else if(c=='\n') { ep += "\\n"; }
+                else if(c=='\r') { ep += "\\r"; }
+                else if(c=='\t') { ep += "\\t"; }
+                else ep += c;
+            }
+            ep += "\"";
+        }
+        char req[32768];
+        int len = snprintf(req, sizeof(req),
+            "{\"prompts\":[%s],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"stream\":0}\n",
+            ep.c_str(), max_tok, temp, top_k);
+
+        char tmpfile[64];
+        snprintf(tmpfile, sizeof(tmpfile), "/tmp/inf_req_%d", (int)getpid());
+        int tf = open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+        if(tf < 0) return false;
+        ssize_t written = 0;
+        while(written < len) {
+            ssize_t n = write(tf, req + written, len - written);
+            if(n < 0) { close(tf); return false; }
+            written += n;
+        }
+        close(tf);
+
+        int rf = open(tmpfile, O_RDONLY);
+        if(rf < 0) return false;
+        char buf[4096];
+        ssize_t nr;
+        int wfd_local = wfd;
+        while((nr = read(rf, buf, sizeof(buf))) > 0) {
+            ssize_t n = write(wfd_local, buf, nr);
+            if(n < 0) { close(rf); return false; }
+        }
+        close(rf);
+        unlink(tmpfile);
+
+        // Read JSON response: skip non-JSON lines, get the actual response
+        char line[65536];
+        do { if(!fgets(line, sizeof(line), from_f)) return false; } while(line[0] != '{');
+
+        // Parse tokens array
+        char* p = strstr(line, "\"tokens\":[");
+        if(!p) return false;
+        p += 9;
+        all_tokens.clear();
+        while(*p && *p != ']') {
+            while(*p && (*p < '0' || *p > '9') && *p != '[' && *p != '-') p++;
+            if(*p == '[') {
+                p++;
+                std::vector<uint32_t> tok_seq;
+                while(*p && *p != ']') {
+                    while(*p && (*p < '0' || *p > '9') && *p != '-') p++;
+                    if(*p && ((*p >= '0' && *p <= '9') || *p == '-')) {
+                        long v = strtol(p, &p, 10);
+                        tok_seq.push_back((uint32_t)v);
+                    }
+                }
+                if(*p == ']') p++;
+                all_tokens.push_back(tok_seq);
+            } else { break; }
+        }
+
+        // Decode tokens locally using LocalTokenizer
+        all_text.clear();
+        for(const auto& ids : all_tokens) {
+            all_text.push_back(local_tok_ ? local_tok_->decode(ids) : "");
+        }
+        return !all_tokens.empty();
+    }
+
     void stop() {
         std::lock_guard<std::mutex> g(lock);
         if(pid > 0) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); }
         if(wfd >= 0) close(wfd);
         if(from_f) fclose(from_f);
+        delete local_tok_; local_tok_ = nullptr;
         wfd = -1; pid = -1; ready = false;
     }
 
@@ -290,13 +394,22 @@ std::string extract_chat_content(const std::string& body) {
 std::string escape_json_str(const std::string& s) {
     std::string r;
     for(size_t i=0;i<s.size();i++) {
-        char c=s[i];
-        if(c=='"') r+="\\\"";
+        unsigned char c=s[i];
+        if(c=='<') r+="\u003c";  // XSS guard
+        else if(c=='>') r+="\u003e";
+        else if(c=='{') r+="\u007b";
+        else if(c=='}') r+="\u007d";
+        else if(c=='"') r+="\\\"";
         else if(c=='\\') r+="\\\\";
         else if(c=='\n') r+="\\n";
         else if(c=='\r') r+="\\r";
         else if(c=='\t') r+="\\t";
-        else r+=c;
+        else if(c < 0x20 || c == 0x7f) r+=" ";  // control chars → space
+        else if(c >= 0x80) {  // non-ASCII: escape as \uXXXX
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            r += buf;
+        } else r+=c;
     }
     return r;
 }
@@ -395,6 +508,31 @@ int main(int argc, char** argv) {
         res.set_content(js.str(), "application/json");
     });
 
+
+    // Batch: POST {"prompts":["...","..."],"max_tokens":N} → 3-4× faster per token
+    svr.Post("/v1/batch", [](const httplib::Request& req, httplib::Response& res) {
+        std::vector<std::string> prompts;
+        const char* bp = strstr(req.body.c_str(), "\"prompts\":");
+        if(bp && (bp = strchr(bp, '['))) {
+            bp++;
+            while(*bp && *bp != ']') {
+                while(*bp && *bp != '"') bp++;
+                if(*bp == '"') { bp++; std::string t; while(*bp && *bp != '"') { if(*bp=='\\' && bp[1]) bp++; t+=*bp++; } if(*bp=='"') bp++; prompts.push_back(t); }
+                while(*bp && *bp!='"' && *bp!=']') bp++;
+            }
+        }
+        if(prompts.empty()) { res.status=400; res.set_content(R"({"error":{"message":"no prompts"}})", "application/json"); return; }
+        if(prompts.size()>8) prompts.resize(8);
+        int mt=json_int_at(req.body,"max_tokens",30);
+        float tp=json_float_at(req.body,"temperature",0.7f);
+        int tk=json_int_at(req.body,"top_k",40);
+        std::vector<std::vector<uint32_t>> at; std::vector<std::string> ax;
+        if(!g_engine.generate_batch(prompts,mt,tp,tk,at,ax)) { res.status=504; res.set_content(R"({"error":{"message":"timeout"}})","application/json"); return; }
+        std::ostringstream js; js<<"{\"batches\":[";
+        for(size_t i=0;i<at.size();i++) { if(i)js<<","; js<<"{\"id\":\"b"<<i<<"\",\"choices\":[{\"text\":\""<<escape_json_str(ax[i])<<"\",\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":"<<at[i].size()<<"}}"; }
+        js<<"]}"; res.set_content(js.str(),"application/json");
+    });
+
     svr.Post("/v1/completions/stream", [](const httplib::Request& req, httplib::Response& res) {
         const std::string& body = req.body;
         std::string prompt = json_string_at(body, "prompt");
@@ -477,3 +615,6 @@ int main(int argc, char** argv) {
     svr.listen("0.0.0.0", port);
     return 0;
 }
+// =====================================================================
+// BPE Tokenizer (for local token decoding)
+// =====================================================================

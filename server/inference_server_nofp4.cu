@@ -716,18 +716,18 @@ int main(int argc, char** argv) {
     S.repetition_penalty = 1.0f;  // default: no penalty
 
     // Capture CUDA Graph for batched_decode_step (M=1)
-    // Graph captures seq_pos=0, updated before each replay via pinned memory.
+    // M=8 capture wastes GPU time on unused batch slots (8× GEMV work for 1× useful output).
+    // M=1 capture is optimal for single-request workloads (the common case).
     S.graph_captured = false;
     S.decode_graph = NULL;
     S.decode_graph_exec = NULL;
     {
         cudaStreamSynchronize(S.st);
-        fprintf(stderr, "  Capturing decode graph...");
+        fprintf(stderr, "  Capturing decode graph (M=1)...");
         fflush(stderr);
         int saved_M = S.M; S.M = 1;
         cudaStreamBeginCapture(S.st, cudaStreamCaptureModeGlobal);
         batched_decode_step(S, 0);
-        // Do NOT sync here — cudaStreamEndCapture handles the barrier
         cudaError_t cerr = cudaStreamEndCapture(S.st, &S.decode_graph);
         S.M = saved_M;
         if (cerr != cudaSuccess) {
