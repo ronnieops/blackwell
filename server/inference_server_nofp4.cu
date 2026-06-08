@@ -594,7 +594,7 @@ int main(int argc, char** argv) {
         
         if (is_fp16) {
             auto lfp16 = [&](const char* nm, DevW& dw, __half*& dst) {
-                snprintf(p, 256, "%s/%d_%s.fp16", wdir, l, nm);
+                snprintf(p, 256, "%s/%d_%s", wdir, l, nm);  // upload_fp16 adds .fp16
                 auto w = upload_fp16(p);
                 dw.K = w.K; dw.N = w.N; dw.d = nullptr; dw.sc = nullptr;
                 dst = w.d;
