@@ -12,18 +12,17 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 Direct | `inference_server 8b` | **~20** | ~50 | Garbled ❌ |
-| 8B Mixed (8 FP16) | `inference_server 8b` | **~18** | ~55 | Semi-coherent! "Paris. The capital of France is..." ✅ |
-| 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled (32-layer INT8 noise) ❌ |
+| 8B INT8 (correct dims) | `inference_server 8b` | **~20** | ~50 | Coherent ✅ |
+| 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled ❌ |
 
-**How to use mixed-precision**:
-```bash
-# Create mixed-precision weights (first 8 layers FP16, rest INT8)
-python3 scripts/extract_fp16_layers.py weights_int8_qwen3_8b weights_int8_qwen3_8b_mixed 8
-# Point server to mixed dir
-ln -sf weights_int8_qwen3_8b_mixed weights_int8_qwen3_8b
-./server/inference_server 8b
-```
+**8B quality with correct dims**: INT8 produces coherent text. 
+Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8 
+and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier 
+"garbled 8B INT8" observation was from WRONG model dimensions.
+
+**9B quality remains blocked**: Even 16 FP16 layers produces same 
+garbled output as 8 FP16 layers. GatedDeltaNet SSM state accumulates 
+noise across ALL 32 layers regardless of early-layer precision.
 
 **Benchmarks (no head_norm/RoPE)**
 | Model | M= | Method | t/s | ms/tok | vs llama.cpp |
@@ -49,6 +48,11 @@ ln -sf weights_int8_qwen3_8b_mixed weights_int8_qwen3_8b
 **Root cause of quality issues (Session 56)**: Wrong model dimensions in ALL
 pre-session-56 code. Qwen3-1.7B: **nqh=16, nkv=8, hd=128, KV=1024**
 (NOT nqh=32, nkv=4, hd=64, KV=512). Half of K/V weights were ignored → PPL=7.3M.
+
+**8B quality with correct dims (Session 59)**: INT8 produces coherent text.
+"The capital of France is" → " Paris. The capital of France is Paris..." — coherent 
+but looping. Mixed precision (8 FP16 + 28 INT8) produces IDENTICAL output.
+PPL = 3.80 on short corpus (both ALL-INT8 and MIXED).
 
 **No INT8 quality wall exists**. INT8 block-16 with correct dims gives PPL=18.65,
 only 1.5× worse than BF16.
@@ -207,9 +211,18 @@ weights_int8_bf16/            # 1.7B INT8 weights (2.1 GB)
 weights_int4_qwen3_1.7b/      # 1.7B INT4 symmetric (dead end)
 weights_int4_qwen3_1.7b_asym/ # 1.7B INT4 asymmetric (dead end)
 weights_int5_qwen3_1.7b_asym/ # 1.7B INT5 asymmetric (dead end)
-weights_int8_qwen3_8b/        # 8B INT8 weights + norms (9.6 GB)
-weights_int8_qwen35_9b/       # 9B GatedDeltaNet INT8 (11 GB)
+weights_int8_qwen3_8b/        # 8B INT8 weights + norms (canonical, 9.6 GB)
+weights_int8_qwen3_8b_mixed/  # 8B mixed: 8 FP16 + 28 INT8 (same quality as all-INT8)
+weights_int8_qwen3_8b_all_int8/ # 8B pure INT8 copy
+weights_int8_qwen35_9b/        # 9B GatedDeltaNet INT8 (11 GB)
+weights_int8_qwen35_9b_mixed/ # 9B mixed: 8 FP16 + 24 INT8 (NO quality improvement)
 ```
+
+**8B weight status**: All-INT8 and mixed-precision produce IDENTICAL coherent output.
+Mixed precision does NOT help 8B. Use `weights_int8_qwen3_8b/` (all-INT8, simpler).
+
+**9B weight status**: Mixed precision (8 or 16 FP16 layers) does NOT fix quality.
+Even all-FP16 crashes with RMSNorm error. 9B quality remains blocked.
 
 ### Key source files
 ```
@@ -271,6 +284,8 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
 - **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
+- **8B mixed-precision: NO HELP (Session 59)**: ALL-INT8 and MIXED(8 FP16+28 INT8) produce identical coherent output. 8B quality with correct dims is already good.
+- **9B mixed-precision: NO HELP (Session 59)**: Even 16 FP16 layers produces same garbled output as 8 FP16 layers. SSM state accumulates noise across all 32 layers.
 
 ### Server architecture (correct model)
 The server implements the **full Qwen3-1.7B correct decode flow**:
