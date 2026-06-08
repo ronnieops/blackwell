@@ -12,6 +12,7 @@
 //     -o server/inference_server_9b -lcudart -lpthread -lz
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -110,6 +111,31 @@ static float* load_bf16(const char* prefix, int n) {
     return d;
 }
 
+// ── FP16 weight loading ──────────────────────────────────────────────
+
+struct Fp16W { int K, N; __half* d; };
+
+static Fp16W upload_fp16(const char* path) {
+    FILE* f=fopen(path,"rb"); if(!f){fprintf(stderr,"FAIL open %s\n",path);exit(1);}
+    int h[2]; (void)fread(h,4,2,f);
+    size_t n=(size_t)h[0]*h[1];
+    std::vector<uint16_t> tmp(n); (void)fread(tmp.data(),2,n,f); fclose(f);
+    __half* d; cudaMalloc(&d,n*2); cudaMemcpy(d,tmp.data(),n*2,cudaMemcpyHostToDevice);
+    return {h[0],h[1],d};
+}
+
+// gemv dispatch: FP16 path loops over rows, INT8 uses dp4a kernel
+static cudaError_t gemv_dispatch(float* y, bool is_fp16, __half* fp16_w,
+    const int8_t* x_i8, const float* x_sc, int K, int N,
+    const int8_t* w_i8, const float* w_sc, cudaStream_t st) {
+    if (is_fp16 && fp16_w) {
+        blackwell::kernels::gemv_fp16_warp_launch(y, fp16_w, x_i8, x_sc, K, N, st);
+        return cudaGetLastError();
+    } else {
+        return blackwell::kernels::gemv_int8_warp(y, x_i8, x_sc, w_i8, w_sc, K, N, st);
+    }
+}
+
 // ── Server struct ────────────────────────────────────────────────────
 
 struct ServerState {
@@ -118,13 +144,17 @@ struct ServerState {
     // Layer weights
     struct GdnLinW {
         DevW qkv, a, b, z, out;
+        __half *fp16_qkv, *fp16_a, *fp16_b, *fp16_z, *fp16_out;
+        bool is_fp16;
         float *conv_w, *A_log, *dt_bias, *norm_w;
     };
     struct GdnFullW {
         DevW q, k, v, o;
+        __half *fp16_q, *fp16_k, *fp16_v, *fp16_o;
+        bool is_fp16;
         float *qn, *kn;
     };
-    struct DevMlp { DevW gate, up, down; };
+    struct DevMlp { DevW gate, up, down; __half *fp16_gate, *fp16_up, *fp16_down; bool is_fp16; };
 
     std::vector<GdnLinW> linW;
     std::vector<GdnFullW> fullW;
@@ -274,19 +304,19 @@ static void decode_step(ServerState& S, int seq_pos) {
 
         if(il){
             // ── Linear attention (GatedDeltaNet) ──
-            die(blackwell::kernels::gemv_int8_warp(S.d_xn,S.d_ai,S.d_as,
-                S.linW[l].qkv.d,S.linW[l].qkv.sc,H,CD,S.st),"lqkv");
+            die(gemv_dispatch(S.d_xn,S.linW[l].is_fp16,S.linW[l].fp16_qkv,
+                S.d_ai,S.d_as,H,CD,S.linW[l].qkv.d,S.linW[l].qkv.sc,S.st),"lqkv");
             die(blackwell::kernels::gated_delta_conv1d_update(
                 S.d_cs+l*CD*(CK-1),S.d_xn,S.linW[l].conv_w,S.d_qkvc,S.st),"lcv");
             // Gate projections
-            die(blackwell::kernels::gemv_int8_warp(S.d_g,S.d_ai,S.d_as,
-                S.linW[l].a.d,S.linW[l].a.sc,H,NV,S.st),"la");
-            die(blackwell::kernels::gemv_int8_warp(S.d_beta,S.d_ai,S.d_as,
-                S.linW[l].b.d,S.linW[l].b.sc,H,NV,S.st),"lb");
+            die(gemv_dispatch(S.d_g,S.linW[l].is_fp16,S.linW[l].fp16_a,
+                S.d_ai,S.d_as,H,NV,S.linW[l].a.d,S.linW[l].a.sc,S.st),"la");
+            die(gemv_dispatch(S.d_beta,S.linW[l].is_fp16,S.linW[l].fp16_b,
+                S.d_ai,S.d_as,H,NV,S.linW[l].b.d,S.linW[l].b.sc,S.st),"lb");
             // g = -exp(A_log)*softplus(a+dt_bias)
             compute_g_k<<<(NV+255)/256,256,0,S.st>>>(S.d_g,S.d_g,S.linW[l].A_log,S.linW[l].dt_bias,NV);
-            die(blackwell::kernels::gemv_int8_warp(S.d_z,S.d_ai,S.d_as,
-                S.linW[l].z.d,S.linW[l].z.sc,H,H,S.st),"lz");
+            die(gemv_dispatch(S.d_z,S.linW[l].is_fp16,S.linW[l].fp16_z,
+                S.d_ai,S.d_as,H,H,S.linW[l].z.d,S.linW[l].z.sc,S.st),"lz");
             // Recurrent step: copy Q/K/V to contiguous buffers, then step
             cudaMemcpyAsync(S.d_q_cnt,S.d_qkvc,NK*HD*4,cudaMemcpyDeviceToDevice,S.st);
             cudaMemcpyAsync(S.d_k_cnt,S.d_qkvc+NK*HD,NK*HD*4,cudaMemcpyDeviceToDevice,S.st);
@@ -299,17 +329,17 @@ static void decode_step(ServerState& S, int seq_pos) {
                 S.d_proj,S.d_ao,S.d_z,S.linW[l].norm_w,1,S.eps,S.st),"lrng");
             // Quantize + out_proj
             die(blackwell::kernels::quantize_int8(S.d_ai,S.d_as,S.d_proj,H,S.st),"q_lo");
-            die(blackwell::kernels::gemv_int8_warp(S.d_proj,S.d_ai,S.d_as,
-                S.linW[l].out.d,S.linW[l].out.sc,H,H,S.st),"lout");
+            die(gemv_dispatch(S.d_proj,S.linW[l].is_fp16,S.linW[l].fp16_out,
+                S.d_ai,S.d_as,H,H,S.linW[l].out.d,S.linW[l].out.sc,S.st),"lout");
         } else {
             // ── Full attention (GQA) ──
             int fi=full_idx(l);
-            die(blackwell::kernels::gemv_int8_warp(S.dQ,S.d_ai,S.d_as,
-                S.fullW[l].q.d,S.fullW[l].q.sc,H,2*NQ*HDA,S.st),"fq");
-            die(blackwell::kernels::gemv_int8_warp(S.dK,S.d_ai,S.d_as,
-                S.fullW[l].k.d,S.fullW[l].k.sc,H,NKV*HDA,S.st),"fk");
-            die(blackwell::kernels::gemv_int8_warp(S.dV,S.d_ai,S.d_as,
-                S.fullW[l].v.d,S.fullW[l].v.sc,H,NKV*HDA,S.st),"fv");
+            die(gemv_dispatch(S.dQ,S.fullW[l].is_fp16,S.fullW[l].fp16_q,
+                S.d_ai,S.d_as,H,2*NQ*HDA,S.fullW[l].q.d,S.fullW[l].q.sc,S.st),"fq");
+            die(gemv_dispatch(S.dK,S.fullW[l].is_fp16,S.fullW[l].fp16_k,
+                S.d_ai,S.d_as,H,NKV*HDA,S.fullW[l].k.d,S.fullW[l].k.sc,S.st),"fk");
+            die(gemv_dispatch(S.dV,S.fullW[l].is_fp16,S.fullW[l].fp16_v,
+                S.d_ai,S.d_as,H,NKV*HDA,S.fullW[l].v.d,S.fullW[l].v.sc,S.st),"fv");
             head_norm_k<<<NQ,128,0,S.st>>>(S.dQ,S.fullW[l].qn,NQ,HDA,S.eps);
             head_norm_k<<<NKV,128,0,S.st>>>(S.dK,S.fullW[l].kn,NKV,HDA,S.eps);
             rope_k<<<NQ,PD/2,0,S.st>>>(S.dQ,NQ,HDA,seq_pos,PD);
@@ -327,8 +357,8 @@ static void decode_step(ServerState& S, int seq_pos) {
             }
             // Quantize + out_proj
             die(blackwell::kernels::quantize_int8(S.d_ai,S.d_as,S.d_proj,H,S.st),"q_fo");
-            die(blackwell::kernels::gemv_int8_warp(S.d_proj,S.d_ai,S.d_as,
-                S.fullW[l].o.d,S.fullW[l].o.sc,H,H,S.st),"fout");
+            die(gemv_dispatch(S.d_proj,S.fullW[l].is_fp16,S.fullW[l].fp16_o,
+                S.d_ai,S.d_as,H,H,S.fullW[l].o.d,S.fullW[l].o.sc,S.st),"fout");
         }
 
         // ── Residual 1 ──
@@ -340,14 +370,14 @@ static void decode_step(ServerState& S, int seq_pos) {
         die(blackwell::kernels::quantize_int8(S.d_ai,S.d_as,S.d_xn,H,S.st),"q_post");
 
         // ── MLP ──
-        die(blackwell::kernels::gemv_int8_warp(S.d_mlp_res,S.d_ai,S.d_as,
-            S.mlp[l].gate.d,S.mlp[l].gate.sc,H,I,S.st),"mg");
-        die(blackwell::kernels::gemv_int8_warp(S.d_mlp_res+I,S.d_ai,S.d_as,
-            S.mlp[l].up.d,S.mlp[l].up.sc,H,I,S.st),"mu");
+        die(gemv_dispatch(S.d_mlp_res,S.mlp[l].is_fp16,S.mlp[l].fp16_gate,
+            S.d_ai,S.d_as,H,I,S.mlp[l].gate.d,S.mlp[l].gate.sc,S.st),"mg");
+        die(gemv_dispatch(S.d_mlp_res+I,S.mlp[l].is_fp16,S.mlp[l].fp16_up,
+            S.d_ai,S.d_as,H,I,S.mlp[l].up.d,S.mlp[l].up.sc,S.st),"mu");
         die(blackwell::kernels::apply_swiglu(S.d_mlp_res,S.d_mlp_res,S.d_mlp_res+I,I,S.st),"ms");
         die(blackwell::kernels::quantize_int8(S.d_mlp_ai,S.d_mlp_as,S.d_mlp_res,I,S.st),"q_mlp");
-        die(blackwell::kernels::gemv_int8_warp(S.d_xn,S.d_mlp_ai,S.d_mlp_as,
-            S.mlp[l].down.d,S.mlp[l].down.sc,I,H,S.st),"md");
+        die(gemv_dispatch(S.d_xn,S.mlp[l].is_fp16,S.mlp[l].fp16_down,
+            S.d_mlp_ai,S.d_mlp_as,I,H,S.mlp[l].down.d,S.mlp[l].down.sc,S.st),"md");
 
         // ── Residual 2 ──
         die(blackwell::kernels::vector_add_fp32(S.d_xn,S.d_xn,S.d_residual,H,S.st),"res2");
@@ -384,11 +414,24 @@ int main(int argc, char** argv) {
         S.d_rn_post[l]=load_f32(p,H);
 
         if(il){
-            snprintf(p,256,"%s/%d_linear_attn.in_proj_qkv",WDIR,l); S.linW[l].qkv=load_int8_w(p);
-            snprintf(p,256,"%s/%d_linear_attn.in_proj_a",WDIR,l);   S.linW[l].a=load_int8_w(p);
-            snprintf(p,256,"%s/%d_linear_attn.in_proj_b",WDIR,l);   S.linW[l].b=load_int8_w(p);
-            snprintf(p,256,"%s/%d_linear_attn.in_proj_z",WDIR,l);   S.linW[l].z=load_int8_w(p);
-            snprintf(p,256,"%s/%d_linear_attn.out_proj",WDIR,l);    S.linW[l].out=load_int8_w(p);
+            // Check for FP16
+            snprintf(p,256,"%s/%d_linear_attn.in_proj_qkv.fp16",WDIR,l);
+            bool fp16 = fopen(p,"rb") != nullptr;
+            S.linW[l].is_fp16 = fp16;
+            S.fullW[l].is_fp16 = false;
+            if(fp16) {
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_qkv.fp16",WDIR,l); auto w=upload_fp16(p); S.linW[l].qkv={w.K,w.N,nullptr,nullptr}; S.linW[l].fp16_qkv=w.d;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_a.fp16",WDIR,l);   w=upload_fp16(p); S.linW[l].a={w.K,w.N,nullptr,nullptr}; S.linW[l].fp16_a=w.d;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_b.fp16",WDIR,l);   w=upload_fp16(p); S.linW[l].b={w.K,w.N,nullptr,nullptr}; S.linW[l].fp16_b=w.d;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_z.fp16",WDIR,l);   w=upload_fp16(p); S.linW[l].z={w.K,w.N,nullptr,nullptr}; S.linW[l].fp16_z=w.d;
+                snprintf(p,256,"%s/%d_linear_attn.out_proj.fp16",WDIR,l);    w=upload_fp16(p); S.linW[l].out={w.K,w.N,nullptr,nullptr}; S.linW[l].fp16_out=w.d;
+            } else {
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_qkv",WDIR,l); S.linW[l].qkv=load_int8_w(p); S.linW[l].fp16_qkv=nullptr;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_a",WDIR,l);   S.linW[l].a=load_int8_w(p); S.linW[l].fp16_a=nullptr;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_b",WDIR,l);   S.linW[l].b=load_int8_w(p); S.linW[l].fp16_b=nullptr;
+                snprintf(p,256,"%s/%d_linear_attn.in_proj_z",WDIR,l);   S.linW[l].z=load_int8_w(p); S.linW[l].fp16_z=nullptr;
+                snprintf(p,256,"%s/%d_linear_attn.out_proj",WDIR,l);    S.linW[l].out=load_int8_w(p); S.linW[l].fp16_out=nullptr;
+            }
             snprintf(p,256,"%s/%d_linear_attn.A_log",WDIR,l);      S.linW[l].A_log=load_f32(p,NV);
             snprintf(p,256,"%s/%d_linear_attn.dt_bias",WDIR,l);    S.linW[l].dt_bias=load_f32(p,NV);
             snprintf(p,256,"%s/%d_linear_attn.norm",WDIR,l);       S.linW[l].norm_w=load_f32(p,HD);
@@ -396,18 +439,42 @@ int main(int argc, char** argv) {
             S.linW[l].conv_w=load_bf16(p,CD*CK);
             S.fullW[l].q.d=nullptr; S.fullW[l].qn=nullptr;
         } else {
-            snprintf(p,256,"%s/%d_self_attn.q_proj",WDIR,l); S.fullW[l].q=load_int8_w(p);
-            snprintf(p,256,"%s/%d_self_attn.k_proj",WDIR,l); S.fullW[l].k=load_int8_w(p);
-            snprintf(p,256,"%s/%d_self_attn.v_proj",WDIR,l); S.fullW[l].v=load_int8_w(p);
-            snprintf(p,256,"%s/%d_self_attn.o_proj",WDIR,l); S.fullW[l].o=load_int8_w(p);
+            // Full attention
+            snprintf(p,256,"%s/%d_self_attn.q_proj.fp16",WDIR,l);
+            bool fp16 = fopen(p,"rb") != nullptr;
+            S.fullW[l].is_fp16 = fp16;
+            S.linW[l].is_fp16 = false;
+            if(fp16) {
+                snprintf(p,256,"%s/%d_self_attn.q_proj.fp16",WDIR,l); auto w=upload_fp16(p); S.fullW[l].q={w.K,w.N,nullptr,nullptr}; S.fullW[l].fp16_q=w.d;
+                snprintf(p,256,"%s/%d_self_attn.k_proj.fp16",WDIR,l); w=upload_fp16(p); S.fullW[l].k={w.K,w.N,nullptr,nullptr}; S.fullW[l].fp16_k=w.d;
+                snprintf(p,256,"%s/%d_self_attn.v_proj.fp16",WDIR,l); w=upload_fp16(p); S.fullW[l].v={w.K,w.N,nullptr,nullptr}; S.fullW[l].fp16_v=w.d;
+                snprintf(p,256,"%s/%d_self_attn.o_proj.fp16",WDIR,l); w=upload_fp16(p); S.fullW[l].o={w.K,w.N,nullptr,nullptr}; S.fullW[l].fp16_o=w.d;
+            } else {
+                snprintf(p,256,"%s/%d_self_attn.q_proj",WDIR,l); S.fullW[l].q=load_int8_w(p); S.fullW[l].fp16_q=nullptr;
+                snprintf(p,256,"%s/%d_self_attn.k_proj",WDIR,l); S.fullW[l].k=load_int8_w(p); S.fullW[l].fp16_k=nullptr;
+                snprintf(p,256,"%s/%d_self_attn.v_proj",WDIR,l); S.fullW[l].v=load_int8_w(p); S.fullW[l].fp16_v=nullptr;
+                snprintf(p,256,"%s/%d_self_attn.o_proj",WDIR,l); S.fullW[l].o=load_int8_w(p); S.fullW[l].fp16_o=nullptr;
+            }
             snprintf(p,256,"%s/%d_self_attn.q_norm",WDIR,l); S.fullW[l].qn=load_f32(p,HDA);
             snprintf(p,256,"%s/%d_self_attn.k_norm",WDIR,l); S.fullW[l].kn=load_f32(p,HDA);
             S.linW[l].qkv.d=nullptr; S.linW[l].out.d=nullptr;
         }
-        snprintf(p,256,"%s/%d_mlp.gate_proj",WDIR,l); S.mlp[l].gate=load_int8_w(p);
-        snprintf(p,256,"%s/%d_mlp.up_proj",WDIR,l);   S.mlp[l].up=load_int8_w(p);
-        snprintf(p,256,"%s/%d_mlp.down_proj",WDIR,l); S.mlp[l].down=load_int8_w(p);
-        if(l%8==0) fprintf(stderr,"  layer %d/%d\n",l,NL);
+        // MLP
+        {
+            snprintf(p,256,"%s/%d_mlp.gate_proj.fp16",WDIR,l);
+            bool fp16 = fopen(p,"rb") != nullptr;
+            S.mlp[l].is_fp16 = fp16;
+            if(fp16) {
+                snprintf(p,256,"%s/%d_mlp.gate_proj.fp16",WDIR,l); auto w=upload_fp16(p); S.mlp[l].gate={w.K,w.N,nullptr,nullptr}; S.mlp[l].fp16_gate=w.d;
+                snprintf(p,256,"%s/%d_mlp.up_proj.fp16",WDIR,l);   w=upload_fp16(p); S.mlp[l].up={w.K,w.N,nullptr,nullptr}; S.mlp[l].fp16_up=w.d;
+                snprintf(p,256,"%s/%d_mlp.down_proj.fp16",WDIR,l); w=upload_fp16(p); S.mlp[l].down={w.K,w.N,nullptr,nullptr}; S.mlp[l].fp16_down=w.d;
+            } else {
+                snprintf(p,256,"%s/%d_mlp.gate_proj",WDIR,l); S.mlp[l].gate=load_int8_w(p); S.mlp[l].fp16_gate=nullptr;
+                snprintf(p,256,"%s/%d_mlp.up_proj",WDIR,l);   S.mlp[l].up=load_int8_w(p); S.mlp[l].fp16_up=nullptr;
+                snprintf(p,256,"%s/%d_mlp.down_proj",WDIR,l); S.mlp[l].down=load_int8_w(p); S.mlp[l].fp16_down=nullptr;
+            }
+        }
+        if(l%8==0) fprintf(stderr,"  layer %d/%d%s\n",l,NL,S.linW[l].is_fp16||S.fullW[l].is_fp16||S.mlp[l].is_fp16?" (FP16)":"");
     }
 
     S.d_fn=load_f32((std::string(WDIR)+"/final_norm").c_str(),H);

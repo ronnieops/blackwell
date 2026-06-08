@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Extract FP16 weights for first K layers of a model.
-Converts INT8 → FP32 → FP16 (lossless for dequantized values).
+"""Extract FP16 weights for first K layers of any model.
+Auto-detects weight files (self_attn.*, linear_attn.*, mlp.*, etc.)
 
 Usage: python3 scripts/extract_fp16_layers.py <int8_dir> <output_dir> <first_k>
 
-Layers 0..K-1: FP16 weights
-Layers K..NL-1: INT8 (copied from int8_dir)
+Layers 0..K-1: FP16 weights (converted from INT8)
+Layers K..NL-1: INT8 (copied)
 """
-import struct, os, sys, shutil
+import struct, os, sys, shutil, re
 import numpy as np
 
 BLOCK = 16
@@ -20,33 +20,48 @@ def main():
     out_dir = sys.argv[2]
     K_fp16 = int(sys.argv[3])
 
-    # Determine dimensions from weight headers
-    test_path = os.path.join(int8_dir, "0_self_attn.q_proj.int8_t")
-    with open(test_path, 'rb') as f:
-        h = np.frombuffer(f.read(20), dtype=np.int32)
-    H, Q = int(h[0]), int(h[1])
+    # Discover all INT8 weight files, infer NL and weight names
+    i8_set = set()
+    for fn in os.listdir(int8_dir):
+        if fn.endswith('.int8_t') and not fn.startswith('embed_') and not fn.startswith('lm_head'):
+            # Parse: {layer}_{name}.int8_t
+            m = re.match(r'^(\d+)_(.+)\.int8_t$', fn)
+            if m:
+                i8_set.add((int(m.group(1)), m.group(2)))
+
+    # Group by layer
+    layers = sorted(set(l for l, _ in i8_set))
+    NL = len(layers)
+    if NL == 0:
+        print("FAIL: no INT8 weight files found")
+        sys.exit(1)
+
+    # Group by weight name
+    wnames = sorted(set(w for _, w in i8_set))
     
-    with open(os.path.join(int8_dir, "0_self_attn.k_proj.int8_t"), 'rb') as f:
-        KV = int(np.frombuffer(f.read(20), dtype=np.int32)[1])
-    with open(os.path.join(int8_dir, "0_mlp.gate_proj.int8_t"), 'rb') as f:
-        ID = int(np.frombuffer(f.read(20), dtype=np.int32)[1])
-    
-    NL = sum(1 for f in os.listdir(int8_dir) if f.endswith('_self_attn.q_proj.int8_t'))
-    
-    print(f"Detected: {NL}L H={H} Q={Q} KV={KV} ID={ID}")
+    # Get dimensions from first layer's q_proj or first available weight
+    first_i8 = next((fn for fn in os.listdir(int8_dir) 
+                     if fn.endswith('.int8_t') and re.match(r'^\d+_self_attn\.q_proj\.int8_t$', fn)
+                     or fn.endswith('.int8_t') and re.match(r'^\d+_linear_attn\.in_proj_qkv\.int8_t$', fn)), None)
+    if first_i8:
+        with open(os.path.join(int8_dir, first_i8), 'rb') as f:
+            h = np.frombuffer(f.read(20), dtype=np.int32)
+        H = int(h[0])
+        print(f"Detected: {NL} layers, H={H}, weight types: {wnames}")
+    else:
+        print(f"Detected: {NL} layers, weight types: {wnames}")
+
     print(f"FP16: first {K_fp16} layers, INT8: layers {K_fp16}..{NL-1}")
     
     os.makedirs(out_dir, exist_ok=True)
-    
-    weight_names = [
-        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-        "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
-    ]
-    
-    for l in range(NL):
-        for wname in weight_names:
+
+    for l in layers:
+        for wname in wnames:
             src_i8 = f"{int8_dir}/{l}_{wname}.int8_t"
             src_sc = f"{int8_dir}/{l}_{wname}.scale_t"
+            
+            if not os.path.exists(src_i8):
+                continue
             
             if l < K_fp16:
                 # Convert to FP16
@@ -79,14 +94,27 @@ def main():
                 shutil.copy2(src_i8, f"{out_dir}/{l}_{wname}.int8_t")
                 shutil.copy2(src_sc, f"{out_dir}/{l}_{wname}.scale_t")
         
-        if l % 7 == 0:
+        if l % 8 == 0 or l == NL - 1:
             print(f"  Layer {l}/{NL}")
     
-    # Copy non-weight files
+    # Copy non-weight files (norms, etc.)
     for fname in os.listdir(int8_dir):
         src = os.path.join(int8_dir, fname)
-        if os.path.isfile(src) and not any(fname.startswith(f"{l}_") for l in range(NL)):
-            shutil.copy2(src, os.path.join(out_dir, fname))
+        if os.path.isfile(src):
+            # Skip embed/lm_head INT8 files (handled separately)
+            if fname.endswith('.int8_t') and not fname.startswith('embed_') and not fname.startswith('lm_head'):
+                continue
+            if fname.endswith('.scale_t') and not fname.startswith('embed_') and not fname.startswith('lm_head'):
+                continue
+            dst = os.path.join(out_dir, fname)
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
+    
+    # Copy embed and lm_head
+    for fn in ['embed_tokens.int8_t', 'embed_tokens.scale_t', 'lm_head.int8_t', 'lm_head.scale_t']:
+        src = os.path.join(int8_dir, fn)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(out_dir, fn))
     
     print(f"\nDone! Mixed-precision weights in {out_dir}")
 
