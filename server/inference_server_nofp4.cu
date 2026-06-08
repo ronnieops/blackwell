@@ -460,63 +460,72 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
     }
 }
 
-// ── Prefill: process M prompt tokens per-sequence through all layers ──
-// Structure: for each sequence m, process all layers, then next sequence.
-// This ensures sequence m's attention at layer l sees K/V from sequences 0..m-1
-// at the SAME layer l (already computed in earlier outer-loop iterations).
+// ── Batched prefill: M tokens in parallel, all layers ──
+// Phase 1: layernorm + QKV for all M tokens (batched)
+// Phase 2: per-token attention + O + MLP + residuals
+// d_x[m] saves original input before Phase 1 overwrites d_residual[m]
 static void batched_prefill(ServerState& S, int M) {
     if (M <= 0) return;
-    size_t pfk_layer_stride = S.pfk_layer_stride;  // ms * nkv * hd (floats)
-    size_t pfk_seq_stride = (size_t)S.nkv * S.hd;  // nkv * hd (floats)
+    size_t pfk_layer_stride = S.pfk_layer_stride;
+    size_t pfk_seq_stride = (size_t)S.nkv * S.hd;
 
+    // Save original input embeddings (Phase 1 will overwrite d_residual[m] with layer outputs)
     for (int m = 0; m < M; m++) {
-        // ── Update RoPE seq_pos for this sequence's token position ──
-        blackwell::kernels::update_decode_seq_pos(m, S.st);
+        cudaMemcpyAsync(S.d_x + m * S.H, S.d_residual[m], S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+    }
 
-        for (int l = 0; l < S.NL; l++) {
-            // ── Input layernorm + quantize ──
+    for (int l = 0; l < S.NL; l++) {
+        // ── Phase 1: layernorm + QKV for ALL M tokens (batched GEMV) ──
+        for (int m = 0; m < M; m++) {
+            // Input layernorm reads from d_x[m] (original embedding, saved before layer loop)
+            // NOT from d_residual[m] (which has layer outputs, not original inputs)
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.d_residual[m], S.d_rn_in[l], S.H, S.eps, S.st);
+                S.d_x + m * S.H, S.d_rn_in[l], S.H, S.eps, S.st);
+        }
+        gemv_batched_dispatch(S.d_Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
+            S.d_xi8, S.d_xi8s, S.H, S.Q, M, S.st);
+        gemv_batched_dispatch(S.d_K, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
+            S.d_xi8, S.d_xi8s, S.H, S.KV, M, S.st);
+        gemv_batched_dispatch(S.d_V, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
+            S.d_xi8, S.d_xi8s, S.H, S.KV, M, S.st);
 
-            // ── QKV projections ──
-            gemv_dispatch(S.d_Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
-                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.Q, S.st);
-            gemv_dispatch(S.d_K, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
-                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.KV, S.st);
-            gemv_dispatch(S.d_V, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
-                S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.KV, S.st);
+        // ── Phase 2: per-token attention + O + MLP + residuals ──
+        for (int m = 0; m < M; m++) {
+            // RoPE seq_pos for token m
+            blackwell::kernels::update_decode_seq_pos(m, S.st);
 
-            // ── Q/K head norms + RoPE ──
-            head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
-            head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K, S.layers[l].kn, S.nkv, S.hd, S.eps);
-            rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q, S.nqh, S.hd, S.d_seq_pos);
-            rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K, S.nkv, S.hd, S.d_seq_pos);
+            // Q/K head norms + RoPE
+            head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
+            head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K + m * S.KV, S.layers[l].kn, S.nkv, S.hd, S.eps);
+            rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q + m * S.Q, S.nqh, S.hd, S.d_seq_pos);
+            rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
 
-            // ── Write K/V to prefill cache at [layer][m][nkv][hd] ──
+            // Write K/V to prefill cache [layer][m][nkv][hd]
             size_t pfk_off = (size_t)l * pfk_layer_stride + m * pfk_seq_stride;
-            cudaMemcpyAsync(S.d_pfk + pfk_off, S.d_K, S.nkv * S.hd * 4, cudaMemcpyDeviceToDevice, S.st);
-            cudaMemcpyAsync(S.d_pfv + pfk_off, S.d_V, S.nkv * S.hd * 4, cudaMemcpyDeviceToDevice, S.st);
+            cudaMemcpyAsync(S.d_pfk + pfk_off, S.d_K + m * S.KV, S.nkv * S.hd * 4, cudaMemcpyDeviceToDevice, S.st);
+            cudaMemcpyAsync(S.d_pfv + pfk_off, S.d_V + m * S.KV, S.nkv * S.hd * 4, cudaMemcpyDeviceToDevice, S.st);
 
-            // ── Attention: sequence m attends to sequences 0..m at layer l ──
+            // Attention: token m attends to tokens 0..m at layer l
             float* pfk_base = S.d_pfk + (size_t)l * pfk_layer_stride;
             float* pfv_base = S.d_pfv + (size_t)l * pfk_layer_stride;
             blackwell::kernels::attention_decode_gqa(
-                S.d_attn, S.d_Q, pfk_base, pfv_base,
+                S.d_attn, S.d_Q + m * S.Q, pfk_base, pfv_base,
                 m, S.nqh, S.nkv, S.hd, S.ms, S.st);
-            cudaMemcpyAsync(S.d_attn_out, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
+            cudaMemcpyAsync(S.d_attn_out + m * S.Q, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
 
-            // ── O projection + residual 1: d_proj += d_residual[m] ──
-            blackwell::kernels::quantize_int8(S.d_attn_i8, S.d_attn_i8s, S.d_attn_out, S.Q, S.st);
+            // ── O projection + residual 1: O_proj + input (input from d_x[m]) ──
+            blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
+                S.d_attn_out + m * S.Q, S.Q, S.st);
             gemv_dispatch(S.d_proj + m * S.H, S.layers[l], S.layers[l].o, S.layers[l].fp16_o,
-                S.d_attn_i8, S.d_attn_i8s, S.Q, S.H, S.st);
-            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+                S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), S.Q, S.H, S.st);
+            // d_proj[m] = O_proj. Add input from d_x[m] (original embedding, saved before Phase 1)
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_x + m * S.H, S.H, S.st);
             cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
 
-            // ── Post-attention layernorm + quantize (reads d_residual[m]) ──
+            // RMSNorm is in-place → d_residual[m] gets overwritten. Save combined hidden state first.
+            cudaMemcpyAsync(S.d_attn_out + m * S.H, S.d_residual[m], S.H * 4, cudaMemcpyDeviceToDevice, S.st);
+            // ── Post-attention layernorm + quantize ──
             blackwell::kernels::fused_rmsnorm_quant_int8(
                 S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
                 S.d_residual[m], S.d_rn_post[l], S.H, S.eps, S.st);
@@ -530,8 +539,9 @@ static void batched_prefill(ServerState& S, int M) {
             blackwell::kernels::quantize_int8(S.d_mlp_i8 + m * S.ID, S.d_mlp_i8s + m * (S.ID / 16), S.d_mlp + m * S.ID, S.ID, S.st);
             gemv_dispatch(S.d_proj + m * S.H, S.layers[l], S.layers[l].down, S.layers[l].fp16_down,
                 S.d_mlp_i8 + m * S.ID, S.d_mlp_i8s + m * (S.ID / 16), S.ID, S.H, S.st);
-            // ── Residual 2: d_proj += d_residual[m] ──
-            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
+            // ── Residual 2: down_out + (O_proj + input) ──
+            // d_proj[m] = down_proj, d_attn_out[m] = pre-layernorm combined state (attn_out + input)
+            blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_attn_out + m * S.H, S.H, S.st);
             cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
         }
     }
