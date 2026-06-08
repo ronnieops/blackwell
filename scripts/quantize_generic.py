@@ -74,6 +74,39 @@ def quantize_per_row_int4_asym(W_f32):
     return packed, sc_zero
 
 
+def quantize_per_row_int4_sym(W_f32):
+    """INT4: symmetric block-16, range [-7..7].
+
+    Per 16-element block: scale = max(abs(min), abs(max)) / 7.
+    Nibble = round(val / scale) + 8, [0..15], packed 2 vals/byte.
+    No zero point. Kernel uses (nib - 8) to get signed value.
+
+    Returns:
+        packed: uint8 array [N * K/2]
+        scales: float32 array [N * num_K_blks] — per-block scales
+    """
+    N, K = W_f32.shape
+    assert K % BLOCK == 0
+    num_K_blks = K // BLOCK
+
+    W_blk = W_f32.reshape(N, num_K_blks, BLOCK)
+    blk_abs = np.max(np.abs(W_blk), axis=2)  # [N, num_K_blks]
+    scales = np.maximum(blk_abs, 1e-10) / 7.0  # symmetric scale
+
+    # Quantize: q = round(val / scale), range [-7..7]
+    sc_bc = scales[:, :, np.newaxis]
+    sc_bc = np.repeat(sc_bc, BLOCK, axis=2).reshape(N, K)
+    q = np.round(W_f32 / sc_bc).astype(np.int32)
+    q = np.clip(q, -7, 7)
+
+    # Nibble-pack: (q + 8) → [0..15]
+    q_shifted = (q + 8).astype(np.uint8)
+    q_reshaped = q_shifted.reshape(N, K // 2, 2)
+    packed = (q_reshaped[:, :, 0] & 0x0F) | ((q_reshaped[:, :, 1] & 0x0F) << 4)
+
+    return packed, scales.astype(np.float32)
+
+
 def quantize_per_row_int5_asym(W_f32):
     """INT5: asymmetric block-16 with per-block zero point.
 
@@ -196,6 +229,26 @@ def write_weight_int4(prefix, int4_packed, scales, K_in, N_out):
     mb_data = int4_packed.nbytes / (1024*1024)
     mb_sc = scales.nbytes / (1024*1024)
     print(f"  {prefix}: [{N_out}×{K_in}] INT4 data={mb_data:.1f}MB scales={mb_sc:.1f}MB")
+
+def write_weight_int4_sym(prefix, int4_packed, scales, K_in, N_out):
+    """Write symmetric INT4 weights (kernel-compatible format)."""
+    num_kb = K_in // BLOCK
+    # .int4_t header: [K, N, BLOCK, kblocks, 1]
+    header = np.array([K_in, N_out, BLOCK, num_kb, 1], dtype=np.int32)
+    path = f"{prefix}.int4_t"
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(header.tobytes())
+        f.write(int4_packed.tobytes())
+    # .scale_t header: [0, 0, 0, kblocks, N], data [N][kblocks]
+    header_sc = np.array([0, 0, 0, num_kb, N_out], dtype=np.int32)
+    path = f"{prefix}.scale_t"
+    with open(path, 'wb') as f:
+        f.write(header_sc.tobytes())
+        f.write(scales.tobytes())
+    mb_data = int4_packed.nbytes / (1024*1024)
+    mb_sc = scales.nbytes / (1024*1024)
+    print(f"  INT4 sym: {N_out}×{K_in} data={mb_data:.1f}MB scales={mb_sc:.1f}MB")
 
 def find_model_shards(model_dir):
     """Find all safetensor shards in model directory (handles single and multi-shard)."""
@@ -366,9 +419,9 @@ def main():
                 prefix = f"{OUT}/{layer}_{wn}"
                 write_weight_int4_asym(prefix, int4_packed, sc_zero, K_in, N_out)
             elif fmt == 'int4':
-                int4_packed, scales = quantize_per_row_int4(W)
+                int4_packed, scales = quantize_per_row_int4_sym(W)
                 prefix = f"{OUT}/{layer}_{wn}"
-                write_weight_int4(prefix, int4_packed, scales, K_in, N_out)
+                write_weight_int4_sym(prefix, int4_packed, scales, K_in, N_out)
             else:
                 int8_data, scales = quantize_per_row_int8(W)
                 prefix = f"{OUT}/{layer}_{wn}"
@@ -384,13 +437,36 @@ def main():
         int4_packed, sc_zero = quantize_per_row_int4_asym(W_emb)
         write_weight_int4_asym(f"{OUT}/embed_tokens", int4_packed, sc_zero, K_in, N_out)
     elif fmt == 'int4':
-        int4_packed, scales = quantize_per_row_int4(W_emb)
-        write_weight_int4(f"{OUT}/embed_tokens", int4_packed, scales, K_in, N_out)
+        int4_packed, scales = quantize_per_row_int4_sym(W_emb)
+        write_weight_int4_sym(f"{OUT}/embed_tokens", int4_packed, scales, K_in, N_out)
     else:
         int8_data, scales = quantize_per_row_int8(W_emb)
         write_weight_int8(f"{OUT}/embed_tokens", int8_data, scales, K_in, N_out)
 
-    print(f"\nDone. {NL} layers × {len(WEIGHT_NAMES)} weights + embed_tokens ({fmt.upper()})")
+    # lm_head (separate in Qwen3-8B)
+    lm_tname = "model.language_model.output.weight"
+    if lm_tname not in tensor_map:
+        lm_tname = "lm_head.weight"
+    if lm_tname in tensor_map:
+        W_lm = read_tensor(tensor_map, shard_paths, lm_tname)
+        N_out, K_in = W_lm.shape
+        if fmt == 'int5_asym':
+            int5_packed, sc_zero = quantize_per_row_int5_asym(W_lm)
+            write_weight_int5_asym(f"{OUT}/lm_head", int5_packed, sc_zero, K_in, N_out)
+        elif fmt == 'int4_asym':
+            int4_packed, sc_zero = quantize_per_row_int4_asym(W_lm)
+            write_weight_int4_asym(f"{OUT}/lm_head", int4_packed, sc_zero, K_in, N_out)
+        elif fmt == 'int4':
+            int4_packed, scales = quantize_per_row_int4_sym(W_lm)
+            write_weight_int4_sym(f"{OUT}/lm_head", int4_packed, scales, K_in, N_out)
+        else:
+            int8_data, scales = quantize_per_row_int8(W_lm)
+            write_weight_int8(f"{OUT}/lm_head", int8_data, scales, K_in, N_out)
+        print(f"  lm_head: {N_out}×{K_in}")
+    else:
+        print(f"  lm_head: not found (tied to embed_tokens?)")
+
+    print(f"\nDone. {NL} layers × {len(WEIGHT_NAMES)} weights + embed_tokens + lm_head ({fmt.upper()})")
 
 if __name__ == "__main__":
     main()

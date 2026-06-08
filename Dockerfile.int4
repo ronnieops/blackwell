@@ -1,0 +1,58 @@
+# Dockerfile — Blackwell INT4 8B Inference Server
+# High-throughput: 56 t/s (14× faster than INT8)
+# Weights mounted as volume at runtime (~5.3 GB on disk)
+#
+# Build:
+#   docker build -f Dockerfile.int4 -t blackwell-server:int4 .
+#
+# Run (requires nvidia-container-toolkit):
+#   docker run --gpus all -p 8080:8080 \
+#     -v /mnt/data/dev/projects/blackwell/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
+#     -v /mnt/data/dev/projects/blackwell/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
+#     blackwell-server:int4 8080 int4_8b
+#
+# Test:
+#   curl http://localhost:8080/v1/models
+#   curl -X POST http://localhost:8080/v1/completions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"prompt":"The capital of France is","max_tokens":10,"repetition_penalty":1.3}'
+
+FROM ubuntu:24.04
+
+LABEL description="Blackwell INT4 8B — RTX 5060 Ti, 56 t/s"
+LABEL version="0.9.3"
+
+# v0.9.3 features:
+# - INT4 symmetric quantization (5.3 GB vs 9.6 GB INT8)
+# - 56 t/s (14× faster than INT8 server)
+# - Repetition penalty support
+# - Coherent output with PPL=23.52 (1.9× BF16)
+
+RUN apt-get update \
+    -o Acquire::Check-Valid-Until=false \
+    -o Acquire::Check-Date=false \
+    -o Acquire::AllowInsecureRepositories=true \
+    -o Acquire::AllowDowngradeToInsecureRepositories=true && \
+    apt-get install -y --allow-unauthenticated --no-install-recommends \
+    ca-certificates curl && rm -rf /var/lib/apt/lists/*
+
+# Copy CUDA runtime library from host
+COPY cuda-libs/libcudart.so.13* /usr/local/lib/
+RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
+
+WORKDIR /app
+
+# Binaries + tokenizer data (weights mounted from host at runtime)
+COPY server/http_subprocess server/inference_server_int4 server/inference_server_int4_batched /app/server/
+COPY tokenizer_data.bin /app/
+
+RUN ldconfig || true
+
+EXPOSE 8080
+ENV CUDA_VISIBLE_DEVICES=0
+
+ENTRYPOINT ["/app/server/http_subprocess"]
+# Default: port 8080, model int4_8b. Override by passing args: <port> <model>
+#   docker run ... blackwell-server:int4 8081 8b   # INT8 model
+#   docker run ... blackwell-server:int4 8082 int4_8b  # INT4 model
+CMD ["8080", "int4_8b"]

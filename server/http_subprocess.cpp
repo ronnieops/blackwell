@@ -53,7 +53,9 @@ public:
         // Determine binary path
         const char* bin = "./server/inference_server";
         std::string bin9b = "./server/inference_server_9b";
+        std::string bin_int4 = "./server/inference_server_int4";
         if(strstr(model,"9b")) bin = bin9b.c_str();
+        else if(strstr(model,"int4")) bin = bin_int4.c_str();
 
         int pin[2], pout[2];
         if(pipe(pin)==-1 || pipe(pout)==-1) return false;
@@ -460,8 +462,8 @@ int main(int argc, char** argv) {
             return;
         }
         int max_tokens = json_int_at(body, "max_tokens", 30);
-        float temp = json_float_at(body, "temperature", 0.7f);
-        int top_k = json_int_at(body, "top_k", 40);
+        float temp = json_float_at(body, "temperature", 0.0f);
+        int top_k = json_int_at(body, "top_k", 0);
 
         std::string prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
         prompt += content;
@@ -490,8 +492,8 @@ int main(int argc, char** argv) {
             return;
         }
         int max_tokens = json_int_at(body, "max_tokens", 30);
-        float temp = json_float_at(body, "temperature", 0.7f);
-        int top_k = json_int_at(body, "top_k", 40);
+        float temp = json_float_at(body, "temperature", 0.0f);
+        int top_k = json_int_at(body, "top_k", 0);
         bool stream = json_int_at(body, "stream", 0) == 1;
 
         std::vector<uint32_t> tokens; std::string text;
@@ -524,8 +526,8 @@ int main(int argc, char** argv) {
         if(prompts.empty()) { res.status=400; res.set_content(R"({"error":{"message":"no prompts"}})", "application/json"); return; }
         if(prompts.size()>8) prompts.resize(8);
         int mt=json_int_at(req.body,"max_tokens",30);
-        float tp=json_float_at(req.body,"temperature",0.7f);
-        int tk=json_int_at(req.body,"top_k",40);
+        float tp=json_float_at(req.body,"temperature",0.0f);
+        int tk=json_int_at(req.body,"top_k",0);
         std::vector<std::vector<uint32_t>> at; std::vector<std::string> ax;
         if(!g_engine.generate_batch(prompts,mt,tp,tk,at,ax)) { res.status=504; res.set_content(R"({"error":{"message":"timeout"}})","application/json"); return; }
         std::ostringstream js; js<<"{\"batches\":[";
@@ -542,8 +544,8 @@ int main(int argc, char** argv) {
             return;
         }
         int max_tokens = json_int_at(body, "max_tokens", 30);
-        float temp = json_float_at(body, "temperature", 0.7f);
-        int top_k = json_int_at(body, "top_k", 40);
+        float temp = json_float_at(body, "temperature", 0.0f);
+        int top_k = json_int_at(body, "top_k", 0);
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");

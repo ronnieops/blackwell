@@ -1,26 +1,14 @@
-# .dockerignore
+weights_*
 build/
-bench/
-scripts/
-CMakeLists.txt
+*.cu
+*.h
 src/
+bench/
 include/
-
-# Exclude dead weight dirs
-weights_int8_qwen3_1.7b*/
-
-# Exclude source files — only need built binaries
-server/*.cu
-server/*.cpp
-server/*.py
-
-# Exclude docs/code
+cmake/
+scripts/
+docs/
+CMakeLists.txt
 *.md
-*.md~
-*.pyc
-__pycache__/
-.git/
-.vscode/
-.idea/
-
-# Keep: weights/, binaries, tokenizer data
+Dockerfile*
+.dockerignore

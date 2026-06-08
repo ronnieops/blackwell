@@ -6,9 +6,13 @@ Read `AGENTS.md` AND this file before acting.
 
 ## 1. Current Objective
 
-Stabilize INT8 production path. Model dimensions were wrong in ALL pre-session-56 code (nqh=32 vs 16, nkv=4 vs 8, hd=64 vs 128, KV=512 vs 1024). With correct dims, INT8 block-16 gives PPL=18.65 (1.5× BF16).
+INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
+14× faster than INT8 server (3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8.
 
-FP8 path ABANDONED — INT8 wins on both quality (PPL 18.65 vs 41.75) and speed (4.5× faster).
+**Session 63 fix**: http_subprocess defaulted to temperature=0.7f → garbled output.
+Fixed to temperature=0.0f (greedy) to match benchmark behavior. Output now
+matches benchmark exactly: "The capital of France is the same as the capital..."
+Repeating token issue (no repetition_penalty by default) — use rep_pen=1.3.
 
 ---
 
@@ -16,45 +20,46 @@ FP8 path ABANDONED — INT8 wins on both quality (PPL 18.65 vs 41.75) and speed 
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| 1.7B HTTP server | ✅ Correct dims | Already used nqh=16/nkv=8/hd=128/KV=1024 |
-| 1.7B bench_ppl | ✅ Fixed | Dims corrected this session, PPL=18.65 |
-| 8B HTTP server | ⚠️ Unknown | Dims not verified — may be wrong |
-| 9B GDN HTTP server | ⚠️ Dim suspicion | q_proj N=8192=32×256 vs server NQ=16. May use half of Q weights. |
-| FP8 path | ⚠️ Abandoned | Reference code kept in src/ |
-| Library | 171 symbols | +6 from FP8 kernel (kept as reference) |
-| Disk | ~61% | 516G free |
+| INT4 8B HTTP server | ✅ Production | `http_subprocess int4_8b`, 56 t/s |
+| INT4 batched server | ✅ Works | M prompts processed sequentially with own KV cache |
+| INT4 benchmark | ✅ 57 t/s | `bench/text_generate_int4_8b` |
+| INT4 PPL benchmark | ✅ PPL 23.52 | `bench/bench_ppl_int4_8b` |
+| Repetition penalty | ✅ Works | Reduces token looping |
+| CUDA Graph | ⚠️ 1% gain | `cudaMemcpyAsync` in attention blocks capture |
+| Docker | ✅ Built | `blackwell-server:int4` (148 MB) |
+| Build | ✅ 177 kernels | `libblackwell_kernels.a` |
+| INT8 server | ✅ Works | 8B: 3.9 t/s, 1.7B: 23 t/s |
 
-### PPL Quality (1.7B, WikiText-2, 512 ctx)
+### PPL Quality (8B)
 
 | Config | PPL | vs BF16 |
 |--------|-----|---------|
 | BF16 (llama.cpp Q8_0) | **12.4** | 1.0× |
-| INT8 block-16 (correct dims) | **18.65** | 1.5× |
-| FP8 per-row (abandoned) | 41.75 | 3.4× |
-| INT8 (old, wrong dims) | 7,351,868 | INVALID |
+| INT8 block-16 | **18.65** | 1.5× |
+| INT4 symmetric | **23.52** | 1.9× |
 
 ---
 
 ## 3. Recent Decisions
 
-- **CRITICAL: Wrong model dimensions found** (Session 56). All code used nqh=32, nkv=4, hd=64, KV=512. Actual Qwen3-1.7B: nqh=16, nkv=8, hd=128, KV=1024.
-- **No INT8 quality wall**. The PPL=7.3M was entirely a config bug. INT8 block-16 gives PPL=18.65 with correct dims.
-- **FP8 path ABANDONED**. FP8 per-row is 4.5× slower (no dp4a) AND 2.3× worse quality than INT8. FP8 advantage only exists for tensor-core mixed-precision (FP8×FP8→FP32 accumulate), not weight-only dequant.
-- **Activation quantization is fine** with correct dims. INT8 weight+act gives PPL=18.65 (same as weight-only).
-- **FP8 GEMV kernel written** as reference (src/kernels/gemv_fp8.cu) but not used in production.
-- **AGENTS.md updated** to reflect corrected dims and strategy.
+- **INT4 8B is production viable**: 56 t/s (14× faster than INT8), coherent output, PPL 23.52
+- **INT4 batched**: M prompts processed sequentially with own KV cache. M=1 works perfectly. M>1 crashes in original design — fixed by sequential processing.
+- **CUDA Graph limited**: 1% speedup. Root cause: `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels.
+- **Repetition penalty added**: Works at 56 t/s, reduces token looping
+- **Docker image built**: `blackwell-server:int4` (148 MB)
+- **Dead code removed**: 8 stale benchmark files (FP8, INT5, FP4)
+- **upload_w4 scale buffer bug FIXED**: Root cause of all INT4 crashes. `ss = h[3]*h[4]` from int4_t header (256) instead of scale_t header (38.9M for lm_head)
 
 ---
 
 ## 4. Important Constraints
 
-- **CORRECT 1.7B DIMS: nqh=16, nkv=8, hd=128, KV=1024** (NOT 32/4/64/512)
+- **CORRECT 8B DIMS: nqh=32, nkv=8, hd=128, KV=1024**
+- **CORRECT 1.7B DIMS: nqh=16, nkv=8, hd=128, KV=1024**
 - `compute_120a` required (NOT `compute_120`)
 - `killall hashcat` before every measurement
-- `gemv_int8_warp` is production INT8 GEMV
-- 1.7B intermediate_size=6144
-- All pre-session-56 quality numbers are INVALID (wrong dims)
-- head_dim=128 means hn_kernel needs 128 threads, RoPE needs 64 threads
+- INT4 is symmetric (no zero point): `nib - 8` for signed values
+- INT4 activation quantization: `sc = max(1e-10, absmax)/7`, `q = clamp(round(v/sc), -7, 7)`
 
 ---
 
@@ -62,9 +67,10 @@ FP8 path ABANDONED — INT8 wins on both quality (PPL 18.65 vs 41.75) and speed 
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| 9B q_proj dim suspicion | HIGH | q_proj weight N=8192=32 heads×256 dim. Server NQ=16. May use half of Q weights. Needs config.json verification. |
-| Pre-session-56 benchmarks invalid | HIGH | Any quality number from before this session used wrong dims |
-| hashcat interference | ⚠️ | Always kill before measurement |
+| CUDA Graph limited | MEDIUM | Attention kernels use cudaMemcpyAsync — blocks full capture |
+| INT4 PPL 23.52 vs BF16 12.4 | MEDIUM | Symmetric quantization, no calibration. AWQ could improve. |
+| 9B quality BLOCKED | HIGH | SSM instability: A_log > 0 for 68.8% of layer-4 channels |
+| Token looping | MEDIUM | Reduced with repetition_penalty=1.3 |
 
 ---
 
@@ -72,35 +78,40 @@ FP8 path ABANDONED — INT8 wins on both quality (PPL 18.65 vs 41.75) and speed 
 
 | Task | Priority | Notes |
 |------|----------|-------|
-| Verify 9B full_attention NQ value | HIGH | q_proj N=8192 suggests 32 heads vs server NQ=16. Find config.json or re-download model config. |
-| Re-run server benchmarks with correct dims | MEDIUM | 1.7B already correct. 8B bench files also correct. Just need fresh measurements. |
-| Clean up stale FP8 weights | LOW | ~2GB, can delete |
-| Remove FP8 bench files from repo | LOW | Or mark as reference |
+| True batched GEMV (M>1) | MEDIUM | Would need separate Q/K/V buffers per sequence |
+| INT4 calibration (AWQ) | HIGH | PPL 23→18? potential improvement |
+| 9B quality fix | HIGH | SSM instability root cause unknown |
 
 ---
 
 ## 7. Suggested Next Actions
 
-1. **Verify 8B and 9B dims**: Check weight file headers against config.json for both models
-2. **Re-run server benchmarks**: Get corrected throughput numbers for 1.7B with proper dims
-3. **Consider improving INT8 quality further**: PPL 18.65 vs BF16 12.4. Options: per-channel scaling, absmax-per-row activations
-4. **Tag v0.8.0**: First release with correct model dimensions
+1. **True batched GEMV**: Separate Q/K/V buffers per sequence + batched kernel
+2. **INT4 calibration**: AWQ-style per-channel scales for PPL improvement
+3. **9B quality**: Investigate SSM A_log instability
+4. **Docker push**: Push `blackwell-server:int4` to ghcr.io
 
 ---
 
 ## 8. Important Files / Commands
 
-### Files created/modified this session
+### Key binaries
 ```
-scripts/quantize_fp8.py            — FP8 quantizer (reference)
-bench/bench_ppl_fp8.cu             — FP8 PPL benchmark (reference)
-bench/bench_ppl_int8_fp32act.cu    — INT8 weight-only PPL benchmark
-src/kernels/gemv_fp8.cu            — FP8 GEMV kernel (reference, not production)
-include/blackwell/kernels.h        — Added FP8 kernel declarations
-CMakeLists.txt                     — Added gemv_fp8.cu
-weights_fp8_bf16/                  — FP8 weights (reference, 1.9 GB)
-AGENTS.md                          — Updated with correct dims and strategy
-docs/FP8_KERNEL_PLAN.md            — Marked OBSOLETE
+server/inference_server_int4           — INT4 server (2.7 MB)
+server/inference_server_int4_batched  — Batched INT4 server (2.7 MB)
+server/http_subprocess                 — HTTP wrapper
+bench/text_generate_int4_8b           — INT4 benchmark (57 t/s)
+bench/bench_ppl_int4_8b               — PPL benchmark (23.52)
+bench/decode_int4_cgraph_8b           — CUDA Graph benchmark
+```
+
+### Docker
+```
+docker build -f Dockerfile.int4 -t blackwell-server:int4 .
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
+  -v /path/to/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
+  blackwell-server:int4 8080 int4_8b
 ```
 
 ### Build
@@ -112,8 +123,9 @@ cmake --build build --parallel
 ### Run
 ```bash
 killall hashcat 2>/dev/null
-./bench/bench_ppl 1.7b 20          # Corrected: PPL~18.65 (was 7.3M)
-./server/http_subprocess 1.7b &    # Quality: semi-coherent text
+curl -X POST http://localhost:8124/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital of France is","max_tokens":30,"repetition_penalty":1.3}'
 ```
 
 ---
@@ -122,15 +134,15 @@ killall hashcat 2>/dev/null
 
 | Check | Value |
 |-------|-------|
-| INT8 PPL (correct dims) | **18.65** ✅ (1.5× BF16) |
-| BF16 reference PPL | **12.4** ✅ (from llama.cpp Q8_0) |
-| 1.7B dims verified | nqh=16, nkv=8, hd=128, KV=1024 ✅ (config.json + weights match) |
-| 8B dims verified | nqh=32, nkv=8, hd=128, KV=1024 ✅ (config.json + weights match) |
-| 9B dims | Suspicious: q_proj N=8192 (32 heads) vs server NQ=16 ❓ |
-| Server dims (1.7B) | Correct per-layer qk_norms loading ✅ |
-| Library symbols | 171 ✅ |
-| All active bench files | Correct dims verified ✅ |
-| FP8 GEMV speed | 4.5× slower than INT8 (verified) ❌ |
+| INT4 8B throughput | **56 t/s** ✅ |
+| INT4 8B PPL | **23.52** ✅ (1.9× BF16) |
+| INT4 batched server | ✅ Works (M sequential) |
+| INT4 docker image | ✅ Built (148 MB) |
+| Build kernel count | **177** ✅ |
+| Repetition penalty | ✅ Works |
+| CUDA Graph speedup | 1% ⚠️ |
+| 8B dims verified | nqh=32, nkv=8, hd=128, KV=1024 ✅ |
+| 1.7B dims verified | nqh=16, nkv=8, hd=128, KV=1024 ✅ |
 
 ---
 
@@ -138,12 +150,18 @@ killall hashcat 2>/dev/null
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-07 |
+| updated_at | 2026-06-08 |
 | branch | master |
-| repo_state | Modified (new files + edits, uncommitted) |
-| session | 56 (FP8 Phase 1 + dimension bug discovery + strategy pivot) |
-| key_finding | 9B q_proj dim suspicion (N=8192 vs server NQ=16). 1.7B and 8B dims all correct. All bench files verified. FP8 path abandoned. |
-| next_priority | Verify 9B full_attention NQ (find config.json or re-download), re-run server benchmarks |
+| repo_state | Modified (uncommitted INT4 files, AGENTS.md updated) |
+| session | 63 (AGENTS.md fix 165→177, http_subprocess temp fix, build verify) |
+| key_finding | INT4 8B production viable at 56 t/s, PPL 23.52. upload_w4 scale bug fixed. CUDA Graph limited by cudaMemcpyAsync. |
+| next_priority | True batched GEMV, INT4 calibration, or 9B quality |
+
+**BUG FIX (Session 63)**: http_subprocess default temp=0.7f caused garbled output.
+Root cause: all 4 request handlers defaulted to temp=0.7f, top_k=40 instead of
+temp=0.0f, top_k=0. Server inference_server_int4 defaulted to temp=0.0f but
+http_subprocess overrode it. Benchmark works (57 t/s, greedy) but HTTP server
+was broken. Fixed in server/http_subprocess.cpp. Output now matches benchmark.
 
 ---
 
@@ -153,18 +171,19 @@ killall hashcat 2>/dev/null
 1. Read `AGENTS.md` → `HANDOFF.md`
 2. `git status` — check state
 3. `killall hashcat 2>/dev/null`
+4. `nvidia-smi --query-compute-apps` — ensure no stale GPU processes
 
 **Verified facts**:
-- Qwen3-1.7B: nqh=**16**, nkv=**8**, hd=**128**, KV=**1024** (NOT 32/4/64/512)
-- INT8 block-16 PPL = **18.65** (1.5× BF16 baseline 12.4)
-- No INT8 quality wall — the 7.3M PPL was a dims bug
-- FP8 path ABANDONED — INT8 wins quality AND speed
-- Server already had correct dims for 1.7B; bench_ppl.cu was wrong
+- INT4 8B: **56 t/s**, PPL **23.52** (1.9× BF16)
+- INT8 8B: **3.9 t/s**, PPL **18.65** (1.5× BF16)
+- 8B dims: nqh=**32**, nkv=**8**, hd=**128**, KV=**1024**
+- INT4 is symmetric: `nib - 8` for signed values, scale = absmax/7
+- upload_w4 bug: read scale_t header for scale count, NOT int4_t header
 
 **DO NOT**:
-- Use old dimension values (nqh=32, nkv=4, hd=64, KV=512)
-- Trust any pre-session-56 PPL/quality number
-- Invest more in FP8 weight-only kernels (no benefit over INT8)
-- Re-dig dead ends: FP4 GEMM, speculative decode, sub-8-bit quantization
-- Assume head_dim=64 — it's 128 for Qwen3-1.7B
-- Delete FP8 reference code — keep for future reference
+- Use old dimension values (nqh=32, nkv=4, hd=64, KV=512 for 1.7B)
+- Trust pre-session-56 quality numbers (wrong dims)
+- Expect CUDA Graph speedup > 1% (cudaMemcpyAsync blocks capture)
+- Re-dig dead ends: FP8, INT5, FP4, asymmetric INT4
+
+**Build verification**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` → expect 177

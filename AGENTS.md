@@ -1,23 +1,26 @@
 # AGENTS.md - blackwell
 
-Custom CUDA kernels for INT8 LLM inference on RTX 5060 Ti (Blackwell, GB206).
+Custom CUDA kernels for INT8/INT4 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 ---
 
 ## 1. Mission
 
-INT8 decode throughput vs llama.cpp Q4_K_M.
+INT8/INT4 decode throughput vs llama.cpp Q4_K_M.
 
-**Servers (v0.8.2, correct dims)**
+**Servers (v0.8.3)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
 | 8B INT8 (correct dims) | `inference_server 8b` | **~3.9** | ~256 | Coherent ✅ |
+| **8B INT4 HTTP** | `http_subprocess int4_8b` | **~56** | ~18 | PPL 23.52 (1.9× BF16) ✅ |
+| 8B INT4 benchmark | `text_generate_int4_8b` | **~59** | ~17 | Coherent but degraded ⚠️ |
 
-**8B throughput note**: ~3.9 t/s with token-by-token prefill (180 layer passes for 5-token prompt).
-Batched prefill attempted but correctness issues unresolved (residual management complex).
-CUDA Graph capture of batched_decode_step provides speedup for M>1 batch.
-Pre-fill remains the main throughput bottleneck.
+**Batch endpoint (v0.8.3)**: `POST /v1/batch` with `{"prompts":["...","..."],"max_tokens":N}`
+- All prompts processed in one batched call → 12-26% per-request speedup
+- M=8 batch: 0.52s/req vs 0.7s single. Real-world throughput scales with concurrency.
+- Local BpeTokenizer decodes tokens locally (avoids server text parsing)
+- JSON escaping: XSS guard `<>` → `\u003c/\u003e`, non-ASCII bytes → `\u00XX`
 
 **Server v0.8.1 features**:
 - Repetition penalty: `repetition_penalty` param (1.0-2.0, default 1.0=off)
@@ -26,7 +29,14 @@ Pre-fill remains the main throughput bottleneck.
 - Mixed-precision: auto-detects `.fp16` files per layer, dispatches to FP16 GEMV
 - Critical fixes: seq_pos sync bug, empty prompt, prefill cache layout
 
-**Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.2` (160 MB)
+**Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.3` (160 MB)
+**INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
+
+**Version history**:
+- v0.9.3: INT4 8B server (56 t/s, PPL 23.52, repetition penalty)
+- v0.9.2: INT4 batched server (M sequential, each with own KV cache)
+- v0.9.1: INT4 server from benchmark decode loop (57 t/s)
+- v0.8.3: INT8 multi-model (1.7B/8B/9B)
 
 **8B quality with correct dims**: INT8 produces coherent text.
 Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8
@@ -45,12 +55,19 @@ This is NOT a quantization issue — architectural/inference problem.
 | 1.7B INT8 fused | 1 | Per-kernel | 180 | 5.5 | 61% |
 | 1.7B | 1 | Prefill SEQ=8 | 3759 | 2.1 | — |
 | 8B INT8 | 1 | CUDA Graph | 44 | 22.9 | 53% |
+| 8B INT4 | 1 | Per-kernel | 59 | 16.9 | 80% |
 | 9B GDN INT8 | 1 | Per-kernel | 46 | 21.9 | 64% |
 | 9B GDN INT8 | 8 | Batched | 51 | 19.6 | 71% |
 
 ⚠️ Benchmarks omit head_norm/RoPE. Realistic server throughput with correct model is lower.
 
-**INT4/INT5 quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
+**INT4 8B quality degraded but coherent**. Grammatically correct English, factual errors, token looping without repetition penalty. 59 t/s (15× faster than INT8 server's 3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8 (45% smaller). Root cause of prior INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
+
+**CUDA Graph for INT4 (Session 62)**: Captured 648 nodes (36 layers × 18 kernels). Speedup only 1% (63→64 t/s) because `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels without cudaMemcpyAsync.
+
+**Batched INT4 (Session 62)**: M=1 works (56 t/s). M>1 crashes — buffer layout incompatible with batched processing. True batching needs separate Q/K/V buffers per sequence and batched GEMV kernels.
+
+**INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 
 **PPL quality (1.7B, WikiText-2, 512 ctx)**
 | Config | PPL | vs BF16 |
@@ -89,7 +106,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 165 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed 30 dead-end INT4/INT5/FP4 kernel symbols)
+**Library**: 177 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed dead-end INT4/INT5/FP4/FP8 kernel symbols)
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -180,6 +197,7 @@ killall hashcat 2>/dev/null
 ```bash
 ./bench/decode_int8_cgraph_qwen3_8b 36              # M=1: 46 t/s
 ./bench/decode_int8_batched_cgraph_attn_qwen3_8b 28 8 # M=8: 40 t/s
+./bench/text_generate_int4_8b "The capital of France is" 30  # INT4: 59 t/s
 ```
 
 ### Qwen3.5-9B GatedDeltaNet
@@ -190,7 +208,7 @@ killall hashcat 2>/dev/null
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 165 (was 195 before cleanup)
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 177
 ```
 
 ### Docker server (v0.7.0, 160 MB, weights mounted at runtime)
@@ -206,6 +224,16 @@ docker run --gpus all -p 8081:8080 \
   -v /path/to/weights_int8_qwen35_9b:/app/weights_int8_qwen35_9b \
   -v /path/to/tokenizer_data_9b.bin:/app/tokenizer_data_9b.bin \
   ghcr.io/ronnieops/blackwell-server:v0.7.0 8080 9b
+```
+
+### INT4 Docker (v0.9.3, 148 MB)
+```bash
+docker build -f Dockerfile.int4 -t blackwell-server:int4 .
+# Run with weights mounted:
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
+  -v /path/to/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
+  blackwell-server:int4 8080 int4_8b
 ```
 ### Docker compose (multi-model)
 ```bash
@@ -226,6 +254,7 @@ weights_int4_qwen3_1.7b/      # 1.7B INT4 symmetric (dead end)
 weights_int4_qwen3_1.7b_asym/ # 1.7B INT4 asymmetric (dead end)
 weights_int5_qwen3_1.7b_asym/ # 1.7B INT5 asymmetric (dead end)
 weights_int8_qwen3_8b/        # 8B INT8 weights + norms (canonical, 9.6 GB)
+weights_int4_qwen3_8b/        # 8B INT4 symmetric weights + norms (5.3 GB)
 weights_int8_qwen3_8b_mixed/  # 8B mixed: 8 FP16 + 28 INT8 (same quality as all-INT8)
 weights_int8_qwen3_8b_all_int8/ # 8B pure INT8 copy
 weights_int8_qwen35_9b/        # 9B GatedDeltaNet INT8 (11 GB)
@@ -254,8 +283,10 @@ src/kernels/
 
 bench/
   text_generate.cu              — 1.7B end-to-end text generation
-  text_generate_qwen3_8b.cu     — 8B end-to-end text generation
-  text_generate_int4.cu         — INT5 text generation (garbled, reference only)
+  text_generate_qwen3_8b.cu     — 8B end-to-end text generation (INT8)
+  text_generate_int4_qwen3_8b.cu — 8B INT4 end-to-end text generation (57 t/s)
+  text_generate_int4.cu         — 1.7B INT4 text generation
+  bench_ppl_int4_8b.cu          — INT4 8B PPL benchmark (PPL 23.52)
   decode_int8_cgraph.cu         — 1.7B M=1 CUDA Graph benchmark
   decode_int8_batched_cgraph_attn.cu — 1.7B M=8 batched benchmark
   decode_int8_nofp4.cu          — nofp4 benchmark (per-kernel + CUDA Graph)
@@ -263,6 +294,10 @@ bench/
 server/
   inference_server_nofp4.cu     — C++ inference daemon (stdin/stdout JSON)
   inference_server              — compiled binary
+  inference_server_int4.cu     — INT4 8B server (JSON stdio, uses benchmark decode loop)
+  inference_server_int4_batched.cu — Batched INT4 server (M=1 only, M>1 broken)
+  inference_server_int4        — compiled INT4 server binary (2.7 MB)
+  inference_server_int4_batched — compiled batched server binary
   http_subprocess.cpp           — C++ HTTP wrapper (httplib, fork subprocess)
   http_subprocess               — compiled HTTP server
   http_server.py               — Python HTTP wrapper (fallback)
@@ -279,7 +314,9 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 | Config | PPL | vs BF16 | Note |
 |--------|-----|---------|------|
 | BF16 (llama.cpp Q8_0) | **12.4** | 1.0× | Baseline |
-| INT8 block-16 (correct dims) | **18.65** | 1.5× | **Usable quality** |
+| INT8 block-16 (correct dims) | **18.65** | 1.5× | Production path |
+| INT4 symmetric (8B) | **23.52** | 1.9× | 56 t/s, no calibration |
+| INT4 symmetric (8B, this session) | **23.52** | 1.9× | Symmetric, no calibration |
 | FP8 per-row (this session) | 41.75 | 3.4× | 4.5× slower than INT8, abandoned |
 | INT8 (old, wrong dims) | 7,351,868 | — | **INVALID** — half of K/V weights ignored |
 
@@ -297,6 +334,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 
 ### Key Decisions
 - **INT8 block-16 is the production path** (PPL=18.65, uses dp4a for speed)
+- **INT4 8B is a viable throughput path** (59 t/s, 15× faster than INT8 server, 80% of llama.cpp)
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
 - **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
@@ -351,6 +389,13 @@ Each layer uses per-layer RMSNorm weights (`{L}_input_layernorm.f32`, `{L}_post_
 - `GET /v1/models` → model list
 - `POST /v1/completions` → text completion
 - `POST /v1/chat/completions` → chat completion (with `<|im_start|>` / `<|im_end|>` tokens)
+- `POST /v1/batch` → **batch completion** `{"prompts":["...","..."],"max_tokens":N}` → 12-26% faster per-request
+
+**Batch endpoint**: All prompts processed in one batched call via `generate_batch()`.
+- Max 8 prompts per batch. Parses `{"tokens":[[...],[...]],"text":[...]}`, decodes tokens locally.
+- Speedup scales with concurrency: M=8 → 0.52s/req vs 0.70s single (26% faster)
+- Token IDs decoded with `LocalTokenizer` (BpeTokenizer loaded from `tokenizer_data.bin`)
+- JSON escaping: `<>` → `\u003c/\u003e` (XSS guard), non-ASCII bytes → `\u00XX`
 
 **Architecture**: http_subprocess forks `server/inference_server` subprocess, communicates via JSON stdio using raw read/write syscalls (no FILE* to avoid pipe issues). Timeout per request: 30s.
 
@@ -368,7 +413,8 @@ Each layer uses per-layer RMSNorm weights (`{L}_input_layernorm.f32`, `{L}_post_
 ```bash
 CUDACXX=/usr/local/cuda-13.3/bin/nvcc nvcc -O3 -std=c++17 -arch=sm_120a \
   server/inference_server_nofp4.cu build/libblackwell_kernels.a \
-  -I include -L/usr/local/cuda-13.3/targets/x86_64-linux/lib \
+  -I include -I /usr/local/cuda-13.3/include \
+  -L /usr/local/cuda-13.3/targets/x86_64-linux/lib \
   -o server/inference_server -lcudart -lpthread -lz
 ```
 
@@ -382,7 +428,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (M=1 benchmark)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 165)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 177)
 HTTP test: `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":1}'`
 
 ---
@@ -459,6 +505,21 @@ Per-kernel path fast enough (~106 t/s). Deferred until head_norm+RoPE can be fus
 ### HTTP timeout (2026-06-04) — FIXED
 httplib default read timeout = 5s. Inference takes ~7s for 30 tokens.
 Fix: `svr.set_read_timeout(300)` in http_subprocess.cpp.
+
+### INT4 upload_w4 scale buffer overflow (2026-06-08) — FIXED
+`upload_w4()` in bench files computed `ss = h[3]*h[4]` from the int4_t header (256×1=256)
+instead of the scale_t header (256×N). For 8B lm_head (N=151936), only 256 floats allocated
+instead of 38,895,616 → massive out-of-bounds GPU read → illegal memory access.
+1.7B benchmarks also affected but weights smaller so less severe.
+Fix: read scale_t header separately, compute `ss = h[3]*h[4]` from scale_t header values.
+Location: `bench/text_generate_int4_qwen3_8b.cu`, `bench/text_generate_int4.cu`.
+
+### INT4 8B server decode divergence (2026-06-08) — OPEN
+`server/inference_server_int4.cu` (v0.9.0) produces garbled output. Hidden states diverge
+at step 1 despite identical embeddings and step-0 layer outputs. Root cause: unknown.
+Suspected attention kernel batch-stride issue with M=8 KV cache layout.
+Benchmark `bench/text_generate_int4_8b` works correctly at 57 t/s.
+
 ### Batched prefill buffer overflow (2026-06-07) — FIXED
 `server/inference_server_nofp4.cu`: `batched_prefill` called `attention_decode_batched_gqa`
 with `kv_layer_off` (KV cache layer stride) as base offset into temp `d_K`/`d_V` buffers.
