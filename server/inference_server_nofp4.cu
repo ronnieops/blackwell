@@ -482,19 +482,18 @@ static void batched_prefill(ServerState& S, int M) {
             head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
             head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K + m * S.KV, S.layers[l].kn, S.nkv, S.hd, S.eps);
 
-            // RoPE for each position (seq_pos = m)
-            blackwell::kernels::update_decode_seq_pos(m, S.st);
-            cudaStreamSynchronize(S.st);
+            // RoPE — seq_pos already on device from batched QKV path (line 374)
             rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q + m * S.Q, S.nqh, S.hd, S.d_seq_pos);
             rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
         }
 
         // ── Write K,V to persistent KV cache (needed by decode step later) ──
         for (int m = 0; m < M; m++) {
+            // Write at position m (token's position in sequence) for decode compatibility
             size_t kb = kv_layer_off + (size_t)m * S.nkv * S.hd;
             blackwell::kernels::update_kv_cache(
                 S.d_kc + kb, S.d_vc + kb, S.d_K + m * S.KV, S.d_V + m * S.KV,
-                0, 0, S.nkv, S.hd, S.ms, S.st);
+                0, m, S.nkv, S.hd, S.ms, S.st);
         }
 
         // ── Attention: batched M sequences attending to all M ──
@@ -508,7 +507,7 @@ static void batched_prefill(ServerState& S, int M) {
                 S.d_attn, S.d_Q, S.d_K, S.d_V,  // Full K,V for all M
                 m, S.nqh, S.nkv, S.hd, S.ms,
                 M, (int)kv_seq_stride, 0, S.st);
-            cudaStreamSynchronize(S.st);  // ensure kernel completes before copy
+            // sync removed (seq_pos already on device)
             cudaMemcpyAsync(S.d_attn_out + m * S.Q, S.d_attn, S.Q * 4, cudaMemcpyDeviceToDevice, S.st);
         }
 
@@ -741,22 +740,23 @@ int main(int argc, char** argv) {
         bool stream = find_int(line, "stream", 0) == 1;
 
         int gen_start = (int)prompts[0].size();
-        // Prefill: load all M tokens if they fit in batch size, else token-by-token
-        if (gen_start > 0 && gen_start <= M) {
-            embed_batch(S, prompts, 0);  // load all M tokens' embeddings to d_residual[m]
-            batched_prefill(S, gen_start);
-            cudaStreamSynchronize(S.st);  // ensure prefill done before gen loop
-            // Copy last token's hidden state to d_residual[0] for decode continuation
-            if (gen_start > 1) {
-                cudaMemcpyAsync(S.d_residual[0], S.d_residual[gen_start - 1], S.H * 4,
-                    cudaMemcpyDeviceToDevice, S.st);
-            }
-        } else if (gen_start > M) {
-            // gen_start > M: fall back to token-by-token decode (no batched prefill overflow)
+        // Prefill: use token-by-token decode for all cases (correct KV cache positions)
+        // Batched prefill has cache layout incompatibility with decode attention
+        if (gen_start > 0) {
             for (int s = 0; s < gen_start; s++) {
                 embed_batch(S, prompts, s);
                 batched_decode_step(S, s);
             }
+        }
+
+        // If no prefill (empty prompt), embed a start token before generate
+        if (gen_start == 0) {
+            // Use token 0 (typically BOS or first vocab item) as start token
+            std::vector<float> h_hidden(S.H);
+            uint32_t start_tok = 0;
+            for (int d = 0; d < S.H; d++)
+                h_hidden[d] = (float)S.h_emb_int8[start_tok * S.H + d] * S.h_emb_scale[start_tok * (S.H / 16) + d / 16];
+            cudaMemcpy(S.d_residual[0], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
         }
 
         // Generate (after prefill, start from position gen_start)
