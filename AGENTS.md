@@ -8,15 +8,16 @@ Custom CUDA kernels for INT8 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 INT8 decode throughput vs llama.cpp Q4_K_M.
 
-**Servers (v0.8.1, correct dims)**
+**Servers (v0.8.x, correct dims)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 (correct dims) | `inference_server 8b` | **~3.7** | ~270 | Coherent ✅ |
+| 8B INT8 (correct dims) | `inference_server 8b` | **~3.8** | ~260 | Coherent ✅ |
 | 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled ❌ |
 
-**8B throughput note**: ~3.7 t/s is with token-by-token prefill (180 layer passes for 5-token prompt).
-Batched prefill has cache layout incompatibility with decode attention — disabled.
+**8B throughput note**: ~3.8 t/s with token-by-token prefill (180 layer passes for 5-token prompt).
+Batched prefill attempted but correctness issues persist (residual management). Token-by-token is correct.
+CUDA Graph capture of batched_decode_step provides speedup for M>1 batch.
 Pre-fill optimization is the main throughput opportunity.
 
 **Server v0.8.1 features**:
