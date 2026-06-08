@@ -11,15 +11,22 @@ INT8 decode throughput vs llama.cpp Q4_K_M.
 **Servers (v0.8.1, correct dims)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
-| 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~85** | ~11.8 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 (correct dims) | `inference_server 8b` | **~20** | ~50 | Coherent ✅ |
+| 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
+| 8B INT8 (correct dims) | `inference_server 8b` | **~3.7** | ~270 | Coherent ✅ |
 | 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled ❌ |
 
+**8B throughput note**: ~3.7 t/s is with token-by-token prefill (180 layer passes for 5-token prompt).
+Batched prefill has cache layout incompatibility with decode attention — disabled.
+Pre-fill optimization is the main throughput opportunity.
+
 **Server v0.8.1 features**:
-- Repetition penalty: `repetition_penalty` parameter (1.0-2.0, default 1.0=off)
-  Reduces token looping. 8B output: "Paris... Paris..." (no pen) → "Paris... the city that has..." (rep=1.3)
+- Repetition penalty: `repetition_penalty` param (1.0-2.0, default 1.0=off)
+  Reduces token looping. 8B: "Paris... Paris..." (no pen) → "Paris... the city that has..." (rep=1.3)
 - Batched QKV: M sequences batched through QKV in 3 calls (vs M×3 sequential)
 - Mixed-precision: auto-detects `.fp16` files per layer, dispatches to FP16 GEMV
+- Critical fixes: seq_pos sync bug, empty prompt, prefill cache layout
+
+**Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.1` (160 MB)
 
 **8B quality with correct dims**: INT8 produces coherent text.
 Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8
