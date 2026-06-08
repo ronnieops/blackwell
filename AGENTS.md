@@ -8,17 +8,16 @@ Custom CUDA kernels for INT8 LLM inference on RTX 5060 Ti (Blackwell, GB206).
 
 INT8 decode throughput vs llama.cpp Q4_K_M.
 
-**Servers (v0.8.x, correct dims)**
+**Servers (v0.8.2, correct dims)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 (correct dims) | `inference_server 8b` | **~3.8** | ~260 | Coherent ✅ |
-| 9B GDN INT8 | `inference_server_9b` | **~28** | ~35 | Garbled ❌ |
+| 8B INT8 (correct dims) | `inference_server 8b` | **~3.9** | ~256 | Coherent ✅ |
 
-**8B throughput note**: ~3.8 t/s with token-by-token prefill (180 layer passes for 5-token prompt).
-Batched prefill attempted but correctness issues persist (residual management). Token-by-token is correct.
+**8B throughput note**: ~3.9 t/s with token-by-token prefill (180 layer passes for 5-token prompt).
+Batched prefill attempted but correctness issues unresolved (residual management complex).
 CUDA Graph capture of batched_decode_step provides speedup for M>1 batch.
-Pre-fill optimization is the main throughput opportunity.
+Pre-fill remains the main throughput bottleneck.
 
 **Server v0.8.1 features**:
 - Repetition penalty: `repetition_penalty` param (1.0-2.0, default 1.0=off)
@@ -27,7 +26,7 @@ Pre-fill optimization is the main throughput opportunity.
 - Mixed-precision: auto-detects `.fp16` files per layer, dispatches to FP16 GEMV
 - Critical fixes: seq_pos sync bug, empty prompt, prefill cache layout
 
-**Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.1` (160 MB)
+**Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.2` (160 MB)
 
 **8B quality with correct dims**: INT8 produces coherent text.
 Mixed precision (FP16 early layers) provides NO improvement — ALL-INT8
