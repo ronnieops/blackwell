@@ -275,6 +275,16 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
             die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "quant_lm");
             die(blackwell::kernels::gemv_int4_warp(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc, H, V, st), "lm_head");
+
+            // Repetition penalty: penalize recently generated tokens
+            if (rep_pen > 1.0f && (int)all_ids.size() > gen_start) {
+                int num_recent = (int)all_ids.size() - gen_start;
+                if (num_recent > 64) num_recent = 64;
+                std::vector<int> h_recent(all_ids.end() - num_recent, all_ids.end());
+                die(cudaMemcpyAsync(d_recent, h_recent.data(), num_recent * sizeof(int), cudaMemcpyHostToDevice, st), "cpy_recent");
+                die(blackwell::kernels::apply_repetition_penalty(d_logits, d_recent, num_recent, rep_pen, V, st), "rep_pen");
+            }
+
             int next_id;
             die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k, d_next_id, 0xdeadbeefLL, step, st), "sample");
             die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy");
@@ -337,7 +347,7 @@ int main(int argc, char** argv) {
 
         // Process first prompt (M=1)
         auto input_ids = tokenizer.encode(str_prompts[0]);
-        float rep_pen = parse_repetition_penalty(line, 1.0f);
+        float rep_pen = parse_repetition_penalty(line, 1.5f);
         auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen);
 
         // Decode tokens

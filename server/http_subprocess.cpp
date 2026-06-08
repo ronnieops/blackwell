@@ -78,7 +78,7 @@ public:
     }
 
     bool generate(const std::string& prompt, int max_tok, float temp, int top_k,
-                  std::vector<uint32_t>& tokens, std::string& text, bool stream = false) {
+                  float rep_pen, std::vector<uint32_t>& tokens, std::string& text, bool stream = false) {
         std::lock_guard<std::mutex> g(lock);
         if(!ready) return false;
 
@@ -95,8 +95,8 @@ public:
 
         char req[16384];
         int len = snprintf(req, sizeof(req),
-            "{\"prompts\":[\"%s\"],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"stream\":%d}\n",
-            ep.c_str(), max_tok, temp, top_k, stream ? 1 : 0);
+            "{\"prompts\":[\"%s\"],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"repetition_penalty\":%.1f,\"stream\":%d}\n",
+            ep.c_str(), max_tok, temp, top_k, rep_pen, stream ? 1 : 0);
 
         // Write to temp file, cat into subprocess stdin
         char tmpfile[64];
@@ -211,7 +211,7 @@ public:
     }
 
     bool generate_batch(const std::vector<std::string>& prompts_in, int max_tok, float temp, int top_k,
-                  std::vector<std::vector<uint32_t>>& all_tokens, std::vector<std::string>& all_text) {
+                  float rep_pen, std::vector<std::vector<uint32_t>>& all_tokens, std::vector<std::string>& all_text) {
         std::lock_guard<std::mutex> g(lock);
         if(!ready) return false;
 
@@ -233,8 +233,8 @@ public:
         }
         char req[32768];
         int len = snprintf(req, sizeof(req),
-            "{\"prompts\":[%s],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"stream\":0}\n",
-            ep.c_str(), max_tok, temp, top_k);
+            "{\"prompts\":[%s],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"repetition_penalty\":%.1f,\"stream\":0}\n",
+            ep.c_str(), max_tok, temp, top_k, rep_pen);
 
         char tmpfile[64];
         snprintf(tmpfile, sizeof(tmpfile), "/tmp/inf_req_%d", (int)getpid());
@@ -464,13 +464,14 @@ int main(int argc, char** argv) {
         int max_tokens = json_int_at(body, "max_tokens", 30);
         float temp = json_float_at(body, "temperature", 0.0f);
         int top_k = json_int_at(body, "top_k", 0);
+        float rep_pen = json_float_at(body, "repetition_penalty", 1.5f);
 
         std::string prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
         prompt += content;
         prompt += "<|im_end|>\n<|im_start|>assistant\n";
 
         std::vector<uint32_t> tokens; std::string text;
-        if(!g_engine.generate(prompt, max_tokens, temp, top_k, tokens, text)) {
+        if(!g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text)) {
             res.status = 504;
             res.set_content(R"({"error":{"message":"Generation timeout or error","type":"internal_error"}})", "application/json");
             return;
@@ -494,10 +495,11 @@ int main(int argc, char** argv) {
         int max_tokens = json_int_at(body, "max_tokens", 30);
         float temp = json_float_at(body, "temperature", 0.0f);
         int top_k = json_int_at(body, "top_k", 0);
+        float rep_pen = json_float_at(body, "repetition_penalty", 1.5f);
         bool stream = json_int_at(body, "stream", 0) == 1;
 
         std::vector<uint32_t> tokens; std::string text;
-        if(!g_engine.generate(prompt, max_tokens, temp, top_k, tokens, text, stream)) {
+        if(!g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text, stream)) {
             res.status = 504;
             res.set_content(R"({"error":{"message":"Generation timeout or error","type":"internal_error"}})", "application/json");
             return;
@@ -528,8 +530,9 @@ int main(int argc, char** argv) {
         int mt=json_int_at(req.body,"max_tokens",30);
         float tp=json_float_at(req.body,"temperature",0.0f);
         int tk=json_int_at(req.body,"top_k",0);
+        float rp=json_float_at(req.body,"repetition_penalty",1.5f);
         std::vector<std::vector<uint32_t>> at; std::vector<std::string> ax;
-        if(!g_engine.generate_batch(prompts,mt,tp,tk,at,ax)) { res.status=504; res.set_content(R"({"error":{"message":"timeout"}})","application/json"); return; }
+        if(!g_engine.generate_batch(prompts,mt,tp,tk,rp,at,ax)) { res.status=504; res.set_content(R"({"error":{"message":"timeout"}})","application/json"); return; }
         std::ostringstream js; js<<"{\"batches\":[";
         for(size_t i=0;i<at.size();i++) { if(i)js<<","; js<<"{\"id\":\"b"<<i<<"\",\"choices\":[{\"text\":\""<<escape_json_str(ax[i])<<"\",\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":"<<at[i].size()<<"}}"; }
         js<<"]}"; res.set_content(js.str(),"application/json");
@@ -546,6 +549,7 @@ int main(int argc, char** argv) {
         int max_tokens = json_int_at(body, "max_tokens", 30);
         float temp = json_float_at(body, "temperature", 0.0f);
         int top_k = json_int_at(body, "top_k", 0);
+        float rep_pen = json_float_at(body, "repetition_penalty", 1.5f);
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");
@@ -568,8 +572,8 @@ int main(int argc, char** argv) {
                 }
                 char req[16384];
                 int len = snprintf(req, sizeof(req),
-                    "{\"prompts\":[\"%s\"],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"stream\":1}\n",
-                    ep.c_str(), max_tokens, temp, top_k);
+                    "{\"prompts\":[\"%s\"],\"max_tokens\":%d,\"temperature\":%g,\"top_k\":%d,\"repetition_penalty\":%.1f,\"stream\":1}\n",
+                    ep.c_str(), max_tokens, temp, top_k, rep_pen);
                 char tmpfile[64];
                 snprintf(tmpfile, sizeof(tmpfile), "/tmp/inf_req_%d", (int)getpid());
                 int tf = open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);

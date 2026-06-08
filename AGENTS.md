@@ -16,6 +16,11 @@ INT8/INT4 decode throughput vs llama.cpp Q4_K_M.
 | **8B INT4 HTTP** | `http_subprocess int4_8b` | **~56** | ~18 | PPL 23.52 (1.9× BF16) ✅ |
 | 8B INT4 benchmark | `text_generate_int4_8b` | **~59** | ~17 | Coherent but degraded ⚠️ |
 
+**INT4 temperature**: Server uses greedy defaults (temp=0.0, top_k=0, rep_pen=1.5).
+Temperature > 0 causes garbled output — INT4 stochastic sampling amplifies
+quantization noise. Greedy (temp=0) matches benchmark output exactly. Rep_pen
+eliminates token looping. Clients can override via JSON body.
+
 **Batch endpoint (v0.8.3)**: `POST /v1/batch` with `{"prompts":["...","..."],"max_tokens":N}`
 - All prompts processed in one batched call → 12-26% per-request speedup
 - M=8 batch: 0.52s/req vs 0.7s single. Real-world throughput scales with concurrency.

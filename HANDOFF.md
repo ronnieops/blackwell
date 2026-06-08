@@ -9,10 +9,13 @@ Read `AGENTS.md` AND this file before acting.
 INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
 14× faster than INT8 server (3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8.
 
-**Session 63 fix**: http_subprocess defaulted to temperature=0.7f → garbled output.
-Fixed to temperature=0.0f (greedy) to match benchmark behavior. Output now
-matches benchmark exactly: "The capital of France is the same as the capital..."
-Repeating token issue (no repetition_penalty by default) — use rep_pen=1.3.
+**Session 63 fixes**:
+1. http_subprocess defaulted to temperature=0.7f → garbled output. Fixed to
+   temperature=0.0f (greedy) to match benchmark behavior.
+2. Added repetition_penalty support: all 4 request handlers now send
+   rep_pen=1.5 by default. Server apply_repetition_penalty kernel uses it.
+   Clients can override via JSON body. Eliminates token looping.
+3. Docker image built: blackwell-server:int4 (148 MB, tested ✅)
 
 ---
 
@@ -153,7 +156,7 @@ curl -X POST http://localhost:8124/v1/completions \
 | updated_at | 2026-06-08 |
 | branch | master |
 | repo_state | Modified (uncommitted INT4 files, AGENTS.md updated) |
-| session | 63 (AGENTS.md fix 165→177, http_subprocess temp fix, build verify) |
+| session | 63 (temp fix, rep_pen, Docker, PPL 23.52 confirmed) |
 | key_finding | INT4 8B production viable at 56 t/s, PPL 23.52. upload_w4 scale bug fixed. CUDA Graph limited by cudaMemcpyAsync. |
 | next_priority | True batched GEMV, INT4 calibration, or 9B quality |
 
