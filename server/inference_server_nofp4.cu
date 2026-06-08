@@ -360,25 +360,27 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
                 S.d_residual[m], S.d_rn_in[l], S.H, S.eps, S.st);
         }
 
-        // ── Q/K/V projections + head_norm + RoPE (per-sequence) ──
-        for (int m = 0; m < M; m++) {
-            gemv_dispatch(S.d_Q + m * S.Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
-    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.Q, S.st);
-            gemv_dispatch(S.d_K + m * S.KV, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
-    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.KV, S.st);
-            gemv_dispatch(S.d_V + m * S.KV, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
-    S.d_xi8 + m * S.H, S.d_xi8s + m * (S.H / 16),
-                S.H, S.KV, S.st);
+        // ── Q/K/V projections (BATCHED for all M sequences) ──
+        // Activation buffer d_xi8 is already in batch layout: [M][H] contiguous
+        // Batched GEMV processes all M sequences in one call vs M sequential calls
+        gemv_batched_dispatch(S.d_Q, S.layers[l], S.layers[l].q, S.layers[l].fp16_q,
+            S.d_xi8, S.d_xi8s, S.H, S.Q, M, S.st);
+        gemv_batched_dispatch(S.d_K, S.layers[l], S.layers[l].k, S.layers[l].fp16_k,
+            S.d_xi8, S.d_xi8s, S.H, S.KV, M, S.st);
+        gemv_batched_dispatch(S.d_V, S.layers[l], S.layers[l].v, S.layers[l].fp16_v,
+            S.d_xi8, S.d_xi8s, S.H, S.KV, M, S.st);
 
+        // Update seq_pos for RoPE (single sync for all sequences)
+        blackwell::kernels::update_decode_seq_pos(seq_pos, S.st);
+        cudaStreamSynchronize(S.st);
+
+        // ── Q/K head norms + RoPE + KV cache write (per-sequence) ──
+        for (int m = 0; m < M; m++) {
             // Q/K head norms
             head_norm_kernel<<<S.nqh, 128, 0, S.st>>>(S.d_Q + m * S.Q, S.layers[l].qn, S.nqh, S.hd, S.eps);
             head_norm_kernel<<<S.nkv, 128, 0, S.st>>>(S.d_K + m * S.KV, S.layers[l].kn, S.nkv, S.hd, S.eps);
 
-            // RoPE: update device seq_pos and sync before kernel reads it
-            blackwell::kernels::update_decode_seq_pos(seq_pos, S.st);
-            cudaStreamSynchronize(S.st);
+            // RoPE
             rope_kernel<<<S.nqh, S.hd / 2, 0, S.st>>>(S.d_Q + m * S.Q, S.nqh, S.hd, S.d_seq_pos);
             rope_kernel<<<S.nkv, S.hd / 2, 0, S.st>>>(S.d_K + m * S.KV, S.nkv, S.hd, S.d_seq_pos);
 
@@ -402,15 +404,17 @@ static void batched_decode_step(ServerState& S, int seq_pos) {
                 M, (int)kv_seq_stride, (int)kv_layer_off, S.st);
         }
 
-        // ── Attention output projection + residual 1 (per-sequence) ──
+        // ── Attention output projection (BATCHED for all M sequences) ──
+        // Quantize all M attention outputs, then batched O projection
         for (int m = 0; m < M; m++) {
             blackwell::kernels::quantize_int8(S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16), S.d_attn + m * S.Q, S.Q, S.st);
-            gemv_dispatch(S.d_proj + m * S.H, S.layers[l], S.layers[l].o, S.layers[l].fp16_o,
-    S.d_attn_i8 + m * S.Q, S.d_attn_i8s + m * (S.Q / 16),
-                S.Q, S.H, S.st);
-            // Residual 1: proj = attn_out + input (before RMSNorm)
+        }
+        gemv_batched_dispatch(S.d_proj, S.layers[l], S.layers[l].o, S.layers[l].fp16_o,
+            S.d_attn_i8, S.d_attn_i8s, S.Q, S.H, M, S.st);
+
+        // ── Residual 1 + save (per-sequence) ──
+        for (int m = 0; m < M; m++) {
             blackwell::kernels::vector_add_fp32(S.d_proj + m * S.H, S.d_proj + m * S.H, S.d_residual[m], S.H, S.st);
-            // Save attention output for MLP residual
             cudaMemcpyAsync(S.d_residual[m], S.d_proj + m * S.H, S.H * 4, cudaMemcpyDeviceToDevice, S.st);
         }
 
