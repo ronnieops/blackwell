@@ -146,6 +146,21 @@ echo '{"prompts":["The capital of France is","What is 2+2?"],"max_tokens":20}' |
 | updated_at | 2026-06-09 |
 | session | 64 |
 | branch | default |
-| repo_state | clean |
+| repo_state | clean (2 commits: 60164a5, 208c759) |
 | active_components | INT4 batched benchmark, INT4/INT8 servers |
 | GPU | RTX 5060 Ti, SM_120a, 500 GB/s peak |
+| kernel_count | 179 |
+
+## Session 64 Actions
+
+1. **Fixed AGENTS.md stale entries**:
+   - Kernel count: 177→179
+   - INT8 8B benchmark: Garbled → Coherent
+   - INT4 batched: M>1 crashes → M=4 at 127 t/s coherent
+
+2. **Committed**:
+   - bench/text_generate_int4_batched.cu (127 t/s at M=4)
+   - Batched GEMV kernels (gemv_int4_batched, quantize_int4_batched)
+   - Attention smem fix ((128+4096)*4 vs 4096*4)
+
+3. **Verified**: Batched M=4 coherent at 111 t/s
