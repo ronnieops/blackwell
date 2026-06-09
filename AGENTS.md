@@ -70,7 +70,7 @@ This is NOT a quantization issue — architectural/inference problem.
 
 **CUDA Graph for INT4 (Session 62)**: Captured 648 nodes (36 layers × 18 kernels). Speedup only 1% (63→64 t/s) because `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels without cudaMemcpyAsync.
 
-**Batched INT4 (Session 64/65)**: M=1: 61 t/s, M=2: 110 t/s (batched GEMV kernels). M=3+: OOM. Uses `gemv_int4_batched` even for M=1 (40% faster than single-sequence `gemv_int4_warp`). Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens`.
+**Batched INT4 (Session 64/65)**: M=1: 63 t/s, M=2: 115 t/s, M=4: 148 t/s, M=8: 169 t/s. M=9+: broken (garbage output). MAXSEQ=512 for batched (vs 4096 for single). Uses `gemv_int4_batched` even for M=1 (40% faster than single-sequence `gemv_int4_warp`). Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens`.
 
 **INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 

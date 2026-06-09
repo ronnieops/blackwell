@@ -241,10 +241,10 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
         for (int l = 0; l < NL; ++l) {
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
-            die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "quant_in");
-            die(blackwell::kernels::gemv_int4_warp(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc, H, Q, st), "q_proj");
-            die(blackwell::kernels::gemv_int4_warp(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc, H, KV, st), "k_proj");
-            die(blackwell::kernels::gemv_int4_warp(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc, H, KV, st), "v_proj");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
+            die(blackwell::kernels::gemv_int4_batched(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc, H, Q, 1, st), "q_proj");
+            die(blackwell::kernels::gemv_int4_batched(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc, H, KV, 1, st), "k_proj");
+            die(blackwell::kernels::gemv_int4_batched(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc, H, KV, 1, st), "v_proj");
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
             die(cudaGetLastError(), "head_norm_Q");
             head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
@@ -257,24 +257,24 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
             die(blackwell::kernels::update_kv_cache(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, step, nkv, hd, MAXSEQ, st), "kv");
             die(blackwell::kernels::attention_decode_batched_gqa(d_attn, d_Q, d_kc, d_vc, step, nqh, nkv, hd, MAXSEQ, 1,
                 (size_t)NL*nkv*MAXSEQ*hd, kv_off, st), "attn");
-            die(blackwell::kernels::quantize_int4(d_attn_i4, d_attn_i4_sc, d_attn, Q, st), "quant_attn");
-            die(blackwell::kernels::gemv_int4_warp(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc, Q, H, st), "o_proj");
+            die(blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, st), "quant_attn");
+            die(blackwell::kernels::gemv_int4_batched(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc, Q, H, 1, st), "o_proj");
             die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
-            die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "quant_mlp_in");
-            die(blackwell::kernels::gemv_int4_warp(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc, H, I, st), "gate");
-            die(blackwell::kernels::gemv_int4_warp(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc, H, I, st), "up");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
+            die(blackwell::kernels::gemv_int4_batched(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc, H, I, 1, st), "gate");
+            die(blackwell::kernels::gemv_int4_batched(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc, H, I, 1, st), "up");
             blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
-            blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I, st);
-            die(blackwell::kernels::gemv_int4_warp(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc, I, H, st), "down");
+            die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
+            die(blackwell::kernels::gemv_int4_batched(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc, I, H, 1, st), "down");
             die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "mlp_res");
         }
 
         if (step >= gen_start - 1) {
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
-            die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "quant_lm");
-            die(blackwell::kernels::gemv_int4_warp(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc, H, V, st), "lm_head");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_lm");
+            die(blackwell::kernels::gemv_int4_batched(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc, H, V, 1, st), "lm_head");
 
             // Repetition penalty: penalize recently generated tokens
             if (rep_pen > 1.0f && (int)all_ids.size() > gen_start) {
