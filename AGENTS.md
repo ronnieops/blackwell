@@ -70,7 +70,7 @@ This is NOT a quantization issue — architectural/inference problem.
 
 **CUDA Graph for INT4 (Session 62)**: Captured 648 nodes (36 layers × 18 kernels). Speedup only 1% (63→64 t/s) because `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels without cudaMemcpyAsync.
 
-**Batched INT4 (Session 62)**: M=1 works (56 t/s). M>1 crashes — buffer layout incompatible with batched processing. True batching needs separate Q/K/V buffers per sequence and batched GEMV kernels.
+**Batched INT4 (Session 64/65)**: M=1: 61 t/s, M=2: 110 t/s (batched GEMV kernels). M=3+: OOM. Uses `gemv_int4_batched` even for M=1 (40% faster than single-sequence `gemv_int4_warp`). Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens`.
 
 **INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 
@@ -289,7 +289,8 @@ src/kernels/
 bench/
   text_generate.cu              — 1.7B end-to-end text generation
   text_generate_qwen3_8b.cu     — 8B end-to-end text generation (INT8)
-  text_generate_int4_qwen3_8b.cu — 8B INT4 end-to-end text generation (57 t/s)
+  text_generate_int4_qwen3_8b.cu — 8B INT4 single-sequence text generation (27 t/s)
+  text_generate_int4_batched.cu — 8B INT4 batched text generation (M=1:61t/s, M=2:110t/s)
   text_generate_int4.cu         — 1.7B INT4 text generation
   bench_ppl_int4_8b.cu          — INT4 8B PPL benchmark (PPL 23.52)
   decode_int8_cgraph.cu         — 1.7B M=1 CUDA Graph benchmark
