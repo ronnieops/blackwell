@@ -88,7 +88,7 @@ M=4:148, M=8:168 t/s. Server uses batched kernels (gemv_int4_batched).
 
 | Task | Priority | Notes |
 |------|----------|-------|
-| True batched GEMV (M>1) | MEDIUM | Would need separate Q/K/V buffers per sequence |
+| Fix M=9+ garbage | MEDIUM | Unknown root cause (possibly memory alignment) |
 | INT4 calibration (AWQ) | HIGH | PPL 23→18? potential improvement |
 | 9B quality fix | HIGH | SSM instability root cause unknown |
 
@@ -110,9 +110,9 @@ M=4:148, M=8:168 t/s. Server uses batched kernels (gemv_int4_batched).
 server/inference_server_int4           — INT4 server (2.7 MB)
 server/inference_server_int4_batched  — Batched INT4 server (2.7 MB)
 server/http_subprocess                 — HTTP wrapper
-bench/text_generate_int4_8b           — INT4 benchmark (57 t/s)
+bench/text_generate_int4_qwen3_8b     — Single-seq INT4 benchmark (44 t/s)
+bench/text_generate_int4_batched       — Batched INT4 benchmark (M=1-8)
 bench/bench_ppl_int4_8b               — PPL benchmark (23.52)
-bench/decode_int4_cgraph_8b           — CUDA Graph benchmark
 ```
 
 ### Docker
@@ -152,6 +152,7 @@ curl -X POST http://localhost:8124/v1/completions \
 | Repetition penalty | ✅ Works |
 | smem regression fixed | ✅ Reverted decode.cu |
 | Server batched kernels | ✅ gemv_int4_batched (M=1) |
+| Server=benchmark match | ✅ Output identical |
 | INT8 8B server | ❌ Broken (CUDA Graph) |
 | 8B dims verified | nqh=32, nkv=8, hd=128, KV=1024 ✅ |
 
@@ -166,7 +167,7 @@ curl -X POST http://localhost:8124/v1/completions \
 | repo_state | Clean (pushed to origin) |
 | session | 65 (smem regression fixed, batched benchmark restored) |
 | key_finding | Batched INT4: M=1:63, M=2:115, M=4:148, M=8:168 t/s. Server uses batched kernels. Session 64 smem fix `((128+4096)*4)` broke output — reverted. |
-| next_priority | Fix M=9+ garbage, investigate smem divergence, or INT4 calibration |
+| next_priority | Fix M=9+ garbage, INT4 calibration, or investigate smem divergence |
 
 **BUG FIX (Session 65)**: Session 64 smem fix `((128+4096)*4` caused INT4 output
 divergence ("is is is is is is"). Reverted `src/kernels/decode.cu` to session 63
