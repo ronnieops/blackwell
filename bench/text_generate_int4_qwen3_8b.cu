@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     }else{
         input_ids=tokenizer.encode(prompt);
     }
-    printf("Input: %zu tokens\n\n", input_ids.size());
+    printf("Input: %zu tokens\n", input_ids.size());
 
     // Device buffers
     float *d_x32, *d_xi_f, *d_res;
@@ -301,9 +301,13 @@ int main(int argc, char** argv) {
 
             // Down projection
             die(blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc,I,H,st),"down");
+            die(blackwell::kernels::gemv_int4_warp(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc,H,I,st),"gate");
+            die(blackwell::kernels::gemv_int4_warp(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc,H,I,st),"up");
 
             // MLP residual: d_x32 = d_proj + d_res (pre-MLP state)
-            die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");        }
+            die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");
+            
+        }
 
         // Final norm + lm_head + GPU sampling
         if(step>=gen_start-1){
@@ -312,6 +316,10 @@ int main(int argc, char** argv) {
             die(blackwell::kernels::quantize_int4(d_x_i4,d_x_i4_sc,d_xi_f,H,st),"quant_lm");
 
             die(blackwell::kernels::gemv_int4_warp(d_logits,(const uint8_t*)d_x_i4,d_x_i4_sc,lm_head_w.d,lm_head_w.sc,H,V,st),"lm_head");
+            float l0,l264,l37018;
+            cudaMemcpy(&l0,d_logits,4,cudaMemcpyDeviceToHost);
+            cudaMemcpy(&l264,d_logits+264,4,cudaMemcpyDeviceToHost);
+            cudaMemcpy(&l37018,d_logits+37018,4,cudaMemcpyDeviceToHost);
             int next_id;
             die(blackwell::kernels::sample_gpu(d_logits,V,temperature,top_k,d_next_id,0xdeadbeefLL,step,st),"sample");
             die(cudaMemcpy(&next_id,d_next_id,4,cudaMemcpyDeviceToHost),"copy");

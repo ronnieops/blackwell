@@ -354,24 +354,37 @@ int main(int argc, char** argv) {
             printf("{\"error\":\"no prompts\"}\n"); fflush(stdout); continue;
         }
 
-        // Process first prompt (M=1)
-        auto input_ids = tokenizer.encode(str_prompts[0]);
+        // Process all prompts sequentially
         float rep_pen = parse_repetition_penalty(line, 1.5f);
-        auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen);
-
-        // Decode tokens
-        std::string text;
-        for (auto id : gen_tokens) text += tokenizer.decode(id);
+        std::vector<std::vector<uint32_t>> all_gen_tokens;
+        std::vector<std::string> all_texts;
+        
+        for (size_t pi = 0; pi < str_prompts.size(); pi++) {
+            auto input_ids = tokenizer.encode(str_prompts[pi]);
+            auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen);
+            std::string text;
+            for (auto id : gen_tokens) text += tokenizer.decode(id);
+            all_gen_tokens.push_back(std::move(gen_tokens));
+            all_texts.push_back(std::move(text));
+        }
 
         // Output JSON
-        printf("{\"tokens\":[[");
-        for (size_t i = 0; i < gen_tokens.size(); i++) {
-            if (i) printf(",");
-            printf("%u", gen_tokens[i]);
+        printf("{\"tokens\":[");
+        for (size_t pi = 0; pi < all_gen_tokens.size(); pi++) {
+            if (pi) printf(",");
+            printf("[");
+            for (size_t i = 0; i < all_gen_tokens[pi].size(); i++) {
+                if (i) printf(",");
+                printf("%u", all_gen_tokens[pi][i]);
+            }
+            printf("]");
         }
-        printf("]],\"text\":[\"");
-        printf("%s", json_escape(text).c_str());
-        printf("\"]}\n"); fflush(stdout);
+        printf("],\"text\":[");
+        for (size_t pi = 0; pi < all_texts.size(); pi++) {
+            if (pi) printf(",");
+            printf("\"%s\"", json_escape(all_texts[pi]).c_str());
+        }
+        printf("]}\n"); fflush(stdout);
     }
     return 0;
 }

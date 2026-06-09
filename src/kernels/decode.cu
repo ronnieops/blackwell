@@ -300,7 +300,7 @@ cudaError_t attention_decode(
                         cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) return e;
 
-    constexpr int smem_bytes = 4096 * 4;  // 16 KB for scores (4096 positions)
+    constexpr int smem_bytes = (128 + 4096) * 4;  // head_dim + MAXSEQ scores
     if (smem_attr_set == 0) {
         int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
         if (old == 0) {
@@ -336,7 +336,7 @@ cudaError_t attention_decode_gqa(
                         cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) return e;
 
-    constexpr int smem_bytes = 4096 * 4;
+    constexpr int smem_bytes = (128 + 4096) * 4;  // head_dim + MAXSEQ scores
     if (smem_attr_set == 0) {
         int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
         if (old == 0) {
@@ -378,7 +378,7 @@ __global__ void attn_batched_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K_cache_base,
     const float* __restrict__ V_cache_base,
-    const int* seq_pos_ptr,
+    int seq_pos,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -395,7 +395,6 @@ __global__ void attn_batched_kernel(
     if (head >= num_q_heads) return;
 
     int kv_head = head * num_kv_heads / num_q_heads;
-    int seq_pos = *seq_pos_ptr;
 
     // Point to this (seq, head) pair's data
     const float* K_cache = K_cache_base + seq_id * kv_batch_elems + kv_layer_elems
@@ -476,12 +475,9 @@ cudaError_t attention_decode_batched_gqa(
     cudaError_t e;
     e = alloc_seq_pos();
     if (e != cudaSuccess) return e;
-    write_seq_pos(seq_pos);
-    e = cudaMemcpyAsync(d_seq_pos_global, h_seq_pos_pinned, sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-    if (e != cudaSuccess) return e;
+    // seq_pos passed directly as kernel argument — no host→device copy needed
 
-    constexpr int smem_bytes = 4096 * 4;
+    constexpr int smem_bytes = (128 + 4096) * 4;  // head_dim + MAXSEQ scores
     if (smem_attr_set == 0) {
         int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
         if (old == 0) {
@@ -489,7 +485,6 @@ cudaError_t attention_decode_batched_gqa(
                 attn_batched_kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 smem_bytes);
-            // Also set for attention_decode_kernel (may not have been triggered)
             cudaFuncSetAttribute(
                 attention_decode_kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -503,7 +498,7 @@ cudaError_t attention_decode_batched_gqa(
     attn_batched_kernel<<<
         dim3(total_blocks), dim3(128), smem_bytes, stream>>>(
         output, Q, K_cache, V_cache,
-        d_seq_pos_global, num_q_heads, num_kv_heads,
+        seq_pos, num_q_heads, num_kv_heads,
         head_dim, max_seq_len, scale,
         M, kv_batch_elems, kv_layer_elems);
 

@@ -752,6 +752,17 @@ cudaError_t quantize_int4(
     int             K,
     cudaStream_t    stream = 0);
 
+// Batched INT4 quantization for M sequences
+// x_out_packed: [M][K/2] packed INT4, x_out_sc: [M][K/16] scales
+// in_fp32: [M][K] FP32 input
+cudaError_t quantize_int4_batched(
+    void*           x_out_packed,
+    float*          x_out_sc,
+    const float*    in_fp32,
+    int             K,
+    int             M,
+    cudaStream_t    stream = 0);
+
 // Fused SwiGLU + INT4 quant — replaces apply_swiglu + quantize_int4 (2→1 kernel)
 cudaError_t fused_swiglu_quant_int4(
     uint8_t* out_packed,

@@ -277,7 +277,8 @@ int main(int argc, char** argv) {
             // KV cache + attention
             size_t kv_off=(size_t)l*nkv*MAXSEQ*hd;
             die(blackwell::kernels::update_kv_cache(d_kc+kv_off,d_vc+kv_off,d_K,d_V,0,step,nkv,hd,MAXSEQ,st),"kv");
-            die(blackwell::kernels::attention_decode_gqa(d_attn,d_Q,d_kc,d_vc,step,nqh,nkv,hd,MAXSEQ,st),"attn");
+            die(blackwell::kernels::attention_decode_batched_gqa(d_attn,d_Q,d_kc,d_vc,step,nqh,nkv,hd,MAXSEQ,1,
+                (size_t)NL*nkv*MAXSEQ*hd,kv_off,st),"attn");
 
             // Wo projection
             die(blackwell::kernels::quantize_int8(d_attn_i8,d_attn_s,d_attn,Q,st),"quant_attn");
@@ -285,6 +286,7 @@ int main(int argc, char** argv) {
 
             // Residual + norm for next
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"attn_res");
+
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res2");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_post,H,eps,st),"rmsnorm_post");
             die(blackwell::kernels::quantize_int8(d_x_i8,d_x_s,d_xi_f,H,st),"quant_mlp_in");
@@ -293,11 +295,13 @@ int main(int argc, char** argv) {
             die(blackwell::kernels::gemv_int8_warp(d_gate,d_x_i8,d_x_s,W[l].g.d,W[l].g.sc,H,I,st),"gate");
             die(blackwell::kernels::gemv_int8_warp(d_up,d_x_i8,d_x_s,W[l].u.d,W[l].u.sc,H,I,st),"up");
 
-            // Fused SwiGLU + quant
-            die(blackwell::kernels::fused_swiglu_quant(d_mlp_i8,d_mlp_s,d_gate,d_up,I,st),"swiglu");
+            // SwiGLU + quant (separate to ensure all scales are computed)
+            blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
+            die(blackwell::kernels::quantize_int8(d_mlp_i8, d_mlp_s, d_gate, I, st),"quant_mlp");
 
             // Down projection
             die(blackwell::kernels::gemv_int8_warp(d_proj,d_mlp_i8,d_mlp_s,W[l].d.d,W[l].d.sc,I,H,st),"down");
+
 
             // MLP residual
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");

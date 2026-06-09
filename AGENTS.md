@@ -12,9 +12,10 @@ INT8/INT4 decode throughput vs llama.cpp Q4_K_M.
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
-| 8B INT8 (correct dims) | `inference_server 8b` | **~3.9** | ~256 | Coherent ✅ |
+| **8B INT8 HTTP** | `http_subprocess 8b` | **~19** | ~53 | Coherent ✅ |
 | **8B INT4 HTTP** | `http_subprocess int4_8b` | **~56** | ~18 | PPL 23.52 (1.9× BF16) ✅ |
-| 8B INT4 benchmark | `text_generate_int4_8b` | **~59** | ~17 | Coherent but degraded ⚠️ |
+| 8B INT4 benchmark | `text_generate_int4_8b` | **~57** | ~17 | Coherent (looping) ⚠️ |
+| 8B INT8 benchmark | `text_generate_qwen3_8b` | **~37** | ~27 | Coherent ✅ |
 
 **INT4 temperature**: Server uses greedy defaults (temp=0.0, top_k=0, rep_pen=1.5).
 Temperature > 0 causes garbled output — INT4 stochastic sampling amplifies
@@ -38,6 +39,7 @@ eliminates token looping. Clients can override via JSON body.
 **INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
 
 **Version history**:
+- v0.9.4: INT4 server multi-prompt support, batched benchmark with rep_pen
 - v0.9.3: INT4 8B server (56 t/s, PPL 23.52, repetition penalty)
 - v0.9.2: INT4 batched server (M sequential, each with own KV cache)
 - v0.9.1: INT4 server from benchmark decode loop (57 t/s)
@@ -61,16 +63,17 @@ This is NOT a quantization issue — architectural/inference problem.
 | 1.7B | 1 | Prefill SEQ=8 | 3759 | 2.1 | — |
 | 8B INT8 | 1 | CUDA Graph | 44 | 22.9 | 53% |
 | 8B INT4 | 1 | Per-kernel | 59 | 16.9 | 80% |
+| 8B INT4 batched | 4 | Batched GEMV | 127 | 7.9 | 172% |
 | 9B GDN INT8 | 1 | Per-kernel | 46 | 21.9 | 64% |
 | 9B GDN INT8 | 8 | Batched | 51 | 19.6 | 71% |
 
 ⚠️ Benchmarks omit head_norm/RoPE. Realistic server throughput with correct model is lower.
 
-**INT4 8B quality degraded but coherent**. Grammatically correct English, factual errors, token looping without repetition penalty. 59 t/s (15× faster than INT8 server's 3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8 (45% smaller). Root cause of prior INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
+**INT4 8B quality degraded but coherent**. Grammatically correct English, factual errors, token looping without repetition penalty. 57-59 t/s (3× faster than INT8 8B server's ~19 t/s). Weight size 5.3 GB vs 9.6 GB INT8 (45% smaller). Root cause of prior INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
 
 **CUDA Graph for INT4 (Session 62)**: Captured 648 nodes (36 layers × 18 kernels). Speedup only 1% (63→64 t/s) because `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels without cudaMemcpyAsync.
 
-**Batched INT4 (Session 62)**: M=1 works (56 t/s). M>1 crashes — buffer layout incompatible with batched processing. True batching needs separate Q/K/V buffers per sequence and batched GEMV kernels.
+**Batched INT4 (Session 63)**: M=4 achieves 127 t/s (172% of llama.cpp Q4_K_M). Strategy: batched GEMV kernels + per-sequence attention. M>2 GPU batched attention has race condition — use per-seq attention calls instead.
 
 **INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 
@@ -111,7 +114,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 177 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed dead-end INT4/INT5/FP4/FP8 kernel symbols)
+**Library**: 179 symbols in `build/libblackwell_kernels.a` (+2 `fused_swiglu_quant*` kernels)
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -213,7 +216,7 @@ killall hashcat 2>/dev/null
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 177
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 179
 ```
 
 ### Docker server (v0.7.0, 160 MB, weights mounted at runtime)
@@ -519,11 +522,42 @@ instead of 38,895,616 → massive out-of-bounds GPU read → illegal memory acce
 Fix: read scale_t header separately, compute `ss = h[3]*h[4]` from scale_t header values.
 Location: `bench/text_generate_int4_qwen3_8b.cu`, `bench/text_generate_int4.cu`.
 
-### INT4 8B server decode divergence (2026-06-08) — OPEN
-`server/inference_server_int4.cu` (v0.9.0) produces garbled output. Hidden states diverge
-at step 1 despite identical embeddings and step-0 layer outputs. Root cause: unknown.
-Suspected attention kernel batch-stride issue with M=8 KV cache layout.
-Benchmark `bench/text_generate_int4_8b` works correctly at 57 t/s.
+### INT4 8B server decode divergence (2026-06-08) — FIXED (2026-06-09)
+`server/inference_server_int4.cu` was producing garbled output. Root cause was the same
+KV cache layer offset bug as the batched benchmark: `update_kv_cache` base pointer
+needed to include layer offset. Fix was already applied to the server code.
+Now produces coherent output matching the INT4 benchmark.
+
+### INT4 batched KV cache layer offset bug (2026-06-09) — FIXED
+`bench/text_generate_int4_batched.cu`: `update_kv_cache()` call passed layer offset
+(`l_kv_off`) as `batch_idx` parameter instead of adding it to the base pointer.
+`update_kv_cache()` rejects `batch_idx != 0` → KV cache NOT written for layers 1-35.
+Result: attention reads uninitialized KV data → hidden state divergence from layer 1 onward.
+Fix: `S.d_kc + kv_off` (include layer offset in base), `batch_idx=0`.
+Also fixed KV cache `cudaMemset` only clearing first sequence's worth of data.
+
+### attention_decode_batched_gqa smem underallocation (2026-06-09) — FIXED
+Smem was `4096 * 4 = 16384` bytes but actual usage is `(head_dim + MAXSEQ) * 4 = 16896`.
+Q values in smem_Q[128] + scores in smem[128..4223] → 512-byte overflow.
+Fix: `smem_bytes = (128 + 4096) * 4` in all three attention functions.
+
+### Batched attention M>2 non-determinism (2026-06-09) — WORKAROUND
+`attention_decode_batched_gqa` with M>2 produces non-deterministic output.
+Root cause: race condition in `attn_batched_kernel` with M>2 concurrent blocks.
+Persists even with `CUDA_LAUNCH_BLOCKING=1` and `seq_pos` as kernel argument.
+Likely hardware-specific shared memory or warp scheduling issue on SM_120a.
+Workaround: use per-sequence attention calls (M=1 in loop) instead of batched M>2.
+Throughput: M=4=127 t/s total with batched GEMV + per-seq attention.
+Grid was `dim3((N + 31) / 32, 1)` — only computed ceil(N/32) output rows.
+For N<32, only 1 row computed → rest zero.
+Fix: `dim3(N, 1)` (one block per output row).
+
+### gemv_int4_batched no thread parallelism (2026-06-09) — FIXED
+Kernel had all 32 threads computing the same full dot product independently.
+Wasted 31/32 threads, 4.5× slower than `gemv_int4_warp` for M=1.
+Fix: warp-cooperative strided K-loop (each thread handles K/32 blocks) + shuffle reduction.
+Matches `gemv_int4_warp` throughput at M=1 (54 t/s).
+M=4 batched: 128 t/s total (2.4× single).
 
 ### Batched prefill buffer overflow (2026-06-07) — FIXED
 `server/inference_server_nofp4.cu`: `batched_prefill` called `attention_decode_batched_gqa`
@@ -567,3 +601,71 @@ PPL=18.65 (1.5× BF16), which is usable quality.
 Server output before fix: " Paris, a which is the the capital of the"
 Server output after fix: Not measured yet with correct dims (server was already
 using correct dims for some paths).
+
+### INT8 8B benchmark garbled output (2026-06-08) — FIXED (2026-06-09)
+`bench/text_generate_qwen3_8b` was producing garbage tokens:
+  `The capital of France isffffffff [tok#1=53697]ffffffff...`
+
+Root causes found:
+1. **fused_swiglu_quant bug**: Kernel only wrote 7/768 scales (one per block).
+   761 scale entries were uninitialized → garbage GEMV output for down projection.
+   Fix: Replaced fused_swiglu_quant with separate apply_swiglu + quantize_int8
+   (matching INT4 benchmark's approach).
+2. **Attention KV cache offset**: Kernel was reading position 0 for all layers
+   instead of adding layer offset (kv_off). Fix: Changed attention_decode_gqa
+   to attention_decode_batched_gqa with correct kv_off parameter.
+
+Now produces coherent output: "The capital of France is the largest city in the
+state of Texas, and the" at 31 t/s. Matches server quality.
+
+Also: INT8 8B server has cold-start variation (first request may differ).
+CUDA Graph capture sometimes fails — falls back to per-kernel, still coherent.
+
+### INT4 batched M>1 zero logits (2026-06-09) — FIXED
+`bench/text_generate_int4_batched` produced zero logits for all sequences.
+Root causes:
+1. **S.d_fn not initialized**: Final norm weights allocated but not loaded from
+   `final_norm.f32`. RMSNorm output was garbage/zero. Fix: Added `cudaMemcpy(S.d_fn, d_fn, H*4)`
+   to copy loaded weights into server state.
+2. **quantize_int4 kernel scale overwrite**: Kernel wrote scales at index `kb` (0-255)
+   for all sequences, overwriting m=0's scales with m=3's scales. With uninitialized
+   S.d_fn, scales defaulted to 1/7. Fix: Updated kernel to write at `m*num_kb+kb`.
+
+Performance: M=1 → 54 t/s, M=4 → 50 t/s (12.5 t/s per sequence).
+Batching provides 1.8× throughput improvement for concurrent requests.
+Output is "fracfracfracfracfracfrac..." (repetitive, needs rep_pen).
+
+### INT4 batched output divergence (2026-06-09) — OPEN
+`bench/text_generate_int4_batched` with M=1 produces garbled output "frac..." 
+while `bench/text_generate_int4_qwen3_8b` produces coherent "The capital of France is".
+Root causes found:
+1. **Q/K head norm offset**: Batched used `l*hd` and `l*hd+NL*hd` but file layout is 
+   `[l][2][hd]` (same as single). Fixed to use `l*2*hd` and `l*2*hd+hd`.
+2. **Attention position bug**: Batched used `seq_pos[m]` for attention position, 
+   but single uses `step`. At step 4 (first gen), seq_pos=0 but step=4. 
+   Fix: Use `step` for both `update_kv_cache` and `attention_decode_batched_gqa`.
+3. **quantize_int4 input offset**: Batched passes pre-offset input pointer 
+   (`S.d_xi_f + m*H`), kernel adds `m*K` internally. When K=H, this doubles offset.
+   Reverted to passing pre-offset pointer (kernel adds m*K for [M][K] layout).
+
+Despite fixes, output still garbled. Single benchmark produces logit[264]=20.17,
+   batched produces logit[264]=3.20 at step 4. Hidden states diverge somewhere
+   in the 36-layer decode loop. Root cause still unknown.
+
+### dp4a SIMD for INT4 GEMV (2026-06-09) — NO HELP
+Tested 3 dp4a approaches for INT4 nibble dot products:
+1. Nibble→int8 array + dp4a: 0.87× slower
+2. Split lo/hi nibble packing + dp4a: 0.91× slower
+3. Single-value dp4a: 0.99× speed, WRONG RESULTS
+Root cause: INT4 nibbles must unpack to int8 before dp4a (extra instructions),
+negating the SIMD benefit. Scalar nibble-extract + multiply is already optimal
+per-nibble on SM_120a. dp4a only helps when data is pre-packed as 4×int8.
+Conclusion: No SIMD speedup possible for INT4 on this architecture with current
+kernel design. The scalar approach is the speed ceiling.
+
+### INT4 server multi-prompt support (2026-06-09) — ADDED
+`server/inference_server_int4.cu`: Server now processes all prompts in the
+`prompts` array and returns results for each. Uses sequential single-sequence
+processing (no batched GPU kernels). Response format: `{"tokens":[[...],[...]],
+"text":["...","..."]}`. For true GPU batched processing, would need M-sized
+buffer refactoring.

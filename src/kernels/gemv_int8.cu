@@ -899,6 +899,122 @@ cudaError_t gemv_int4_warp(
     return cudaPeekAtLastError();
 }
 
+// ===========================================================================
+// Batched INT4 GEMV — processes M sequences in parallel
+// Weight loaded once per K-block, reused across M tokens via template.
+// ===========================================================================
+namespace {
+
+constexpr int kINT4Block = 32;  // threads per block (1 warp)
+
+// Batched INT4 GEMV: M sequences × same weight matrix in one kernel launch.
+// Grid: N blocks, 32 threads/block (1 warp). Each warp computes 1 output row
+// for all M sequences. Weight loaded once, reused across M activations.
+template <int M>
+__launch_bounds__(32, 8)
+__global__ void gemv_int4_batched_kernel(
+    float* __restrict__ y_out,            // [M][N] output
+    const uint8_t* __restrict__ x_packed,  // [M][K/2] packed INT4 activations
+    const float* __restrict__ x_scale,    // [M][K/16] activation scales
+    const uint8_t* __restrict__ W_packed, // [N][K/2] packed INT4 weights
+    const float* __restrict__ W_scale,    // [N][K/16] weight scales
+    int K, int N)
+{
+    constexpr int B = 16;    // quantization block size
+    constexpr int PB = 8;    // packed bytes per block (B/2)
+    int n_out = blockIdx.x;
+    if (n_out >= N) return;
+    int tid = threadIdx.x;
+
+    int num_K_blks = K / B;
+
+    // Accumulators for M tokens (template unroll for M=1..8)
+    float acc[M];
+    #pragma unroll
+    for (int mi = 0; mi < M; ++mi) acc[mi] = 0.0f;
+
+    // Stride-32 loop: each thread handles scattered K-blocks
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 8 packed bytes = 16 INT4 values from weight row (shared across M)
+        const uint8_t* w_ptr = &W_packed[(size_t)n_out * (K / 2) + kb * PB];
+        uint2 w_packed = *reinterpret_cast<const uint2*>(w_ptr);
+        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+
+        // Load activation for each of M tokens (strided access)
+        #pragma unroll
+        for (int mi = 0; mi < M; ++mi) {
+            const uint8_t* x_ptr = &x_packed[(size_t)mi * (K / 2) + kb * PB];
+            uint2 x_packed_val = *reinterpret_cast<const uint2*>(x_ptr);
+            float x_sc = x_scale[(size_t)mi * num_K_blks + kb];
+            float prod_scale = w_sc * x_sc;
+
+            // Scalar unpack + dot product
+            const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w_packed);
+            const uint8_t* xb = reinterpret_cast<const uint8_t*>(&x_packed_val);
+
+            float sum_f = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < PB; ++j) {
+                float w0, w1, x0, x1;
+                int4_byte_to_floats(wb[j], w0, w1);
+                int4_byte_to_floats(xb[j], x0, x1);
+                sum_f += w0 * x0 + w1 * x1;
+            }
+            acc[mi] += sum_f * prod_scale;
+        }
+    }
+
+    // Warp shuffle reduction for each of M accumulators
+    #pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+        acc[mi] += __shfl_xor_sync(0xffffffff, acc[mi], 16);
+        acc[mi] += __shfl_xor_sync(0xffffffff, acc[mi], 8);
+        acc[mi] += __shfl_xor_sync(0xffffffff, acc[mi], 4);
+        acc[mi] += __shfl_xor_sync(0xffffffff, acc[mi], 2);
+        acc[mi] += __shfl_xor_sync(0xffffffff, acc[mi], 1);
+    }
+
+    // Thread 0 writes all M outputs
+    if (tid == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < M; ++mi) {
+            y_out[(size_t)mi * N + n_out] = acc[mi];
+        }
+    }
+}
+
+}  // anonymous namespace
+
+cudaError_t gemv_int4_batched(
+    float*          y_out,
+    const uint8_t*  x_packed,
+    const float*    x_scale,
+    const uint8_t*  W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 8)
+        return cudaErrorInvalidValue;
+
+    dim3 grid(N, 1);
+
+    switch (M) {
+        case 1: gemv_int4_batched_kernel<1><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 2: gemv_int4_batched_kernel<2><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 3: gemv_int4_batched_kernel<3><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 4: gemv_int4_batched_kernel<4><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 5: gemv_int4_batched_kernel<5><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 6: gemv_int4_batched_kernel<6><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 7: gemv_int4_batched_kernel<7><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 8: gemv_int4_batched_kernel<8><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaPeekAtLastError();
+}
+
 cudaError_t gemv_int8_from_fp4(
     float*          y_out,
     const void*     x_fp4,
@@ -1505,32 +1621,39 @@ __global__ void quantize_int4_kernel(
     uint8_t* __restrict__ x_out,
     float* __restrict__ x_sc,
     const float* __restrict__ in_fp32,
-    int K)
+    int K,
+    int M)  // batch size (scales laid out as [M][K/16])
 {
     constexpr int B = 16;
     int kb = blockIdx.x;
     int num_kb = K / B;
     if (kb >= num_kb) return;
-
+    
+    // Sequence index from grid y dimension (for M>1 batches)
+    int m = (gridDim.y > 1) ? blockIdx.y : 0;
     int off = kb * B;
+    
+    // Compute scales from input
     float absmax = 0.f;
     for (int i = 0; i < B; ++i) {
-        float v = fabsf(in_fp32[off + i]);
+        float v = fabsf(in_fp32[m * K + off + i]);
         if (v > absmax) absmax = v;
     }
     float sc = (absmax > 1e-10f) ? (absmax / 7.f) : (1.f / 7.f);
-    x_sc[kb] = sc;
+    
+    // Write scale at correct position for batched layout
+    x_sc[m * num_kb + kb] = sc;
 
     for (int i = 0; i < B / 2; ++i) {
-        float v0 = in_fp32[off + i * 2];
-        float v1 = in_fp32[off + i * 2 + 1];
+        float v0 = in_fp32[m * K + off + i * 2];
+        float v1 = in_fp32[m * K + off + i * 2 + 1];
         int q0 = (int)roundf(v0 / sc);
         int q1 = (int)roundf(v1 / sc);
         q0 = max(-8, min(7, q0));
         q1 = max(-8, min(7, q1));
         uint8_t nib0 = (uint8_t)((q0 + 8) & 0x0F);
         uint8_t nib1 = (uint8_t)((q1 + 8) & 0x0F);
-        x_out[kb * (B / 2) + i] = nib0 | (nib1 << 4);
+        x_out[m * (K / 2) + kb * (B / 2) + i] = nib0 | (nib1 << 4);
     }
 }
 
@@ -1541,12 +1664,34 @@ cudaError_t quantize_int4(
     int             K,
     cudaStream_t    stream)
 {
+    // For backward compatibility with M=1 (no batch dimension)
     int num_kb = K / 16;
-    quantize_int4_kernel<<<num_kb, 1, 0, stream>>>(
+    quantize_int4_kernel<<<dim3(num_kb, 1), 1, 0, stream>>>(
         static_cast<uint8_t*>(x_out_packed),
         x_out_sc,
         in_fp32,
-        K);
+        K,
+        1);  // M=1
+    return cudaPeekAtLastError();
+}
+
+cudaError_t quantize_int4_batched(
+    void*           x_out_packed,
+    float*          x_out_sc,
+    const float*    in_fp32,
+    int             K,
+    int             M,
+    cudaStream_t    stream)
+{
+    // Batched version: scales are [M][K/16], activations are [M][K]
+    int num_kb = K / 16;
+    dim3 grid(num_kb, M);  // [num_kb, M] blocks
+    quantize_int4_kernel<<<grid, 1, 0, stream>>>(
+        static_cast<uint8_t*>(x_out_packed),
+        x_out_sc,
+        in_fp32,
+        K,
+        M);
     return cudaPeekAtLastError();
 }
 
