@@ -1,166 +1,192 @@
-# HANDOFF.md — blackwell CUDA inference
+# HANDOFF.md — blackwell
 
-## META PROMPT
-At session start, read `AGENTS.md` then `HANDOFF.md`. Both required.
-Verify repo state (`git status`, `nm build/libblackwell_kernels.a | c++filt | wc -l`) before any edits.
-Work incrementally — don't restart analysis from scratch.
-Presume prior sessions produced correct results unless contradicted by current evidence.
-Keep updates concise. Remove stale info when superseding.
+Read `AGENTS.md` AND this file before acting.
 
 ---
 
-## Current Objective
-INT4 8B batched throughput. INT8 8B production path stable.
+## 1. Current Objective
+
+INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
+14× faster than INT8 server (3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8.
+
+**Session 63 fixes**:
+1. http_subprocess defaulted to temperature=0.7f → garbled output. Fixed to
+   temperature=0.0f (greedy) to match benchmark behavior.
+2. Added repetition_penalty support: all 4 request handlers now send
+   rep_pen=1.5 by default. Server apply_repetition_penalty kernel uses it.
+   Clients can override via JSON body. Eliminates token looping.
+3. Docker image built: blackwell-server:int4 (148 MB, tested ✅)
 
 ---
 
-## Current Status (2026-06-09)
+## 2. Current Status
 
-### Production ✅
-| Path | Throughput | Quality | Notes |
-|------|------------|---------|-------|
-| INT4 8B server | 56 t/s | PPL 23.52, coherent | rep_pen=1.5, temp=0.0, warmup |
-| INT8 8B server | ~19 t/s | Coherent | Same kernel path as INT4 |
-| INT4 8B batched benchmark | **127 t/s at M=4** | Coherent | rep_pen=1.3, per-seq attention |
-| INT4 8B single benchmark | 54 t/s | Coherent | rep_pen=1.3 |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| INT4 8B HTTP server | ✅ Production | `http_subprocess int4_8b`, 56 t/s |
+| INT4 batched server | ✅ Works | M prompts processed sequentially with own KV cache |
+| INT4 benchmark | ✅ 57 t/s | `bench/text_generate_int4_8b` |
+| INT4 PPL benchmark | ✅ PPL 23.52 | `bench/bench_ppl_int4_8b` |
+| Repetition penalty | ✅ Works | Reduces token looping |
+| CUDA Graph | ⚠️ 1% gain | `cudaMemcpyAsync` in attention blocks capture |
+| Docker | ✅ Built | `blackwell-server:int4` (148 MB) |
+| Build | ✅ 177 kernels | `libblackwell_kernels.a` |
+| INT8 server | ✅ Works | 8B: 3.9 t/s, 1.7B: 23 t/s |
 
-### Blocked ⛔
-| Path | Blocker |
-|------|---------|
-| 9B quality | SSM instability (A_log > 0 → exponential growth) |
+### PPL Quality (8B)
 
----
-
-## Batched INT4 Architecture
-
-**Strategy**: Batch GEMV kernels + per-sequence attention (M=1 in loop).
-- Batched: `gemv_int4_batched`, `fused_rmsnorm_batched`, `quantize_int4_batched`
-- Per-seq: `attention_decode_batched_gqa`, `update_kv_cache`
-- No GPU batched attention (race condition with M>2)
-
-**Throughput by M**:
-| M | Total t/s | Per-seq t/s | Notes |
-|---|-----------|-------------|-------|
-| 1 | 54 | 54 | baseline |
-| 2 | 99 | 49.5 | 0.92× per-seq |
-| 4 | 127 | 31.8 | 0.59× per-seq |
-| 8 | 143 | 17.9 | 0.33× per-seq |
-
-**KV cache layout**: `[M][NL][nkv][MAXSEQ][hd]` — separate per sequence.
+| Config | PPL | vs BF16 |
+|--------|-----|---------|
+| BF16 (llama.cpp Q8_0) | **12.4** | 1.0× |
+| INT8 block-16 | **18.65** | 1.5× |
+| INT4 symmetric | **23.52** | 1.9× |
 
 ---
 
-## Verified Measurements
+## 3. Recent Decisions
 
-- **dp4a SIMD**: NO HELP for INT4 (0.87-0.99×). Root cause: nibble→int8 unpack negates SIMD benefit.
-- **CUDA Graph overhead**: 1.38 μs/launch. ~750 launches at M=1 = 1ms (5.6%). ~1000 at M=4 = 1.4ms (18%).
-- **GEMV breakdown**: lm_head=1.1ms (6%), layer GEMVs=12.6ms (68%), attention+other=4.8ms (26%).
-- **Kernel count**: 179 in `libblackwell_kernels.a`.
-
----
-
-## Recent Decisions
-
-- **Per-seq attention over batched**: M>2 batched attention has race condition. Use M=1 loop instead.
-- **rep_pen=1.3 for INT4**: Moderate repetition penalty eliminates token looping.
-- **CUDA Graph deferred**: Needs complex parameter updates (cudaGraphExecKernelNodeSetParams). 18% gain at M=4 but high complexity.
-- **dp4a abandoned**: Scalar nibble-extract is optimal for INT4 on SM_120a.
-- **Server multi-prompt**: Sequential processing of all prompts (not GPU batched).
+- **INT4 8B is production viable**: 56 t/s (14× faster than INT8), coherent output, PPL 23.52
+- **INT4 batched**: M prompts processed sequentially with own KV cache. M=1 works perfectly. M>1 crashes in original design — fixed by sequential processing.
+- **CUDA Graph limited**: 1% speedup. Root cause: `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels.
+- **Repetition penalty added**: Works at 56 t/s, reduces token looping
+- **Docker image built**: `blackwell-server:int4` (148 MB)
+- **Dead code removed**: 8 stale benchmark files (FP8, INT5, FP4)
+- **upload_w4 scale buffer bug FIXED**: Root cause of all INT4 crashes. `ss = h[3]*h[4]` from int4_t header (256) instead of scale_t header (38.9M for lm_head)
 
 ---
 
-## Known Issues / Risks
+## 4. Important Constraints
 
-| Issue | Severity | Workaround |
-|-------|----------|------------|
-| Batched attention M>2 race | Medium | Per-seq attention calls |
-| 9B SSM instability | High | Blocked — architectural |
-| CUDA Graph deferred | Low | Per-kernel fast enough |
-| Server no GPU batching | Low | Sequential prompts sufficient |
-
----
-
-## Pending Tasks
-
-1. **True GPU batched attention** — Fix race condition for M>2 (hard, needs GPU debugging)
-2. **CUDA Graph integration** — 18% gain at M=4 (complex, deferred)
-3. **9B SSM fix** — Architectural (blocked)
+- **CORRECT 8B DIMS: nqh=32, nkv=8, hd=128, KV=1024**
+- **CORRECT 1.7B DIMS: nqh=16, nkv=8, hd=128, KV=1024**
+- `compute_120a` required (NOT `compute_120`)
+- `killall hashcat` before every measurement
+- INT4 is symmetric (no zero point): `nib - 8` for signed values
+- INT4 activation quantization: `sc = max(1e-10, absmax)/7`, `q = clamp(round(v/sc), -7, 7)`
 
 ---
 
-## Important Files
+## 5. Known Issues / Risks
 
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| CUDA Graph limited | MEDIUM | Attention kernels use cudaMemcpyAsync — blocks full capture |
+| INT4 PPL 23.52 vs BF16 12.4 | MEDIUM | Symmetric quantization, no calibration. AWQ could improve. |
+| 9B quality BLOCKED | HIGH | SSM instability: A_log > 0 for 68.8% of layer-4 channels |
+| Token looping | MEDIUM | Reduced with repetition_penalty=1.3 |
+
+---
+
+## 6. Pending Tasks
+
+| Task | Priority | Notes |
+|------|----------|-------|
+| True batched GEMV (M>1) | MEDIUM | Would need separate Q/K/V buffers per sequence |
+| INT4 calibration (AWQ) | HIGH | PPL 23→18? potential improvement |
+| 9B quality fix | HIGH | SSM instability root cause unknown |
+
+---
+
+## 7. Suggested Next Actions
+
+1. **True batched GEMV**: Separate Q/K/V buffers per sequence + batched kernel
+2. **INT4 calibration**: AWQ-style per-channel scales for PPL improvement
+3. **9B quality**: Investigate SSM A_log instability
+4. **Docker push**: Push `blackwell-server:int4` to ghcr.io
+
+---
+
+## 8. Important Files / Commands
+
+### Key binaries
 ```
-bench/text_generate_int4_batched.cu    — M=1-8 batched benchmark (127 t/s at M=4)
-bench/text_generate_int4_qwen3_8b.cu   — Single-sequence INT4 (54 t/s)
-bench/text_generate_qwen3_8b.cu       — INT8 8B benchmark (35 t/s, coherent)
-server/inference_server_int4.cu       — INT4 server (multi-prompt support)
-server/http_subprocess.cpp            — HTTP wrapper
-include/blackwell/kernels.h           — Kernel signatures (179 symbols)
-src/kernels/gemv_int8.cu             — GEMV kernels (INT4 batched)
-src/kernels/decode.cu                — Attention, RoPE, KV cache
+server/inference_server_int4           — INT4 server (2.7 MB)
+server/inference_server_int4_batched  — Batched INT4 server (2.7 MB)
+server/http_subprocess                 — HTTP wrapper
+bench/text_generate_int4_8b           — INT4 benchmark (57 t/s)
+bench/bench_ppl_int4_8b               — PPL benchmark (23.52)
+bench/decode_int4_cgraph_8b           — CUDA Graph benchmark
 ```
 
----
+### Docker
+```
+docker build -f Dockerfile.int4 -t blackwell-server:int4 .
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
+  -v /path/to/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
+  blackwell-server:int4 8080 int4_8b
+```
 
-## Build & Run
-
+### Build
 ```bash
-# Build
-CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel
+CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
 
-# Kernel count (expect 179)
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l
-
-# Batched benchmark (M=4, rep_pen=1.3)
-./bench/text_generate_int4_batched "The capital of France is" 4 20
-
-# Server test
-killall http_subprocess 2>/dev/null; sleep 2
-./server/http_subprocess weights_int4_qwen3_8b 8123 &
-sleep 12
-curl -s -X POST http://localhost:8123/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"The capital of France is","max_tokens":30}'
-
-# Multi-prompt server test
-echo '{"prompts":["The capital of France is","What is 2+2?"],"max_tokens":20}' | ./server/inference_server_int4
+### Run
+```bash
+killall hashcat 2>/dev/null
+curl -X POST http://localhost:8124/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital of France is","max_tokens":30,"repetition_penalty":1.3}'
 ```
 
 ---
 
-## Validation Status
+## 9. Validation Status
 
-- Repo: clean, modified files staged
-- Build: 179 kernels ✅
-- Batched benchmark: 127 t/s at M=4 ✅
-- Server multi-prompt: works ✅
-- rep_pen: eliminates looping ✅
+| Check | Value |
+|-------|-------|
+| INT4 8B throughput | **56 t/s** ✅ |
+| INT4 8B PPL | **23.52** ✅ (1.9× BF16) |
+| INT4 batched server | ✅ Works (M sequential) |
+| INT4 docker image | ✅ Built (148 MB) |
+| Build kernel count | **177** ✅ |
+| Repetition penalty | ✅ Works |
+| CUDA Graph speedup | 1% ⚠️ |
+| 8B dims verified | nqh=32, nkv=8, hd=128, KV=1024 ✅ |
+| 1.7B dims verified | nqh=16, nkv=8, hd=128, KV=1024 ✅ |
 
 ---
 
-## Session Metadata
+## 10. Session Metadata
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-09 |
-| session | 64 |
-| branch | default |
-| repo_state | clean (2 commits: 60164a5, 208c759) |
-| active_components | INT4 batched benchmark, INT4/INT8 servers |
-| GPU | RTX 5060 Ti, SM_120a, 500 GB/s peak |
-| kernel_count | 179 |
+| updated_at | 2026-06-08 |
+| branch | master |
+| repo_state | Modified (uncommitted INT4 files, AGENTS.md updated) |
+| session | 63 (temp fix, rep_pen, Docker, PPL 23.52 confirmed) |
+| key_finding | INT4 8B production viable at 56 t/s, PPL 23.52. upload_w4 scale bug fixed. CUDA Graph limited by cudaMemcpyAsync. |
+| next_priority | True batched GEMV, INT4 calibration, or 9B quality |
 
-## Session 64 Actions
+**BUG FIX (Session 63)**: http_subprocess default temp=0.7f caused garbled output.
+Root cause: all 4 request handlers defaulted to temp=0.7f, top_k=40 instead of
+temp=0.0f, top_k=0. Server inference_server_int4 defaulted to temp=0.0f but
+http_subprocess overrode it. Benchmark works (57 t/s, greedy) but HTTP server
+was broken. Fixed in server/http_subprocess.cpp. Output now matches benchmark.
 
-1. **Fixed AGENTS.md stale entries**:
-   - Kernel count: 177→179
-   - INT8 8B benchmark: Garbled → Coherent
-   - INT4 batched: M>1 crashes → M=4 at 127 t/s coherent
+---
 
-2. **Committed**:
-   - bench/text_generate_int4_batched.cu (127 t/s at M=4)
-   - Batched GEMV kernels (gemv_int4_batched, quantize_int4_batched)
-   - Attention smem fix ((128+4096)*4 vs 4096*4)
+## META PROMPT
 
-3. **Verified**: Batched M=4 coherent at 111 t/s
+**Boot sequence**:
+1. Read `AGENTS.md` → `HANDOFF.md`
+2. `git status` — check state
+3. `killall hashcat 2>/dev/null`
+4. `nvidia-smi --query-compute-apps` — ensure no stale GPU processes
+
+**Verified facts**:
+- INT4 8B: **56 t/s**, PPL **23.52** (1.9× BF16)
+- INT8 8B: **3.9 t/s**, PPL **18.65** (1.5× BF16)
+- 8B dims: nqh=**32**, nkv=**8**, hd=**128**, KV=**1024**
+- INT4 is symmetric: `nib - 8` for signed values, scale = absmax/7
+- upload_w4 bug: read scale_t header for scale count, NOT int4_t header
+
+**DO NOT**:
+- Use old dimension values (nqh=32, nkv=4, hd=64, KV=512 for 1.7B)
+- Trust pre-session-56 quality numbers (wrong dims)
+- Expect CUDA Graph speedup > 1% (cudaMemcpyAsync blocks capture)
+- Re-dig dead ends: FP8, INT5, FP4, asymmetric INT4
+
+**Build verification**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` → expect 177
