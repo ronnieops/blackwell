@@ -6,16 +6,21 @@ Read `AGENTS.md` AND this file before acting.
 
 ## 1. Current Objective
 
-INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
-14× faster than INT8 server (3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8.
+INT4 8B production path stabilized. INT4 batched benchmark: M=1:63, M=2:115,
+M=4:148, M=8:168 t/s. Server uses batched kernels (gemv_int4_batched).
 
-**Session 63 fixes**:
-1. http_subprocess defaulted to temperature=0.7f → garbled output. Fixed to
-   temperature=0.0f (greedy) to match benchmark behavior.
-2. Added repetition_penalty support: all 4 request handlers now send
-   rep_pen=1.5 by default. Server apply_repetition_penalty kernel uses it.
-   Clients can override via JSON body. Eliminates token looping.
-3. Docker image built: blackwell-server:int4 (148 MB, tested ✅)
+**Session 65 fixes**:
+1. Session 64 smem fix `((128+4096)*4)` broke INT4 output (garbage).
+   Reverted `src/kernels/decode.cu` to session 63 version (smem=4096*4).
+2. Batched benchmark OOM at M=3+. Fixed by reducing MAXSEQ 4096→512.
+3. Server updated to use batched kernels (gemv_int4_batched M=1).
+   Output now matches benchmark exactly.
+4. INT8 8B server has CUDA Graph issues (garbage output). Not investigated.
+
+**Session 64 finding** (reverted):
+- smem_bytes = `(128+4096)*4` caused output divergence
+- Root cause unknown — attention kernel smem layout doesn't match expected
+- smem_bytes = `4096*4` (16 KB) works correctly
 
 ---
 
@@ -23,35 +28,36 @@ INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| INT4 8B HTTP server | ✅ Production | `http_subprocess int4_8b`, 56 t/s |
-| INT4 batched server | ✅ Works | M prompts processed sequentially with own KV cache |
-| INT4 benchmark | ✅ 57 t/s | `bench/text_generate_int4_8b` |
+| INT4 8B HTTP server | ✅ Production | `inference_server_int4`, 56 t/s |
+| INT4 batched benchmark | ✅ M=1-8 | M=1:63, M=2:115, M=4:148, M=8:168 t/s |
+| INT4 batched M=9+ | ❌ Broken | Garbage output (unknown root cause) |
 | INT4 PPL benchmark | ✅ PPL 23.52 | `bench/bench_ppl_int4_8b` |
 | Repetition penalty | ✅ Works | Reduces token looping |
-| CUDA Graph | ⚠️ 1% gain | `cudaMemcpyAsync` in attention blocks capture |
+| CUDA Graph | ⚠️ Issues | Breaks INT8 8B server output |
 | Docker | ✅ Built | `blackwell-server:int4` (148 MB) |
-| Build | ✅ 177 kernels | `libblackwell_kernels.a` |
-| INT8 server | ✅ Works | 8B: 3.9 t/s, 1.7B: 23 t/s |
+| Build | ✅ 179 kernels | `libblackwell_kernels.a` |
+| INT8 8B server | ❌ Broken | CUDA Graph causes garbage output |
 
-### PPL Quality (8B)
+### Batched INT4 Throughput
 
-| Config | PPL | vs BF16 |
-|--------|-----|---------|
-| BF16 (llama.cpp Q8_0) | **12.4** | 1.0× |
-| INT8 block-16 | **18.65** | 1.5× |
-| INT4 symmetric | **23.52** | 1.9× |
+| M | t/s | ms/tok | Notes |
+|---|-----|--------|-------|
+| 1 | 63 | 15.8 | Batched GEMV (40% faster than single-seq gemv_int4_warp) |
+| 2 | 116 | 8.6 | |
+| 4 | 148 | 6.8 | |
+| 8 | 168 | 5.9 | |
+| 9+ | — | — | Garbage output |
 
 ---
 
 ## 3. Recent Decisions
 
-- **INT4 8B is production viable**: 56 t/s (14× faster than INT8), coherent output, PPL 23.52
-- **INT4 batched**: M prompts processed sequentially with own KV cache. M=1 works perfectly. M>1 crashes in original design — fixed by sequential processing.
-- **CUDA Graph limited**: 1% speedup. Root cause: `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels.
-- **Repetition penalty added**: Works at 56 t/s, reduces token looping
-- **Docker image built**: `blackwell-server:int4` (148 MB)
-- **Dead code removed**: 8 stale benchmark files (FP8, INT5, FP4)
-- **upload_w4 scale buffer bug FIXED**: Root cause of all INT4 crashes. `ss = h[3]*h[4]` from int4_t header (256) instead of scale_t header (38.9M for lm_head)
+- **Batched GEMV kernels faster**: `gemv_int4_batched` 40% faster than `gemv_int4_warp` even at M=1
+- **MAXSEQ=512 for batched**: M=3+ OOM with MAXSEQ=4096. Reduced to 512 allows M=8.
+- **M=9+ broken**: Garbage output. Unknown root cause.
+- **smem_bytes change breaks output**: Session 64 smem fix `((128+4096)*4)` caused divergence. Reverted to `4096*4`.
+- **Server uses batched kernels**: All GEMV ops now use `gemv_int4_batched` (M=1). Output matches benchmark.
+- **INT8 8B server broken**: CUDA Graph causes garbage output. Not investigated.
 
 ---
 
@@ -70,10 +76,11 @@ INT4 8B production path stabilized. INT4 8B: 56 t/s, PPL 23.52 (1.9× BF16).
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
+| M=9+ batched broken | MEDIUM | Garbage output. Unknown root cause. |
+| INT8 8B server broken | MEDIUM | CUDA Graph causes garbage output. |
 | CUDA Graph limited | MEDIUM | Attention kernels use cudaMemcpyAsync — blocks full capture |
-| INT4 PPL 23.52 vs BF16 12.4 | MEDIUM | Symmetric quantization, no calibration. AWQ could improve. |
+| INT4 PPL 23.52 vs BF16 12.4 | MEDIUM | Symmetric quantization, no calibration. |
 | 9B quality BLOCKED | HIGH | SSM instability: A_log > 0 for 68.8% of layer-4 channels |
-| Token looping | MEDIUM | Reduced with repetition_penalty=1.3 |
 
 ---
 
@@ -139,13 +146,14 @@ curl -X POST http://localhost:8124/v1/completions \
 |-------|-------|
 | INT4 8B throughput | **56 t/s** ✅ |
 | INT4 8B PPL | **23.52** ✅ (1.9× BF16) |
-| INT4 batched server | ✅ Works (M sequential) |
-| INT4 docker image | ✅ Built (148 MB) |
-| Build kernel count | **177** ✅ |
+| Batched benchmark M=1-8 | ✅ Works |
+| Batched server output | ✅ Matches benchmark |
+| Build kernel count | **179** ✅ |
 | Repetition penalty | ✅ Works |
-| CUDA Graph speedup | 1% ⚠️ |
+| smem regression fixed | ✅ Reverted decode.cu |
+| Server batched kernels | ✅ gemv_int4_batched (M=1) |
+| INT8 8B server | ❌ Broken (CUDA Graph) |
 | 8B dims verified | nqh=32, nkv=8, hd=128, KV=1024 ✅ |
-| 1.7B dims verified | nqh=16, nkv=8, hd=128, KV=1024 ✅ |
 
 ---
 
@@ -153,18 +161,21 @@ curl -X POST http://localhost:8124/v1/completions \
 
 | Field | Value |
 |-------|-------|
-| updated_at | 2026-06-08 |
+| updated_at | 2026-06-09 |
 | branch | master |
-| repo_state | Modified (uncommitted INT4 files, AGENTS.md updated) |
-| session | 63 (temp fix, rep_pen, Docker, PPL 23.52 confirmed) |
-| key_finding | INT4 8B production viable at 56 t/s, PPL 23.52. upload_w4 scale bug fixed. CUDA Graph limited by cudaMemcpyAsync. |
-| next_priority | True batched GEMV, INT4 calibration, or 9B quality |
+| repo_state | Clean (pushed to origin) |
+| session | 65 (smem regression fixed, batched benchmark restored) |
+| key_finding | Batched INT4: M=1:63, M=2:115, M=4:148, M=8:168 t/s. Server uses batched kernels. Session 64 smem fix `((128+4096)*4)` broke output — reverted. |
+| next_priority | Fix M=9+ garbage, investigate smem divergence, or INT4 calibration |
 
-**BUG FIX (Session 63)**: http_subprocess default temp=0.7f caused garbled output.
-Root cause: all 4 request handlers defaulted to temp=0.7f, top_k=40 instead of
-temp=0.0f, top_k=0. Server inference_server_int4 defaulted to temp=0.0f but
-http_subprocess overrode it. Benchmark works (57 t/s, greedy) but HTTP server
-was broken. Fixed in server/http_subprocess.cpp. Output now matches benchmark.
+**BUG FIX (Session 65)**: Session 64 smem fix `((128+4096)*4` caused INT4 output
+divergence ("is is is is is is"). Reverted `src/kernels/decode.cu` to session 63
+version (smem=4096*4). Output restored: "The capital of France is a city in
+the state of".
+
+**BUG FIX (Session 65)**: Server used `gemv_int4_warp` but benchmark used
+`gemv_int4_batched`. Updated server to use batched kernels (M=1). Output now
+matches benchmark exactly.
 
 ---
 
@@ -189,4 +200,4 @@ was broken. Fixed in server/http_subprocess.cpp. Output now matches benchmark.
 - Expect CUDA Graph speedup > 1% (cudaMemcpyAsync blocks capture)
 - Re-dig dead ends: FP8, INT5, FP4, asymmetric INT4
 
-**Build verification**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` → expect 177
+**Build verification**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` → expect 179
