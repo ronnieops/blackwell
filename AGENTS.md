@@ -77,11 +77,13 @@ This is NOT a quantization issue — architectural/inference problem.
 
 **INT4 8B quality degraded but coherent**. Grammatically correct English, factual errors, token looping without repetition penalty. 59 t/s (15× faster than INT8 server's 3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8 (45% smaller). Root cause of prior INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
 
-**CUDA Graph for INT4 (Session 62)**: Captured 648 nodes (36 layers × 18 kernels). Speedup only 1% (63→64 t/s) because `update_kv_cache` and `attention_decode_batched_gqa` use `cudaMemcpyAsync` internally — not CUDA Graph compatible. Full speedup requires custom kernels without cudaMemcpyAsync.
+**CUDA Graph for INT4 (Session 72)**: Captured 867 nodes (36 layers × full decode: QKV→head_norm→RoPE→KV cache→attention→MLP→lm_head). Speedup **2.1%** (64→65 t/s) after replacing H2D memcpy with device-side seq_pos. New graph-safe APIs: `attention_decode_batched_gqa_device()` and `attention_decode_gqa_device()` (no H2D memcpy). Limited by GEMV dominance (92% of runtime). Benchmark: `./bench/decode_int4_cgraph_8b [tokens]`.
 
 **Batched INT4 (Session 64/65)**: M=1: 63 t/s, M=2: 115 t/s, M=4: 148 t/s, M=8: 169 t/s. M=9+: broken (garbage output). MAXSEQ=512 for batched (vs 4096 for single). Uses `gemv_int4_batched` even for M=1 (40% faster than single-sequence `gemv_int4_warp`). Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens`.
 
 **INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
+
+**GGUF Bridge (Session 72)**: `better-inference/` — GGUF → blackwell INT4 converter. Parser (`gguf.h`) reads GGUF v3 files, extracts metadata and tensors. Converter (`gguf_convert.cpp`) dequantizes Q8_0/Q4_K → FP32 → re-quantizes to INT4 block-16, writes blackwell weight format. Tested with Qwen3-1.7B Q8_0 GGUF → 454 files, 1.3GB. Weights verified correct (scales in [0.002,0.012], values reasonable). Tokenizer export matches original format. Phase 1 (parser) + Phase 2 (Qwen3 converter) complete. Phase 3 (Llama support) needs name mapper. Usage: `./better-inference/gguf_convert model.gguf output_dir/`
 
 **PPL quality (1.7B, WikiText-2, 512 ctx)**
 | Config | PPL | vs BF16 |
@@ -122,7 +124,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 179 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed dead-end INT4/INT5/FP4/FP8 kernel symbols)
+**Library**: 181 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed dead-end INT4/INT5/FP4/FP8 kernel symbols; +2 new graph-safe attention variants in Session 72)
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)

@@ -21,13 +21,13 @@
 const int H = 4096;       // hidden
 const int Q = 4096;       // Q projection (H)
 const int KV = 2048;      // K/V projection
-const int I = 10944;      // intermediate (MLP)
+const int I = 12288;      // intermediate (MLP)
 const int V = 151936;     // vocab
 const int NL = 36;        // num layers
 const int nqh = 32;       // num Q heads
 const int nkv = 8;        // num K/V heads
 const int hd = 128;       // head dim
-const int KV_cache = 512; // max KV cache seq
+const int KV_cache = 1024; // max KV cache seq
 
 using namespace blackwell::kernels;
 

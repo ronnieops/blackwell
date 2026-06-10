@@ -214,6 +214,35 @@ cudaError_t attention_decode_batched_gqa(
     size_t          kv_layer_elems, // floats from seq base to current layer
     cudaStream_t    stream = 0);
 
+// Graph-safe batched GQA: takes device-side seq_pos pointer (no H2D memcpy)
+cudaError_t attention_decode_batched_gqa_device(
+    float*          output,
+    const float*    Q,
+    const float*    K_cache,
+    const float*    V_cache,
+    const int*      d_seq_pos,      // device pointer (skip H2D copy)
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             head_dim,
+    int             max_seq_len,
+    int             M,
+    size_t          kv_batch_elems,
+    size_t          kv_layer_elems,
+    cudaStream_t    stream = 0);
+
+// Graph-safe single-seq GQA: takes device-side seq_pos pointer
+cudaError_t attention_decode_gqa_device(
+    float*          output,
+    const float*    Q,
+    const float*    K_cache,
+    const float*    V_cache,
+    const int*      d_seq_pos,      // device pointer (skip H2D copy)
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Attention (prefill)
 // ---------------------------------------------------------------------------

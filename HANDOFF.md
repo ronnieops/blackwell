@@ -6,8 +6,8 @@
 
 ## 1. Current Objective
 
-**Production-ready INT4 8B inference server** — 36 tasks complete. Project is stable.
-Session 71: Final cleanup, documentation, benchmark suite, deployment automation.
+**Production-ready INT4 8B inference server** — 37 tasks complete. Project is stable.
+Session 72: CUDA Graph fix (2.1% speedup, graph-safe attention), GGUF bridge Phase 1-2 working.
 
 ---
 
@@ -21,7 +21,8 @@ Session 71: Final cleanup, documentation, benchmark suite, deployment automation
 | Benchmark suite | ✅ | `scripts/benchmark_suite.py` — automated tests |
 | Deployment | ✅ | `deploy/` with systemd, nginx, monitoring |
 | API | ✅ | OpenAI-compatible (unique IDs, timestamps, usage) |
-| Documentation | ✅ | README, API, DEPLOYMENT, ARCHITECTURE, QUALITY |
+| CUDA Graph | ⚠️ **Partial** | 2.1% speedup (867 nodes). Limited by GEMV 92% dominance. |
+| GGUF Bridge | ✅ **Phase 1-2** | Parser + Qwen3 converter working. 1.7B tested. |
 | NVFP4 | ❌ **ABANDONED** | PPL=24,850. Format mismatch + double quant unsolvable. |
 | 9B quality | ❌ **BLOCKED** | SSM instability. A_log clamp insufficient. |
 | New model download | ❌ **BLOCKED** | Network issues. No 14B or 9B weights available. |
@@ -35,6 +36,8 @@ Session 71: Final cleanup, documentation, benchmark suite, deployment automation
 - **Benchmark suite**: Automated tests for health, models, correctness, throughput, memory, regression, PPL estimate.
 - **API improvements**: OpenAI-compatible responses with unique IDs, timestamps, system_fingerprint.
 - **Housekeeping**: 89→19 bench .cu files, removed stale binaries and backups.
+- **CUDA Graph fix (Session 72)**: Replaced H2D memcpy in attention with device-side seq_pos. New APIs: `attention_decode_batched_gqa_device()`, `attention_decode_gqa_device()`. Graph now captures 867 nodes including KV cache + attention + RoPE. Speedup: 2.1% (64→65 t/s). Limited by GEMV dominance.
+- **GGUF bridge Phase 1-2**: Parser reads GGUF v3, converter dequantizes Q8_0→INT4, writes blackwell format. Tested with Qwen3-1.7B Q8_0. Tokenizer export matches original format.
 
 ---
 
@@ -46,7 +49,7 @@ Session 71: Final cleanup, documentation, benchmark suite, deployment automation
 - `killall hashcat` before every GPU measurement
 - Only weight dir: `weights_int4_qwen3_8b/` (5.8 GB)
 - GPU memory: 9661 MB / 15849 MB (RTX 5060 Ti)
-- 179 kernel symbols in `libblackwell_kernels.a`
+- 181 kernel symbols in `libblackwell_kernels.a`
 - Disk: ~630 GB free
 
 ---
@@ -76,10 +79,10 @@ Session 71: Final cleanup, documentation, benchmark suite, deployment automation
 
 ## 7. Suggested Next Actions
 
-1. **New model** — When network available: Qwen3-14B or Mistral 7B. Need download + INT4 conversion.
-2. **Client SDK** — Python/JS library for easier integration.
-3. **Stress testing** — Concurrent load, memory limits.
-4. **Research** — Different quantization (GPTQ, QuIP#) or block sizes.
+1. **GGUF bridge Phase 3** — Llama tensor name mapper for GGUF converter. Llama uses `blk.{l}.attn_{q,k,v,o}.weight` vs Qwen3's `blk.{l}.attn_{q,k,v,o}.weight` (same naming convention!). Need to handle RoPE base and tokenizer (tiktoken vs BPE).
+2. **8B GGUF validation** — Find or download 8B GGUF model to validate full quality. Qwen3-1.7B tested but 1.7B INT4 is dead-end.
+3. **Client SDK** — Python/JS library for easier integration.
+4. **CUDA Graph full fusion** — Replace GEMV+quantize+fused_rmsnorm into fewer kernels to reduce launch overhead further.
 
 ---
 
@@ -110,7 +113,12 @@ cmake --build build --parallel
 
 ### Validate
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 179
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 181
+```
+
+### CUDA Graph benchmark
+```bash
+./bench/decode_int4_cgraph_8b 50  # ~65 t/s (2.1% faster than per-kernel ~64 t/s)
 ```
 
 ### Deployment
@@ -129,9 +137,11 @@ sudo cp deploy/blackwell.service /etc/systemd/system/
 | Throughput | **~55 t/s** | ✅ |
 | PPL (AWQ α=0.6) | **21.82** | ✅ |
 | GPU memory | 9661 MB | ✅ |
-| Kernel symbols | **179** | ✅ |
+| Kernel symbols | **181** | ✅ |
 | Benchmark suite | All tests pass | ✅ |
 | Server health | Working | ✅ |
+| CUDA Graph | 2.1% speedup | ⚠️ |
+| GGUF bridge | Qwen3 converter | ✅ |
 
 ---
 
@@ -143,8 +153,8 @@ sudo cp deploy/blackwell.service /etc/systemd/system/
 | branch | master |
 | repo_state | Dirty (modified files) |
 | active_components | INT4 8B server, benchmark suite, deployment |
-| key_session | 71 — Final cleanup, embedding pre-load, API improvements, documentation |
-| next_priority | New model or client SDK when direction confirmed |
+| key_session | 72 — CUDA Graph fix, GGUF bridge Phase 1-2 |
+| next_priority | GGUF Llama support, 8B GGUF validation, client SDK |
 
 ---
 

@@ -510,6 +510,83 @@ cudaError_t attention_decode_batched_gqa(
     return cudaPeekAtLastError();
 }
 
+// Graph-safe variant: takes device-side seq_pos pointer, no H2D memcpy.
+cudaError_t attention_decode_batched_gqa_device(
+    float* output, const float* Q,
+    const float* K_cache, const float* V_cache,
+    const int* d_seq_pos,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int max_seq_len,
+    int M, size_t kv_batch_elems, size_t kv_layer_elems,
+    cudaStream_t stream) {
+
+    constexpr int smem_bytes = 4096 * 4;
+    if (smem_attr_set == 0) {
+        int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
+        if (old == 0) {
+            cudaFuncSetAttribute(
+                attn_batched_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            cudaFuncSetAttribute(
+                attention_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_attr_set = 2;
+        }
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int total_blocks = M * num_q_heads;
+    attn_batched_kernel<<<
+        dim3(total_blocks), dim3(128), smem_bytes, stream>>>(
+        output, Q, K_cache, V_cache,
+        d_seq_pos, num_q_heads, num_kv_heads,
+        head_dim, max_seq_len, scale,
+        M, kv_batch_elems, kv_layer_elems);
+
+    return cudaPeekAtLastError();
+}
+
+// Graph-safe single-seq GQA: takes device-side seq_pos pointer.
+cudaError_t attention_decode_gqa_device(
+    float* output, const float* Q,
+    const float* K_cache, const float* V_cache,
+    const int* d_seq_pos,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int max_seq_len,
+    cudaStream_t stream) {
+
+    constexpr int smem_bytes = 4096 * 4;
+    if (smem_attr_set == 0) {
+        int old = __sync_val_compare_and_swap(&smem_attr_set, 0, 1);
+        if (old == 0) {
+            cudaFuncSetAttribute(
+                attention_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            smem_attr_set = 2;
+        }
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    if (head_dim > 128) {
+        attention_decode_kernel_v4<<<
+            dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
+            output, Q, K_cache, V_cache,
+            d_seq_pos, num_q_heads, num_kv_heads,
+            head_dim, max_seq_len, scale);
+    } else {
+        attention_decode_kernel<<<
+            dim3(num_q_heads), dim3(128), smem_bytes, stream>>>(
+            output, Q, K_cache, V_cache,
+            d_seq_pos, num_q_heads, num_kv_heads,
+            head_dim, max_seq_len, scale);
+    }
+
+    return cudaPeekAtLastError();
+}
+
 cudaError_t update_kv_cache(
     float* k_cache, float* v_cache,
     const float* k_new, const float* v_new,
