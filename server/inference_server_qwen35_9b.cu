@@ -73,7 +73,11 @@ __global__ void attn_gate_k(float* out, const float* gate, int n) {
 __global__ void compute_g_k(float* g, const float* a, const float* al, const float* dt, int n) {
     int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return;
     float sp = logf(1.f+expf(a[i]+dt[i]));
-    g[i] = -expf(al[i])*sp;
+    // Clamp A_log to ensure exp(A_log) <= 1, preventing SSM state explosion.
+    // Pretrained weights have A_log > 0 for many channels (up to +4.25 -> exp=70).
+    // Without clamp, g < -1 -> state diverges exponentially.
+    float al_clamped = fminf(al[i], 0.0f);
+    g[i] = -expf(al_clamped)*sp;
 }
 
 // ── Weight loading ───────────────────────────────────────────────────

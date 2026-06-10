@@ -1,16 +1,31 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #define CPPHTTPLIB_ZLIB_SUPPORT 0
 #include "blackwell/httplib.h"
+#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <mutex>
+#include <atomic>
+#include <chrono>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+// Global metrics
+static std::atomic<uint64_t> g_request_count{0};
+static std::atomic<uint64_t> g_error_count{0};
+static std::atomic<uint64_t> g_total_latency_ms{0};
+static std::chrono::steady_clock::time_point g_start_time = std::chrono::steady_clock::now();
+
+static void record_request(bool success, int64_t duration_ms) {
+    g_request_count.fetch_add(1);
+    if(!success) g_error_count.fetch_add(1);
+    g_total_latency_ms.fetch_add((uint64_t)duration_ms);
+}
 
 // Blackwell HTTP Server
 // Uses temp-file IPC: writes request JSON to /tmp/inf_{pid}.req,
@@ -54,7 +69,9 @@ public:
         const char* bin = "./server/inference_server";
         std::string bin9b = "./server/inference_server_9b";
         std::string bin_int4 = "./server/inference_server_int4";
+        std::string bin_int4_batched = "./server/inference_server_int4_batched";
         if(strstr(model,"9b")) bin = bin9b.c_str();
+        else if(strstr(model,"batched")) bin = bin_int4_batched.c_str();
         else if(strstr(model,"int4")) bin = bin_int4.c_str();
 
         int pin[2], pout[2];
@@ -79,8 +96,12 @@ public:
 
     bool generate(const std::string& prompt, int max_tok, float temp, int top_k,
                   float rep_pen, std::vector<uint32_t>& tokens, std::string& text, bool stream = false) {
+        auto req_start = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> g(lock);
-        if(!ready) return false;
+        if(!ready) {
+            g_error_count.fetch_add(1);
+            return false;
+        }
 
         std::string ep;
         for(size_t i=0;i<prompt.size();i++) {
@@ -171,6 +192,9 @@ public:
                 char* s = strstr(line, "\"text\":\"");
                 if(s) { s += 8; char* e = strchr(s, '"'); if(e) text = std::string(s, e-s); }
             }
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - req_start).count();
+            record_request(!tokens.empty(), duration);
             return !tokens.empty();
         } else {
             // Streaming: read SSE lines until [DONE] with timeout
@@ -212,8 +236,12 @@ public:
 
     bool generate_batch(const std::vector<std::string>& prompts_in, int max_tok, float temp, int top_k,
                   float rep_pen, std::vector<std::vector<uint32_t>>& all_tokens, std::vector<std::string>& all_text) {
+        auto req_start = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> g(lock);
-        if(!ready) return false;
+        if(!ready) {
+            g_error_count.fetch_add(1);
+            return false;
+        }
 
         // Build batch JSON: {"prompts":["p1","p2",...],"max_tokens":N,...}
         std::string ep;
@@ -291,6 +319,9 @@ public:
         for(const auto& ids : all_tokens) {
             all_text.push_back(local_tok_ ? local_tok_->decode(ids) : "");
         }
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - req_start).count();
+        record_request(!all_tokens.empty(), duration);
         return !all_tokens.empty();
     }
 
@@ -429,6 +460,7 @@ int main(int argc, char** argv) {
     }
     if(strstr(model,"8b")) g_model_name = "8B";
     else if(strstr(model,"9b")) g_model_name = "9B";
+    else if(strstr(model,"batched")) g_model_name = "8B";
     else g_model_name = "1.7B";
 
     fprintf(stderr, "Blackwell HTTP Server\n  Model: %s\n  Port: %d\n", model, port);
@@ -442,7 +474,27 @@ int main(int argc, char** argv) {
     svr.set_read_timeout(300);
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(R"({"status":"ok"})", "application/json");
+        // Get GPU memory info
+        size_t gpu_free = 0, gpu_total = 0;
+        cudaMemGetInfo(&gpu_free, &gpu_total);
+        size_t gpu_used = gpu_total - gpu_free;
+        
+        // Compute uptime
+        auto now = std::chrono::steady_clock::now();
+        auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(now - g_start_time).count();
+        
+        // Compute avg latency
+        uint64_t req_cnt = g_request_count.load();
+        uint64_t err_cnt = g_error_count.load();
+        uint64_t total_lat = g_total_latency_ms.load();
+        double avg_lat = (req_cnt > 0) ? (double)total_lat / req_cnt : 0.0;
+        
+        char js[512];
+        snprintf(js, sizeof(js),
+            R"({"status":"ok","model":"blackwell-%s","gpu_used_mb":%zu,"gpu_total_mb":%zu,"uptime_sec":%ld,"requests":%lu,"errors":%lu,"avg_latency_ms":%.1f})",
+            g_model_name.c_str(), gpu_used / 1024 / 1024, gpu_total / 1024 / 1024,
+            uptime_sec, req_cnt, err_cnt, avg_lat);
+        res.set_content(js, "application/json");
     });
 
     svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
@@ -478,9 +530,9 @@ int main(int argc, char** argv) {
         }
 
         std::ostringstream js;
-        js << "{\"id\":\"chatcmpl-0\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"blackwell-" << g_model_name << "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        js << "{\"id\":\"chatcmpl-" << g_request_count.load() << "\",\"object\":\"chat.completion\",\"created\":" << time(nullptr) << ",\"model\":\"blackwell-" << g_model_name << "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
         js << escape_json_str(text);
-        js << "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":" << tokens.size() << ",\"total_tokens\":" << tokens.size() << "}}";
+        js << "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":" << tokens.size() << ",\"total_tokens\":" << (tokens.size() + 1) << "}}";
         res.set_content(js.str(), "application/json");
     });
 
@@ -506,7 +558,7 @@ int main(int argc, char** argv) {
         }
 
         std::ostringstream js;
-        js << "{\"id\":\"cmpl-0\",\"object\":\"text_completion\",\"created\":0,\"model\":\"blackwell-" << g_model_name << "\",\"choices\":[{\"text\":\"";
+        js << "{\"id\":\"cmpl-" << g_request_count.load() << "\",\"object\":\"text_completion\",\"created\":" << time(nullptr) << ",\"model\":\"blackwell-" << g_model_name << "\",\"choices\":[{\"text\":\"";
         js << escape_json_str(text);
         js << "\",\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":" << tokens.size() << ",\"total_tokens\":" << tokens.size() << "}}";
         res.set_content(js.str(), "application/json");

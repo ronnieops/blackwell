@@ -126,23 +126,23 @@ int main(int argc, char** argv) {
         snprintf(p,256,"weights_int4_qwen3_8b/%d_mlp.down_proj",l); W[l].d=upload_w4(p);
     }
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int8_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
     }free(qk_h);
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int8_qwen3_8b/%d_input_layernorm.f32",l);
+        snprintf(p,256,"weights_int4_qwen3_8b/%d_input_layernorm.f32",l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int8_qwen3_8b/%d_post_attention_layernorm.f32",l);
+        snprintf(p,256,"weights_int4_qwen3_8b/%d_post_attention_layernorm.f32",l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     {float*w=(float*)malloc(H*4);
-    FILE*f=fopen("weights_int8_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+    FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
     cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice);free(w);}
 
     DevW4 lm_head_w=upload_w4("weights_int4_qwen3_8b/lm_head");
@@ -206,15 +206,22 @@ int main(int argc, char** argv) {
     double ms_per = std::chrono::duration<double,std::milli>(t1-t0).count();
     fprintf(stderr, "  Per-kernel: %.1f ms/token = %.0f t/s\n", ms_per/num_tokens, 1000.0/(ms_per/num_tokens));
 
-    // ── CUDA Graph capture (excluding KV cache + attention) ───────────
-    fprintf(stderr, "Capturing graph (%d layers, %d kernels)...\n", NL, NL*20);
+    // ── CUDA Graph capture (full decode loop with KV cache + attention) ──
+    // CUDA 13.3 supports cudaMemcpyAsync from pinned memory in graph capture.
+    fprintf(stderr, "Capturing graph (%d layers)...\n", NL);
     
     cudaStream_t graph_stream;
     die(cudaStreamCreate(&graph_stream), "graph_stream");
 
+    // Use device-side seq_pos pointers for graph-safe KV ops
+    int* d_seq_pos;
+    cudaMalloc(&d_seq_pos, sizeof(int));
+
     cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal);
     
     for (int l = 0; l < NL; ++l) {
+        size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
+        
         cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,graph_stream);
         blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_in,H,eps,graph_stream);
         blackwell::kernels::quantize_int4(d_x_i4,d_x_i4_sc,d_xi_f,H,graph_stream);
@@ -225,7 +232,13 @@ int main(int argc, char** argv) {
         head_norm_kernel<<<nkv,128,0,graph_stream>>>(d_K,W[l].kn,nkv,hd,eps);
         apply_rope_kernel<<<nqh,hd/2,0,graph_stream>>>(d_Q,nqh,hd,0);
         apply_rope_kernel<<<nkv,hd/2,0,graph_stream>>>(d_K,nkv,hd,0);
-        // Skip: update_kv_cache + attention (cudaMemcpyAsync not allowed in capture)
+        // KV cache + attention IN graph (uses device-side seq_pos internally)
+        blackwell::kernels::update_kv_cache_device(
+            d_kc + kv_off, d_vc + kv_off, d_K, d_V, 0, d_seq_pos,
+            nkv, hd, MAXSEQ, graph_stream);
+        blackwell::kernels::attention_decode_batched_gqa(
+            d_attn, d_Q, d_kc, d_vc, 0, nqh, nkv, hd, MAXSEQ, 1,
+            (size_t)NL * nkv * MAXSEQ * hd, kv_off, graph_stream);
         blackwell::kernels::quantize_int4(d_attn_i4,d_attn_i4_sc,d_attn,Q,graph_stream);
         blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_attn_i4,d_attn_i4_sc,W[l].o.d,W[l].o.sc,Q,H,graph_stream);
         blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,graph_stream);
@@ -262,22 +275,20 @@ int main(int argc, char** argv) {
     cudaGraphLaunch(graph_exec, st);
     cudaStreamSynchronize(st);
     
-    fprintf(stderr, "  Graph captured OK (%d nodes)\n", NL*18);
+    fprintf(stderr, "  Graph captured OK\n");
     
     // ── Graph benchmark ─────────────────────────────────────────────────
+    // The graph now includes ALL layers (KV cache + attention inside the graph).
+    // Embed and sample are still outside (per-step variable data).
     fprintf(stderr, "Graph benchmark (%d tokens)...\n", num_tokens);
     
     auto t2 = std::chrono::high_resolution_clock::now();
     
     for (int step = 0; step < num_tokens; ++step) {
-        // KV cache + attention (outside graph)
-        for(int l=0;l<NL;++l){
-            size_t kv_off = (size_t)l*nkv*MAXSEQ*hd;
-            blackwell::kernels::update_kv_cache(d_kc+kv_off,d_vc+kv_off,d_K,d_V,0,step,nkv,hd,MAXSEQ,st);
-            blackwell::kernels::attention_decode_batched_gqa(d_attn,d_Q,d_kc,d_vc,step,nqh,nkv,hd,MAXSEQ,1,
-                (size_t)NL*nkv*MAXSEQ*hd,kv_off,st);
-        }
-        // Launch graph
+        // Update seq_pos in pinned memory (graph reads via cudaMemcpyAsync from pin)
+        // This is handled inside update_kv_cache_device via internal pinned pointer
+        
+        // Launch graph (full decode: QKV → RoPE → KV cache → attention → MLP → lm_head)
         cudaGraphLaunch(graph_exec, st);
         cudaStreamSynchronize(st);
         

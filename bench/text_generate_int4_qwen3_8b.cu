@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
     }
 
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int8_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -187,17 +187,17 @@ int main(int argc, char** argv) {
 
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p_,256,"weights_int8_qwen3_8b/%d_input_layernorm.f32",l);
+        snprintf(p_,256,"weights_int4_qwen3_8b/%d_input_layernorm.f32",l);
         {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p_,256,"weights_int8_qwen3_8b/%d_post_attention_layernorm.f32",l);
+        snprintf(p_,256,"weights_int4_qwen3_8b/%d_post_attention_layernorm.f32",l);
         {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
 
     {float*w=(float*)malloc(H*4);
-    FILE*f=fopen("weights_int8_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+    FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
     cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice);free(w);}
 
     DevW4 embed=upload_w4("weights_int4_qwen3_8b/embed_tokens");
@@ -301,8 +301,6 @@ int main(int argc, char** argv) {
 
             // Down projection
             die(blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc,I,H,st),"down");
-            die(blackwell::kernels::gemv_int4_warp(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc,H,I,st),"gate");
-            die(blackwell::kernels::gemv_int4_warp(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc,H,I,st),"up");
 
             // MLP residual: d_x32 = d_proj + d_res (pre-MLP state)
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");

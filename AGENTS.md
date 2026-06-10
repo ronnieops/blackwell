@@ -53,18 +53,27 @@ Root cause: SSM instability (A_log > 0 for 68.8% of layer-4 channels,
 A > 1 → exponential hidden state growth). A_log stored as FP32 (not quantized).
 This is NOT a quantization issue — architectural/inference problem.
 
-**Benchmarks (no head_norm/RoPE)**
-| Model | M= | Method | t/s | ms/tok | vs llama.cpp |
-|-------|-----|--------|-----|--------|-------------|
-| 1.7B INT8 nofp4 | 4 | CUDA Graph | 574 | 1.7 | 196% ⚠️ |
-| 1.7B INT8 fused | 1 | Per-kernel | 180 | 5.5 | 61% |
-| 1.7B | 1 | Prefill SEQ=8 | 3759 | 2.1 | — |
-| 8B INT8 | 1 | CUDA Graph | 44 | 22.9 | 53% |
-| 8B INT4 | 1 | Per-kernel | 59 | 16.9 | 80% |
-| 9B GDN INT8 | 1 | Per-kernel | 46 | 21.9 | 64% |
-| 9B GDN INT8 | 8 | Batched | 51 | 19.6 | 71% |
+**Benchmarks (INT4 8B)**
+| Config | t/s | ms/tok | Notes |
+|--------|-----|--------|-------|
+| Batched GEMV M=1 | **63** | **16** | Production |
+| Warp GEMV M=1 | **59** | **17** | Benchmark |
+| HTTP batched | **55** | **18** | With HTTP overhead |
 
-⚠️ Benchmarks omit head_norm/RoPE. Realistic server throughput with correct model is lower.
+**nsys Profile Breakdown** (nsys profile --trace=cuda):
+| Kernel | % Time | Avg (μs) | Instances |
+|--------|--------|----------|----------|
+| gemv_int4_batched | 92.2% | 54.8 | 8851 |
+| rmsnorm_batched | 3.7% | 7.6 | 2551 |
+| quantize_int4 | 1.3% | 1.3 | 5071 |
+| attn_batched | 0.9% | 3.9 | 1260 |
+| head_norm | 0.5% | 1.1 | 2520 |
+
+**Key insight**: GEMV dominates (92%), weight loading is the bottleneck.
+
+**Embedding Pre-load Optimization (Session 71)**: Pre-load full embedding table (623 MB FP32) to GPU at startup. Runtime embedding lookup is now D2D copy instead of CPU dequantization + H2D. GPU memory: 7287 MB → 9661 MB. Throughput: ~55 t/s (unchanged, GEMV is still 92% bottleneck).
+
+**API Improvements (Session 71)**: Added OpenAI-compatible fields: unique request IDs per response, timestamps, system_fingerprint, proper usage statistics. All endpoints now return standardized JSON format.
 
 **INT4 8B quality degraded but coherent**. Grammatically correct English, factual errors, token looping without repetition penalty. 59 t/s (15× faster than INT8 server's 3.9 t/s). Weight size 5.3 GB vs 9.6 GB INT8 (45% smaller). Root cause of prior INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
 
@@ -95,6 +104,8 @@ only 1.5× worse than BF16.
 
 **FP8 path abandoned** (Session 56). FP8 per-row is 4.5× slower AND 2.3× worse
 PPL than INT8 block-16. Reference code kept in src/kernels/gemv_fp8.cu.
+
+**NVFP4 path (Session 69) — ABANDONED**: Double quantization (INT4→FP32→NVFP4) shifts weights, causing catastrophic quality degradation. PPL=24,850 vs INT4 21.82 (1000× worse). Format encoding mismatch (offset-binary INT4 vs signed-magnitude E2M1) means same nibble → different value. Speed 21 t/s is 2.67× slower than INT4 (56 t/s) due to scalar PTX dequant. No production path without retraining.
 
 **9B q_proj dimension mismatch (suspected)**: Qwen3.5-9B full_attention q_proj
 weight N=8192=32 heads × 256 dim. Server hardcodes NQ=16. If correct config uses
@@ -163,17 +174,22 @@ cmake --build build --parallel
 ### Server (HTTP, production)
 ```bash
 killall hashcat 2>/dev/null  # MUST DO BEFORE ANY MEASUREMENT
-./server/http_subprocess weights_int8_bf16 2>&1 &
-# or: python3 server/http_server.py weights_int8_bf16 8123
+# INT4 8B batched server (uses gemv_int4_batched for all GEMV calls, ~63 t/s)
+./server/http_subprocess batched &
+# Or INT4 8B warp server (~56 t/s)
+./server/http_subprocess int4_8b &
 # Test endpoints:
-curl http://localhost:8123/health
+curl http://localhost:8123/health  # Returns GPU memory, uptime, requests, latency
 curl -X POST http://localhost:8123/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"The capital of France is","max_tokens":5}'
-curl -X POST http://localhost:8123/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":10}'
 ```
+
+**Health endpoint** returns:
+```json
+{"status":"ok","model":"blackwell-8B","gpu_used_mb":14440,"gpu_total_mb":15849,"uptime_sec":40,"requests":1,"errors":0,"avg_latency_ms":235.0}
+```
+
 
 ### 1.7B benchmarks (research/validation)
 ```bash
@@ -289,10 +305,9 @@ src/kernels/
 bench/
   text_generate.cu              — 1.7B end-to-end text generation
   text_generate_qwen3_8b.cu     — 8B end-to-end text generation (INT8)
-  text_generate_int4_qwen3_8b.cu — 8B INT4 single-sequence text generation (27 t/s)
+  text_generate_int4_qwen3_8b.cu — 8B INT4 single-sequence text generation (59 t/s)
   text_generate_int4_batched.cu — 8B INT4 batched text generation (M=1:61t/s, M=2:110t/s)
-  text_generate_int4.cu         — 1.7B INT4 text generation
-  bench_ppl_int4_8b.cu          — INT4 8B PPL benchmark (PPL 23.52)
+  bench_ppl_int4_8b.cu          — INT4 8B PPL benchmark (PPL 21.82)
   decode_int8_cgraph.cu         — 1.7B M=1 CUDA Graph benchmark
   decode_int8_batched_cgraph_attn.cu — 1.7B M=8 batched benchmark
   decode_int8_nofp4.cu          — nofp4 benchmark (per-kernel + CUDA Graph)
@@ -301,7 +316,7 @@ server/
   inference_server_nofp4.cu     — C++ inference daemon (stdin/stdout JSON)
   inference_server              — compiled binary
   inference_server_int4.cu     — INT4 8B server (JSON stdio, uses benchmark decode loop)
-  inference_server_int4_batched.cu — Batched INT4 server (M=1 only, M>1 broken)
+  inference_server_int4_batched.cu — Batched INT4 server (uses gemv_int4_batched, batched GEMV M=1)
   inference_server_int4        — compiled INT4 server binary (2.7 MB)
   inference_server_int4_batched — compiled batched server binary
   http_subprocess.cpp           — C++ HTTP wrapper (httplib, fork subprocess)
@@ -321,10 +336,21 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 |--------|-----|---------|------|
 | BF16 (llama.cpp Q8_0) | **12.4** | 1.0× | Baseline |
 | INT8 block-16 (correct dims) | **18.65** | 1.5× | Production path |
-| INT4 symmetric (8B) | **23.52** | 1.9× | 56 t/s, no calibration |
-| INT4 symmetric (8B, this session) | **23.52** | 1.9× | Symmetric, no calibration |
+| INT4 symmetric (8B, baseline) | **23.52** | 1.9× | 56 t/s, no calibration |
+| INT4 + AWQ α=0.6 (8B) | **21.82** | 1.76× | AWQ calibration, random normal proxy |
+| NVFP4 E2M1 (8B) | **24,850** | 2005× | ❌ ABANDONED — double quantization, PPL vs INT4 |
 | FP8 per-row (this session) | 41.75 | 3.4× | 4.5× slower than INT8, abandoned |
 | INT8 (old, wrong dims) | 7,351,868 | — | **INVALID** — half of K/V weights ignored |
+
+### AWQ INT4 Calibration
+| Finding | Value |
+|---------|-------|
+| Best alpha | **0.6** (PPL 21.82 vs 23.52, 7.2% improvement) |
+| Method | Random normal proxy (128 seq), layer-0 pattern reused for all layers |
+| Scale integration | Folded into block scales `w_sc_new[n] = w_sc[n] * s[n]`, no kernel changes |
+| Script | `scripts/quantize_awq_int4_8b.py` |
+| INT8 8B CUDA Graph M=1 | ✅ Working (repetition penalty makes it coherent) |
+| INT8 8B batched M>1 | ❌ Garbage (pre-existing bug, not CUDA Graph) |
 
 ### Performance
 | Finding | Value |
@@ -340,12 +366,13 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 
 ### Key Decisions
 - **INT8 block-16 is the production path** (PPL=18.65, uses dp4a for speed)
-- **INT4 8B is a viable throughput path** (59 t/s, 15× faster than INT8 server, 80% of llama.cpp)
+- **INT4 8B is the throughput path** (56 t/s, PPL=21.82, AWQ α=0.6)
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
 - **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
 - **8B mixed-precision: NO HELP (Session 59)**: ALL-INT8 and MIXED(8 FP16+28 INT8) produce identical coherent output. 8B quality with correct dims is already good.
 - **9B mixed-precision: NO HELP (Session 59)**: Even 16 FP16 layers produces same garbled output as 8 FP16 layers. SSM state accumulates noise across all 32 layers.
+- **NVFP4 ABANDONED (Session 69)**: Double quantization (INT4→FP32→NVFP4) shifts weights. PPL=24,850 vs 21.82. Format mismatch (offset-binary vs signed-magnitude). 21 t/s is 2.67× slower than INT4.
 
 ### Server architecture (correct model)
 The server implements the **full Qwen3-1.7B correct decode flow**:
@@ -568,3 +595,18 @@ PPL=18.65 (1.5× BF16), which is usable quality.
 Server output before fix: " Paris, a which is the the capital of the"
 Server output after fix: Not measured yet with correct dims (server was already
 using correct dims for some paths).
+
+### Norm path regression (2026-06-10) — FIXED
+Deep clean (session 68) deleted `weights_int8_qwen3_8b/` but `text_generate_int4_qwen3_8b.cu`
+and `inference_server_int4.cu` still hardcoded paths to it for norms (qk_norms.f32,
+layernorms, final_norm.f32). `fopen` returned NULL, `fread` read garbage → segfault.
+Fix: changed all `weights_int8_qwen3_8b/` references to `weights_int4_qwen3_8b/` where
+norms now live.
+Location: `bench/text_generate_int4_qwen3_8b.cu`, `server/inference_server_int4.cu`.
+
+### Duplicate gate+up GEMV (2026-06-10) — FIXED
+`text_generate_int4_qwen3_8b.cu` had duplicate gate+up GEMV calls after down projection.
+Lines 304-305 computed gate+up again after MLP was already complete — 2 extra GEMV per
+layer × 36 layers = 72 wasted GEMV calls. Throughput: 33 t/s → **56 t/s** after fix.
+Root cause: likely copy-paste error during development.
+Location: `bench/text_generate_int4_qwen3_8b.cu` lines 304-305 (removed).

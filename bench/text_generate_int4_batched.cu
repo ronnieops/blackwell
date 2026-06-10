@@ -416,8 +416,11 @@ int main(int argc, char** argv) {
     if (argc >= 2) prompt = argv[1];
     if (argc >= 3) M = atoi(argv[2]);
     if (argc >= 4) max_new = atoi(argv[3]);
+    const char* wdir = "weights_int4_qwen3_8b";
+    if (argc >= 5) wdir = argv[4];
     
     printf("# Batched INT4 8B — %d sequences\n", M);
+    printf("  Weights: %s\n", wdir);
     printf("  Prompt: \"%s\"\n", prompt);
     
     // Reset CUDA device to ensure clean state
@@ -441,33 +444,34 @@ int main(int argc, char** argv) {
     
     // Load Q/K head norms from combined qk_norms.f32 (once for all layers)
     float* qk_h = (float*)malloc(NL * 2 * hd * 4);
-    { FILE* f2 = fopen("weights_int4_qwen3_8b/qk_norms.f32", "rb"); fread(qk_h, 4, NL * 2 * hd, f2); fclose(f2); }
+    char wqk[256]; snprintf(wqk, 256, "%s/qk_norms.f32", wdir);
+    { FILE* f2 = fopen(wqk, "rb"); fread(qk_h, 4, NL * 2 * hd, f2); fclose(f2); }
     
     for (int l = 0; l < NL; ++l) {
-        char p[256];
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_input_layernorm.f32", l);
+        char p[512];
+        snprintf(p, 512, "%s/%d_input_layernorm.f32", wdir, l);
         float* w = (float*)malloc(H * 4);
         FILE* f = fopen(p, "rb"); fread(w, 4, H, f); fclose(f);
         cudaMalloc(&W[l].rn_in, H * 4); cudaMemcpy(W[l].rn_in, w, H * 4, cudaMemcpyHostToDevice); free(w);
         
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_post_attention_layernorm.f32", l);
+        snprintf(p, 512, "%s/%d_post_attention_layernorm.f32", wdir, l);
         w = (float*)malloc(H * 4);
         f = fopen(p, "rb"); fread(w, 4, H, f); fclose(f);
         cudaMalloc(&W[l].rn_post, H * 4); cudaMemcpy(W[l].rn_post, w, H * 4, cudaMemcpyHostToDevice); free(w);
         
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_self_attn.q_proj", l);
+        snprintf(p, 512, "%s/%d_self_attn.q_proj", wdir, l);
         W[l].q = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_self_attn.k_proj", l);
+        snprintf(p, 512, "%s/%d_self_attn.k_proj", wdir, l);
         W[l].k = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_self_attn.v_proj", l);
+        snprintf(p, 512, "%s/%d_self_attn.v_proj", wdir, l);
         W[l].v = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_self_attn.o_proj", l);
+        snprintf(p, 512, "%s/%d_self_attn.o_proj", wdir, l);
         W[l].o = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_mlp.gate_proj", l);
+        snprintf(p, 512, "%s/%d_mlp.gate_proj", wdir, l);
         W[l].g = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_mlp.up_proj", l);
+        snprintf(p, 512, "%s/%d_mlp.up_proj", wdir, l);
         W[l].u = upload_w4(p);
-        snprintf(p, 256, "weights_int4_qwen3_8b/%d_mlp.down_proj", l);
+        snprintf(p, 512, "%s/%d_mlp.down_proj", wdir, l);
         W[l].d = upload_w4(p);
         
         // Q/K head norms from qk_norms.f32: [l][2][hd] layout (same as single benchmark)
@@ -479,21 +483,21 @@ int main(int argc, char** argv) {
     }
     free(qk_h);  // Free qk_norms buffer
     
-    DevW4 embed = upload_w4("weights_int4_qwen3_8b/embed_tokens");
+    char pw[512];
+    DevW4 embed = upload_w4((std::string(wdir) + "/embed_tokens").c_str());
     uint8_t* host_embed_d = new uint8_t[(size_t)embed.K * embed.N / 2];
     float* host_embed_sc = new float[(size_t)embed.N * (embed.K / 16)];
     {
-        char p[256];
-        snprintf(p, 256, "weights_int4_qwen3_8b/embed_tokens.int4_t");
-        FILE* f = fopen(p, "rb"); int h[5]; fread(h, 4, 5, f);
+        snprintf(pw, 512, "%s/embed_tokens.int4_t", wdir);
+        FILE* f = fopen(pw, "rb"); int h[5]; fread(h, 4, 5, f);
         size_t ds = (size_t)h[0] * h[1] / 2; fread(host_embed_d, 1, ds, f); fclose(f);
-        snprintf(p, 256, "weights_int4_qwen3_8b/embed_tokens.scale_t");
-        f = fopen(p, "rb"); fread(h, 4, 5, f); size_t ss = (size_t)h[3] * h[4];
+        snprintf(pw, 512, "%s/embed_tokens.scale_t", wdir);
+        f = fopen(pw, "rb"); fread(h, 4, 5, f); size_t ss = (size_t)h[3] * h[4];
         fread(host_embed_sc, 4, ss, f); fclose(f);
     }
     printf("Embed loaded: %d x %d (INT4)\n", embed.K, embed.N);
     
-    DevW4 lm_head_w = upload_w4("weights_int4_qwen3_8b/lm_head");
+    DevW4 lm_head_w = upload_w4((std::string(wdir) + "/lm_head").c_str());
     // Check lm_head weights and scales
     float* h_lm_sc = new float[16];
     cudaMemcpy(h_lm_sc, lm_head_w.sc, 64, cudaMemcpyDeviceToHost);
@@ -502,7 +506,8 @@ int main(int argc, char** argv) {
     delete[] h_lm_sc;
     
     float* w = (float*)malloc(H * 4);
-    FILE* f = fopen("weights_int4_qwen3_8b/final_norm.f32", "rb");
+    snprintf(pw, 512, "%s/final_norm.f32", wdir);
+    FILE* f = fopen(pw, "rb");
     fread(w, 4, H, f); fclose(f);
     float* d_fn; cudaMalloc(&d_fn, H * 4); cudaMemcpy(d_fn, w, H * 4, cudaMemcpyHostToDevice);
     float* d_fn_sc; cudaMalloc(&d_fn_sc, H / 16 * 4);

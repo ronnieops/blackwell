@@ -1,0 +1,27 @@
+[Unit]
+Description=Blackwell INT4 Inference Server
+After=cuda.service network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=/mnt/data/dev/projects/blackwell
+ExecStart=/mnt/data/dev/projects/blackwell/server/http_subprocess batched
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment="CUDA_VISIBLE_DEVICES=0"
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=16G
+
+# Logging
+SyslogIdentifier=blackwell
+
+[Install]
+WantedBy=multi-user.target

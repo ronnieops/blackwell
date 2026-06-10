@@ -172,7 +172,7 @@ static void load_model() {
     }
     // QK norms
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int8_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -180,17 +180,17 @@ static void load_model() {
     // Per-layer RMSNorm
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int8_qwen3_8b/%d_input_layernorm.f32",l);
+        snprintf(p,256,"weights_int4_qwen3_8b/%d_input_layernorm.f32",l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int8_qwen3_8b/%d_post_attention_layernorm.f32",l);
+        snprintf(p,256,"weights_int4_qwen3_8b/%d_post_attention_layernorm.f32",l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     // Final norm
     {float*w=(float*)malloc(H*4);
-     FILE*f=fopen("weights_int8_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+     FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
      AL(d_fn,H*4); cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice); free(w);}
     // Embed + lm_head
     embed_w=upload_w4("weights_int4_qwen3_8b/embed_tokens");

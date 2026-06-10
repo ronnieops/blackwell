@@ -1,44 +1,101 @@
-# Code Context
+# Code Context — Blackwell Repo Scout (2026-06-10)
 
-## Files Retrieved
-1. `build/libblackwell_kernels.a` — static kernel library, 179 symbols (was 177 per AGENTS.md)
-2. `bench/text_generate_int4_qwen3_8b.cu` (lines 1-16445) — 8B INT4 end-to-end benchmark
-3. `bench/text_generate_int4_batched.cu` (lines 1-21908) — NEW batched INT4 benchmark (untracked)
-4. `server/inference_server_int4.cu` (lines 1-17977) — INT4 inference server
-5. `weights_int4_qwen3_8b/` — 582 files, 5.8 GB INT4 weights
-6. `AGENTS.md` vs `HANDOFF.md` — AGENTS.md is canonical, HANDOFF.md is a diff variant
+## 1. Repo State
 
-## Key Code
-- **Kernel count**: 179 (AGENTS.md says 177 — +2 new kernels added)
-- **New kernel symbols** (not in AGENTS.md baseline):
-  - `fused_swiglu_quant` — fused SwiGLU+quant wrapper
-  - `fused_swiglu_quant_kernel` — inner kernel
-- **Production INT4 kernels**: `gemv_int4_warp`, `gemv_int4_batched`, `quantize_int4`, `unpack_int4_fp32`
-- **INT4 weight path**: `weights_int4_qwen3_8b/` — symmetric INT4, 5.8 GB
+- **Branch:** `master`
+- **Last commit:** `ecf69b7` — "Refresh HANDOFF.md: remove stale task, add batched benchmark file"
+- **Git status:** Dirty — 12 modified files + 8 untracked
+  - Modified: `AGENTS.md`, `Dockerfile.int4`, `HANDOFF.md`, `bench/text_generate_int4_batched.cu`, `server/inference_server`, `server/inference_server_9b`, `server/inference_server_nofp4.cu`, `server/inference_server_qwen35_9b.cu`, `src/kernels/gemv_int8.cu`
+  - Untracked: `bench/diag_9b_ssm.py`, `bench/text_generate_int4_1.7b.cu`, `bench/tokenize_corpus.cu`, `bench/tokenize_text.cu`, `better-inference/`, `scripts/quantize_awq_int4_8b.py`, `server/inference_server_nofp4`, `wiki_corpus.txt`
+- **Readme/AGENTS.md** present with full project context (Session 1-65 documented)
 
-## Architecture
-```
-INT4 decode path (bench/text_generate_int4_qwen3_8b.cu):
-  embed → quantize_int4 → gemv_int4_warp → RMSNorm → repeat×36
+## 2. Build System
 
-Server path (server/inference_server_int4.cu):
-  embed → quantize_int4 → gemv_int4_warp → RMSNorm → repeat×36
-  HTTP wrapper: http_subprocess forks inference_server_int4
+- **CMakeLists.txt:** Uses CUDA 13.3, `compute_120a`, GCC-12 host compiler. Library target `blackwell_kernels` — 179 symbols confirmed.
+- **Compiler:** `/usr/local/cuda-13.3/bin/nvcc`
+- **Library:** `build/libblackwell_kernels.a` — 179 exported symbols (matches expected 179)
+- **Build dir:** `build/bench/` does NOT exist — bench targets built ad-hoc outside CMake
+- **No CMake targets for new bench files** — `text_generate_int4_1.7b.cu`, `text_generate_int4_batched.cu`, `tokenize_*.cu`, `diag_9b_ssm.py` not in CMakeLists.txt
 
-Batched path (bench/text_generate_int4_batched.cu):
-  M sequences → batched GEMV (gemv_int4_batched) → per-seq RMSNorm/attention
-  Note: M>1 reported broken in AGENTS.md ("output divergence, root cause unknown")
-```
+## 3. Key New Files
 
-## Start Here
-`bench/text_generate_int4_qwen3_8b.cu` — canonical INT4 8B decode loop. Use as reference for correct single-sequence behavior. Compare against `bench/text_generate_int4_batched.cu` for batched divergence debugging.
+### `better-inference/` (855 lines total)
+- **`gguf.h`** (456 lines) — Standalone GGUF header parser. No llama.cpp dependency.
+- **`gguf_convert.cpp`** (333 lines) — GGUF → blackwell INT4 format converter.
+- **`gguf_test.cpp`** (66 lines) — Minimal test.
+- **`DESIGN.md`** — Phase plan: GGUF parser → Tensor converter → Llama 3.1 8B → AWQ calibration service.
+- **Binaries:** `gguf_convert` (69KB, built Jun 10 06:41), `gguf_test` (63KB, built Jun 10 06:12).
 
-## Discrepancies Found
-1. **Kernel count mismatch**: 179 vs 177 documented — 2 new `fused_swiglu_quant*` symbols added
-2. **Untracked file**: `bench/text_generate_int4_batched.cu` exists but not committed
-3. **AGENTS.md stale**: Server version shows "Garbled output ❌" for 8B INT8 benchmark — this was FIXED (coherent output now)
-4. **HANDOFF.md**: Variant doc with meta-prompt header, not canonical
-5. **Dirty git state**: 8 modified files not staged — likely session work-in-progress
+### `scripts/quantize_awq_int4_8b.py` (22,699 bytes)
+- AWQ INT4 calibration for 8B model.
 
-## Supervisor coordination
-No blocking issues. Repo state consistent with recent session work.
+### `bench/text_generate_int4_1.7b.cu` (17,138 bytes, untracked)
+- INT4 text generation for 1.7B model (previously missing).
+
+### `bench/tokenize_corpus.cu` (2,167 bytes, untracked)
+- Tokenizes text corpus, writes token IDs to file.
+
+### `bench/tokenize_text.cu` (1,263 bytes, untracked)
+- Tokenizes single text string.
+
+### `bench/diag_9b_ssm.py` (4,617 bytes, untracked)
+- Diagnose 9B GatedDeltaNet SSM instability.
+
+## 4. Binary Presence
+
+| Binary | Path | Size | Built | Status |
+|--------|------|------|-------|--------|
+| `bench/bench_ppl_int4_8b` | ✓ | 1.1 MB | Jun 8 13:52 | ✅ |
+| `bench/text_generate_int4_batched` | ✓ | 5.2 MB | Jun 9 20:29 | ✅ |
+| `bench/text_generate_int4_qwen3_8b` | ✓ | 4.2 MB | Jun 9 16:06 | ✅ |
+| `server/inference_server_int4` | ✓ | 4.2 MB | Jun 9 16:27 | ✅ |
+| `server/http_subprocess` | ✓ | 1.2 MB | Jun 8 17:49 | ✅ |
+| `better-inference/gguf_convert` | ✓ | 69 KB | Jun 10 06:41 | ✅ (new) |
+| `server/inference_server_nofp4` | ✓ | untracked | (new) | ✅ |
+
+**No missing critical binaries.** All expected INT4/HTTP binaries present.
+
+## 5. GPU State
+
+- **GPU:** NVIDIA GeForce RTX 5060 Ti, 16 GB VRAM (16311 MiB)
+- **Compute Capability:** 12.0
+- **Available:** ✅ — GPU online, nvidia-smi functional
+
+## 6. Weight Directories
+
+10 weight dirs present:
+
+| Dir | Size | Purpose |
+|-----|------|---------|
+| `weights_int4_qwen3_8b/` | **5.8 GB** | ✅ INT4 8B weights (508 files: .int4_t + .scale_t per tensor) |
+| `weights_int8_qwen3_8b/` | present | INT8 8B weights |
+| `weights_int8_qwen3_8b_all_int8/` | present | Pure INT8 copy |
+| `weights_int8_qwen3_8b_mixed/` | present | Mixed FP16+INT8 |
+| `weights_int8_bf16/` | present | 1.7B INT8 |
+| `weights_int8_qwen35_9b/` | present | 9B GDN INT8 |
+| `weights_int8_qwen35_9b_mixed/` | present | 9B mixed |
+| `weights_int8_qwen35_9b_all_fp16/` | present | 9B all-FP16 |
+| `weights_fp8_bf16/` | present | Dead-end FP8 |
+| `weights_int8_per_row/` | present | Experimental |
+
+**INT4 8B weights confirmed** (5.8 GB, 508 files).
+
+## 7. Discrepancies & Issues
+
+1. **Dirty working tree** — Modified source files (`inference_server_nofp4.cu`, `inference_server_qwen35_9b.cu`, `gemv_int8.cu`, `text_generate_int4_batched.cu`) not yet committed. Risk of stale build if rebuild required.
+
+2. **Stale build** — `build/libblackwell_kernels.a` last built unconfirmed. `src/kernels/gemv_int8.cu` modified — **must rebuild** before benchmarking.
+
+3. **Better-inference CMake integration missing** — `gguf_convert.cpp` built ad-hoc via g++, not part of CMake. Needs `add_executable` target.
+
+4. **GoogleTest crash** — `better-inference/gguf_test` built but may fail on machines without GoogleTest installed (CMake test target not investigated).
+
+5. **No new bench files in CMake** — `text_generate_int4_1.7b.cu`, `tokenize_corpus.cu`, `tokenize_text.cu` built manually. Not reproducible via `cmake --build`.
+
+## 8. Summary
+
+Repo is in active development state. All critical binaries present. INT4 8B weights confirmed at 5.8 GB. Build is slightly stale — `gemv_int8.cu` modified since last build. Better-inference GGUF parser is new and promising (855 LOC, no llama.cpp dep). 179 kernel symbols match expectation.
+
+**Start here if building:** Rebuild library first: `cmake -B build && cmake --build build --parallel`
+
+**Start here if adding CMake targets:** Edit `CMakeLists.txt` to add `better-inference/gguf_convert.cpp` and new bench files as executable targets.

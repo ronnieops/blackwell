@@ -154,3 +154,54 @@ if(BUILD_PYTHON_BINDINGS)
         message(STATUS "pybind11 not found — Python bindings disabled (pip install pybind11).")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# better-inference: GGUF bridge tools (no CUDA dependency)
+# ---------------------------------------------------------------------------
+add_executable(gguf_convert
+    better-inference/gguf_convert.cpp
+)
+target_include_directories(gguf_convert PRIVATE better-inference)
+target_compile_options(gguf_convert PRIVATE -O2 -std=c++17)
+target_link_libraries(gguf_convert PRIVATE stdc++fs)
+set_target_properties(gguf_convert PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../better-inference")
+
+add_executable(gguf_test
+    better-inference/gguf_test.cpp
+)
+target_include_directories(gguf_test PRIVATE better-inference)
+target_compile_options(gguf_test PRIVATE -O2 -std=c++17)
+set_target_properties(gguf_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../better-inference")
+
+# ---------------------------------------------------------------------------
+# Benchmarks (CUDA, link against kernel library)
+# ---------------------------------------------------------------------------
+function(add_blackwell_bench NAME SOURCE)
+    add_executable(${NAME} ${SOURCE})
+    target_link_libraries(${NAME} PRIVATE
+        blackwell_kernels
+        CUDA::cudart
+        CUDA::curand
+    )
+    target_compile_options(${NAME} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=compute_120a>
+    )
+    target_include_directories(${NAME} PRIVATE include)
+    set_target_properties(${NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../bench")
+endfunction()
+
+# INT4 benches
+add_blackwell_bench(text_generate_int4_1.7b bench/text_generate_int4_1.7b.cu)
+add_blackwell_bench(text_generate_int4_batched bench/text_generate_int4_batched.cu)
+add_blackwell_bench(text_generate_int4_qwen3_8b bench/text_generate_int4_qwen3_8b.cu)
+add_blackwell_bench(bench_ppl_int4_8b bench/bench_ppl_int4_8b.cu)
+add_blackwell_bench(decode_int4_cgraph_8b bench/decode_int4_cgraph_8b.cu)
+
+# Tokenizer
+add_blackwell_bench(tokenize_corpus bench/tokenize_corpus.cu)
+add_blackwell_bench(tokenize_text bench/tokenize_text.cu)
+
+# Llama 3.1
+add_blackwell_bench(text_generate_llama31_8b bench/text_generate_llama31_8b.cu)

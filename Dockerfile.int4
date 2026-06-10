@@ -8,7 +8,6 @@
 # Run (requires nvidia-container-toolkit):
 #   docker run --gpus all -p 8080:8080 \
 #     -v /mnt/data/dev/projects/blackwell/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
-#     -v /mnt/data/dev/projects/blackwell/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
 #     blackwell-server:int4 8080 int4_8b
 #
 # Test:
@@ -20,13 +19,11 @@
 FROM ubuntu:24.04
 
 LABEL description="Blackwell INT4 8B — RTX 5060 Ti, 56 t/s"
-LABEL version="0.9.3"
+LABEL version="0.9.5"
 
-# v0.9.3 features:
-# - INT4 symmetric quantization (5.3 GB vs 9.6 GB INT8)
-# - 56 t/s (14× faster than INT8 server)
-# - Repetition penalty support
-# - Coherent output with PPL=23.52 (1.9× BF16)
+# v0.9.5 features:
+# - Same as v0.9.4 but rebuilt with latest kernels (179 symbols)
+# - Includes fused_swiglu_quant kernel
 
 RUN apt-get update \
     -o Acquire::Check-Valid-Until=false \
@@ -43,7 +40,7 @@ RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
 WORKDIR /app
 
 # Binaries + tokenizer data (weights mounted from host at runtime)
-COPY server/http_subprocess server/inference_server_int4 server/inference_server_int4_batched /app/server/
+COPY server/http_subprocess server/inference_server_int4 /app/server/
 COPY tokenizer_data.bin /app/
 
 RUN ldconfig || true

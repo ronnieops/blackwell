@@ -996,7 +996,7 @@ cudaError_t gemv_int4_batched(
     int             M,
     cudaStream_t    stream)
 {
-    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 8)
+    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 16)
         return cudaErrorInvalidValue;
 
     dim3 grid(N, 1);
@@ -1010,6 +1010,14 @@ cudaError_t gemv_int4_batched(
         case 6: gemv_int4_batched_kernel<6><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
         case 7: gemv_int4_batched_kernel<7><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
         case 8: gemv_int4_batched_kernel<8><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 9: gemv_int4_batched_kernel<9><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 10: gemv_int4_batched_kernel<10><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 11: gemv_int4_batched_kernel<11><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 12: gemv_int4_batched_kernel<12><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 13: gemv_int4_batched_kernel<13><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 14: gemv_int4_batched_kernel<14><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 15: gemv_int4_batched_kernel<15><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 16: gemv_int4_batched_kernel<16><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
         default: return cudaErrorInvalidValue;
     }
     return cudaPeekAtLastError();

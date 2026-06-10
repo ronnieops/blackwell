@@ -888,8 +888,8 @@ int main(int argc, char** argv) {
                     for (int d = 0; d < S.H; d++)
                         h_hidden[d] = (float)S.h_emb_int8[next_id * S.H + d] * S.h_emb_scale[next_id * (S.H / 16) + d / 16];
                     cudaMemcpy(S.d_residual[0], h_hidden.data(), S.H * 4, cudaMemcpyHostToDevice);
-                    // Use CUDA Graph for batched decode if available
-                    if (S.graph_captured) {
+                    // Use CUDA Graph only for M=1 (graph captured with M=1, replays wrong for M>1)
+                    if (S.graph_captured && M == 1) {
                         // Update seq_pos before graph launch (async copy to pinned → device)
                         blackwell::kernels::update_decode_seq_pos(item_pos[m], S.st);
                         cudaGraphLaunch(S.decode_graph_exec, S.st);
