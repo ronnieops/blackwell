@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
     const char* prefix = "llama";
     if (arch == "qwen3" || arch == "qwen2") prefix = "qwen3";
     else if (arch == "llama") prefix = "llama";
+    bool is_llama = (arch == "llama");
 
     auto get_meta = [&](const char* key_suffix, int default_val) -> int {
         char full_key[128];
@@ -152,6 +153,7 @@ int main(int argc, char** argv) {
     printf("V = %d\n", V);
 
     // Get RoPE config
+    // Llama 3: rope_freqs (float array). Qwen3: rope_theta (scalar).
     auto get_meta_f = [&](const char* key_suffix, float default_val) -> float {
         char full_key[128];
         snprintf(full_key, 128, "%s.%s", prefix, key_suffix);
@@ -162,6 +164,27 @@ int main(int argc, char** argv) {
         return default_val;
     };
     float rope_theta = get_meta_f("rope.freq_base", 1000000.0f);
+
+    // Llama 3: rope_freqs array overrides rope_theta.
+    // rope_freqs[i] = theta^{ -2*(i % 2) / head_dim } for position i.
+    // We store rope_theta and let server RoPE kernel compute freq from pos.
+    // If rope_freqs exists, derive rope_theta from freq[0].
+    {
+        char rope_freqs_key[128];
+        snprintf(rope_freqs_key, 128, "%s.rope_freqs", prefix);
+        auto rf_it = reader.metadata().find(rope_freqs_key);
+        if (rf_it != reader.metadata().end()) {
+            auto* rf = std::get_if<std::vector<float>>(&rf_it->second);
+            if (rf && !rf->empty()) {
+                // freq[0] = theta^{-2/head_dim}. Extract theta: theta = freq[0]^{ -head_dim/2 }
+                float f0 = (*rf)[0];
+                if (f0 > 0) {
+                    rope_theta = powf(f0, -(float)hd / 2.0f);
+                    printf("  Llama 3 rope: rope_freqs[0]=%.6f → rope_theta=%.0f\n", f0, rope_theta);
+                }
+            }
+        }
+    }
 
     printf("Config: %d layers, H=%d, I=%d, nqh=%d, nkv=%d, hd=%d, V=%d, rope_theta=%.0f\n",
            NL, H, I, nqh, nkv, hd, V, rope_theta);
@@ -226,7 +249,7 @@ int main(int argc, char** argv) {
     for (auto& ti : tensors) {
         
         char bw_name[128];
-        if (!map_qwen3_name(ti.name.c_str(), bw_name, sizeof(bw_name))) {
+        if (!map_tensor_name(ti.name.c_str(), bw_name, sizeof(bw_name))) {
             printf("  SKIP: %s (unmapped)\n", ti.name.c_str());
             continue;
         }

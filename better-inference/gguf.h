@@ -506,23 +506,24 @@ static Int4Weight requant_int4(const float* data, int N, int K) {
     return w;
 }
 
-// ── Tensor name mapper (Qwen3 architecture) ─────────────────────
-// GGUF name → blackwell prefix
-struct TensorMapping {
-    const char* blackwell_name;
-    int layer;  // -1 for non-layer tensors
-};
+// ── Tensor name mapper (Qwen3 + Llama 3.1) ───────────────────────
+// GGUF name → blackwell weight file name.
+// Both Qwen3 and Llama 3.1 use the same tensor naming convention:
+//   blk.{l}.attn_q.weight  → layer l self_attn.q_proj
+//   blk.{l}.ffn_gate.weight → layer l mlp.gate_proj
+//   token_embd.weight → embed_tokens
+//
+// Key differences:
+//   - Llama 3: rope_freqs (float array) vs Qwen3: rope_theta (scalar)
+//   - Llama 3: tiktoken vocab; Qwen3: BPE vocab
+//   - Llama 2: no attn_q_norm / attn_k_norm (optional; skipped if absent)
+//   - Qwen3: has attn_q_norm / attn_k_norm (required)
 
-// Qwen3 specific: GGUF prefix "blk.{layer}." → blackwell "{layer}_"
-// Tensor name suffix mapping:
-static const char* map_tensor_name_qwen3(const char* gguf_name) {
-    // Non-layer tensors
+// Non-layer tensor mapping (shared Qwen3 + Llama)
+static const char* map_tensor_name_common(const char* gguf_name) {
     if (strcmp(gguf_name, "token_embd.weight") == 0) return "embed_tokens";
     if (strcmp(gguf_name, "output_norm.weight") == 0) return "final_norm";
     if (strcmp(gguf_name, "output.weight") == 0) return "lm_head";
-
-    // Layer tensors: "blk.{l}.{group}.{name}.weight" → "{l}_{group}_{name}"
-    // We handle in the converter code, not here
     return nullptr;
 }
 
@@ -535,46 +536,47 @@ static int extract_blk_layer(const char* name) {
     return (*p == '.') ? layer : -1;
 }
 
-// Map "blk.{l}.attn_q.weight" → "l_self_attn.q_proj" etc.
-// Returns true if mapped, writes to buf (must hold 128 chars)
-static bool map_qwen3_name(const char* gguf_name, char* buf, int buf_size) {
-    // Non-layer
-    auto* mapped = map_tensor_name_qwen3(gguf_name);
-    if (mapped) { snprintf(buf, buf_size, "%s", mapped); return true; }
+// Internal layer tensor mapper.
+// suf: pointer to tensor suffix after "blk.{l}."
+// Returns true if matched, writes "{l}_{bw_name}" to buf.
+static bool map_layer_tensor(const char* suf, int layer, char* buf, int buf_size) {
+    static const struct NameMap { const char* gguf; const char* bw; } maps[] = {
+        {"attn_norm.weight",       "input_layernorm"},
+        {"attn_q.weight",          "self_attn.q_proj"},
+        {"attn_k.weight",          "self_attn.k_proj"},
+        {"attn_v.weight",          "self_attn.v_proj"},
+        {"attn_output.weight",      "self_attn.o_proj"},
+        {"attn_q_norm.weight",      "q_norm"},   // Llama 3 + Qwen3
+        {"attn_k_norm.weight",      "k_norm"},   // Llama 3 + Qwen3
+        {"ffn_norm.weight",         "post_attention_layernorm"},
+        {"ffn_gate.weight",         "mlp.gate_proj"},
+        {"ffn_up.weight",            "mlp.up_proj"},
+        {"ffn_down.weight",         "mlp.down_proj"},
+    };
+    for (auto& m : maps) {
+        if (strcmp(suf, m.gguf) == 0) {
+            snprintf(buf, buf_size, "%d_%s", layer, m.bw);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Map GGUF tensor name → blackwell weight file name.
+// Works for both Qwen3 and Llama 3.1 (same naming convention).
+// Returns true if mapped, writes to buf (128 bytes).
+static bool map_tensor_name(const char* gguf_name, char* buf, int buf_size) {
+    // Non-layer tensors
+    auto* common = map_tensor_name_common(gguf_name);
+    if (common) { snprintf(buf, buf_size, "%s", common); return true; }
 
     // Layer tensor
     int l = extract_blk_layer(gguf_name);
     if (l < 0) return false;
 
-    // Find suffix after "blk.{l}."
     const char* suf = gguf_name + 4;
     while (*suf >= '0' && *suf <= '9') suf++;
     if (*suf == '.') suf++; else return false;
 
-    // GGUF suffix → blackwell name mapping
-    // GGUF stores shapes as [N, K] (row-major: outer=N, inner=K)
-    // Blackwell format: K=input_dim, N=output_dim
-    // The GGUF shape[0] = N, shape[1] = K → our K=shape[1], N=shape[0]
-    struct NameMap { const char* gguf; const char* bw; };
-    static const NameMap maps[] = {
-        {"attn_norm.weight", "input_layernorm"},
-        {"attn_q.weight", "self_attn.q_proj"},
-        {"attn_k.weight", "self_attn.k_proj"},
-        {"attn_v.weight", "self_attn.v_proj"},
-        {"attn_output.weight", "self_attn.o_proj"},
-        {"attn_q_norm.weight", "q_norm"},
-        {"attn_k_norm.weight", "k_norm"},
-        {"ffn_norm.weight", "post_attention_layernorm"},
-        {"ffn_gate.weight", "mlp.gate_proj"},
-        {"ffn_up.weight", "mlp.up_proj"},
-        {"ffn_down.weight", "mlp.down_proj"},
-    };
-
-    for (auto& m : maps) {
-        if (strcmp(suf, m.gguf) == 0) {
-            snprintf(buf, buf_size, "%d_%s", l, m.bw);
-            return true;
-        }
-    }
-    return false;
+    return map_layer_tensor(suf, l, buf, buf_size);
 }
