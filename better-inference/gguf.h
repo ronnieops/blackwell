@@ -300,6 +300,10 @@ private:
                 return n_super * 80;   // block_q5_K: d(2)+dmin(2)+scales(12)+qh(32)+qs(32)
             case GGML_TYPE_Q6_K:
                 return n_super * 210;  // block_q6_K: d(2)+ql(128)+qh(64)+scales(16)
+            case GGML_TYPE_Q5_0: {
+                uint64_t n_blocks = (n_el + 31) / 32;
+                return n_blocks * 26;  // d(fp16) + qs[20] + qh[4]
+            }
             default: return n_el * 4;  // fallback
         }
     }
@@ -343,6 +347,38 @@ static void dequant_q8_0(const uint8_t* src, float* dst, uint64_t n_el) {
     uint64_t n_blocks = (n_el + 31) / 32;
     for (uint64_t b = 0; b < n_blocks; b++)
         dequant_q8_0_block(src + b * 34, dst + b * 32);
+}
+
+// ── Q5_0 dequant ────────────────────────────────────────────────
+// Q5_0: 32 elements/block, 22 bytes/block (2 fp16 scale + 20 bytes q4 data + qh)
+// Actually Q5_0 stores 4-bit base + separate 1-bit high bit:
+//   qs[20]: 32 x 4-bit nibbles (base values 0-15)
+//   qh[4]:  32 x 1-bit high bits (adds 16 when bit=1)
+// Dequant: y = d * (qs_nibble + (qh_bit ? 16 : 0) - 16)
+// = d * (qs_nibble + qh_bit * 16 - 16)
+// Final: y = d * q, where q ∈ [-16, 15]
+// Formula: q = (nibble + (qh_bit ? 16 : 0)) - 16 = nibble - 16 + (qh_bit ? 16 : 0)
+// Simplified: q = nibble + (qh_bit ? 0 : 0) ... let's just use the full formula
+
+// Q5_0 block: d(fp16) + qs[20] + qh[4] = 26 bytes
+static void dequant_q5_0_block(const uint8_t* src, float* dst) {
+    float d;
+    dequant_f16(src, &d);
+    const uint8_t* qs = src + 2;
+    const uint8_t* qh = src + 22;
+    for (int i = 0; i < 32; i++) {
+        uint8_t nibble = qs[i / 2];
+        nibble = (i % 2 == 0) ? (nibble & 0x0F) : (nibble >> 4);
+        uint8_t bit = (qh[i / 8] >> (i % 8)) & 1;
+        int q = (int)nibble + (bit ? 16 : 0) - 16;  // range: -16 to 15
+        dst[i] = d * (float)q;
+    }
+}
+
+static void dequant_q5_0(const uint8_t* src, float* dst, uint64_t n_el) {
+    uint64_t n_blocks = (n_el + 31) / 32;
+    for (uint64_t b = 0; b < n_blocks; b++)
+        dequant_q5_0_block(src + b * 26, dst + b * 32);
 }
 
 // ── Q4_K (k-quant) dequant ───────────────────────────────────────

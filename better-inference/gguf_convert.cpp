@@ -126,14 +126,16 @@ int main(int argc, char** argv) {
     printf("Architecture: %s\n", arch.c_str());
 
     // Handle different arch prefixes for metadata keys
-    const char* prefix = "llama";
-    if (arch == "qwen3" || arch == "qwen2") prefix = "qwen3";
-    else if (arch == "llama") prefix = "llama";
+    // Prefix matches architecture name for metadata keys.
+    // Qwen2 → qwen2, Qwen3 → qwen3, Llama → llama
+    std::string prefix = arch;
+    // Normalize: lowercase
+    for (auto& c : prefix) if (c >= 'A' && c <= 'Z') c += 32;
     bool is_llama = (arch == "llama");
 
     auto get_meta = [&](const char* key_suffix, int default_val) -> int {
         char full_key[128];
-        snprintf(full_key, 128, "%s.%s", prefix, key_suffix);
+        snprintf(full_key, 128, "%s.%s", prefix.c_str(), key_suffix);
         return reader.meta_int(full_key, default_val);
     };
 
@@ -171,7 +173,7 @@ int main(int argc, char** argv) {
     // If rope_freqs exists, derive rope_theta from freq[0].
     {
         char rope_freqs_key[128];
-        snprintf(rope_freqs_key, 128, "%s.rope_freqs", prefix);
+        snprintf(rope_freqs_key, 128, "%s.rope_freqs", prefix.c_str());
         auto rf_it = reader.metadata().find(rope_freqs_key);
         if (rf_it != reader.metadata().end()) {
             auto* rf = std::get_if<std::vector<float>>(&rf_it->second);
@@ -255,7 +257,8 @@ int main(int argc, char** argv) {
         }
 
         // Get file data pointer — GGUF offset is relative to tensor data section start
-        uint64_t file_offset = tensor_data_off + ti.offset;
+        // GGUF tensor offset is absolute from file start
+        uint64_t file_offset = ti.offset;
         if (file_offset + ti.file_size > gguf_mem.size) {
             fprintf(stderr, "  ERROR: %s offset out of bounds (file_offset=%llu + size=%llu > %zu)\n",
                     ti.name.c_str(), (unsigned long long)file_offset,
@@ -307,6 +310,25 @@ int main(int argc, char** argv) {
             // Other F32 — treat as weight to requant
             // (unlikely for Qwen3)
             printf("  F32 FALLTHRU: %s\n", ti.name.c_str());
+        }
+
+        // Handle Q5_0 quantized tensors
+        if (ti.type == GGML_TYPE_Q5_0) {
+            uint64_t n_el = ti.nelements();
+            uint64_t K = ti.shape[0];
+            uint64_t N = ti.shape.size() > 1 ? ti.shape[1] : 1;
+
+            printf("  Converting %s: [%llu x %llu] Q5_0\n",
+                   ti.name.c_str(), (unsigned long long)N,
+                   (unsigned long long)K);
+
+            if (n_el < 1024) { printf("    -> too small, skipping\n"); continue; }
+
+            std::vector<float> f32_buf(n_el);
+            dequant_q5_0(src, f32_buf.data(), n_el);
+
+            auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+            write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
         }
 
         // Handle Q8_0 quantized tensors
