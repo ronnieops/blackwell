@@ -410,6 +410,19 @@ cudaError_t fused_rmsnorm_quant_int8(
     float           eps,
     cudaStream_t    stream = 0);
 
+// Fused RMSNorm + INT4 quant (single kernel)
+// Input: FP32 projection output, RMSNorm weight
+// Output: packed INT4 (2 vals/byte) + per-block scales (block-16, absmax/7)
+// Replaces: fused_rmsnorm → quantize_int4 (2 kernels → 1 kernel)
+cudaError_t fused_rmsnorm_quant_int4(
+    uint8_t*        x_out_packed,
+    float*          x_out_scale,
+    const float*    proj,
+    const float*    weight,
+    int             N,
+    float           eps,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Fused O-projection + RMSNorm + FP4 pack (convenience: 2 kernels)
 // ---------------------------------------------------------------------------
