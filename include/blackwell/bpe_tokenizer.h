@@ -299,6 +299,45 @@ public:
     std::vector<uint32_t> encode(const std::string& text) const {
         std::vector<uint32_t> ids;
 
+        // 0. Check for special tokens (Llama 3: <|begin_of_text|>, <|eot_id|>, etc.)
+        // These may not be in the BPE vocab and must be handled before pretokenization.
+        {
+            size_t pos = 0;
+            while (pos < text.size()) {
+                // Try to match special tokens (longest first)
+                bool matched = false;
+                for (const auto& [tok_str, tok_id] : special_tokens) {
+                    if (pos + tok_str.size() <= text.size() &&
+                        text.compare(pos, tok_str.size(), tok_str) == 0) {
+                        ids.push_back(tok_id);
+                        pos += tok_str.size();
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) continue;
+                // Not a special token — find the next special token boundary
+                size_t next_special = text.size();
+                for (const auto& [tok_str, _] : special_tokens) {
+                    size_t found = text.find(tok_str, pos);
+                    if (found != std::string::npos && found < next_special)
+                        next_special = found;
+                }
+                if (next_special > pos) {
+                    // BPE-encode the non-special segment
+                    auto seg_ids = encode_bpe(text.substr(pos, next_special - pos));
+                    ids.insert(ids.end(), seg_ids.begin(), seg_ids.end());
+                }
+                pos = next_special;
+            }
+            return ids;
+        }
+    }
+
+    // Encode non-special text segment via pretokenize + BPE.
+    std::vector<uint32_t> encode_bpe(const std::string& text) const {
+        std::vector<uint32_t> ids;
+
         // 1. Pre-tokenize: split into chunks using simplified GPT-4 regex
         // For ASCII: match words, numbers, punctuation, whitespace
         std::vector<std::string> chunks = pretokenize(text);
