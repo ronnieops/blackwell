@@ -49,8 +49,37 @@ static DevW4 upload_w4(const char* prefix) {
     return dw;
 }
 
+// FP32 weight struct (loaded from .fp16 files)
+struct DevFP32 { int K, N; float* d; };
+static DevFP32 upload_fp32(const char* prefix) {
+    char p[256]; snprintf(p,256,"%s.fp16",prefix);
+    FILE* f=fopen(p,"rb"); int hdr[2]; fread(hdr,4,2,f);
+    int K=hdr[0], N=hdr[1];
+    size_t nel=(size_t)N*K;
+    std::vector<uint16_t> hp(nel);
+    fread(hp.data(),2,nel,f); fclose(f);
+    std::vector<float> fp(nel);
+    for(size_t i=0;i<nel;i++) {
+        uint16_t h=hp[i];
+        uint32_t b=(h&0x8000)<<16; int exp=(h>>10)&0x1F;
+        uint32_t man=h&0x3FF;
+        if(exp==0) { fp[i]=0; }
+        else if(exp==31) { fp[i]=(h&0x3FF)?1e18f:1e18f; }
+        else { exp-=15; if(exp<-14) exp=-14; fp[i]=ldexpf((1.0f+man/1024.0f),exp); if(h&0x8000) fp[i]=-fp[i]; }
+    }
+    DevFP32 dw; dw.K=K; dw.N=N;
+    cudaMalloc(&dw.d,nel*4); cudaMemcpy(dw.d,fp.data(),nel*4,cudaMemcpyHostToDevice);
+    return dw;
+}
+
 struct LW4 {
     DevW4 q,k,v,o,g,u,d;
+    float* qn; float* kn; float* rn_in; float* rn_post;
+};
+
+// FP32 weight layer struct (for --fp16 mode)
+struct LF32 {
+    DevFP32 q,k,v,o,g,u,d;
     float* qn; float* kn; float* rn_in; float* rn_post;
 };
 

@@ -728,6 +728,16 @@ cudaError_t gemv_fp4_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// FP32 GEMV — y = W * x where W is [N x K] row-major FP32.
+// For high-precision inference with FP16 weights (dequantized to FP32).
+cudaError_t gemv_fp32_launch(
+    float*          y_out,
+    const float*    W_fp32,
+    const float*    x_fp32,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // FP32 activations × packed FP4 weights — mixed precision warp GEMV.
 // x_fp32: [K] FP32, W_packed: [N][K/2] bytes, W_scale: [N][K/16] FP32
 cudaError_t gemv_fp32_fp4_warp(
