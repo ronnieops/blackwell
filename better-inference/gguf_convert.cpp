@@ -155,7 +155,9 @@ int main(int argc, char** argv) {
     printf("V = %d\n", V);
 
     // Get RoPE config
-    // Llama 3: rope_freqs (float array). Qwen3: rope_theta (scalar).
+    // GGUF v3 uses nested prefixes. Keys like "rope.freq_base" are stored as
+    // "general.repo_url.key" (e.g., "https://huggingface.co/.../llama.rope.freq_base").
+    // We need to search for any key ending with the suffix.
     auto get_meta_f = [&](const char* key_suffix, float default_val) -> float {
         char full_key[128];
         snprintf(full_key, 128, "%s.%s", prefix, key_suffix);
@@ -163,9 +165,43 @@ int main(int argc, char** argv) {
         if (it != reader.metadata().end()) {
             if (auto* v = std::get_if<float>(&it->second)) return *v;
         }
+        // Fallback: search for any key ending with key_suffix
+        for (const auto& kv : reader.metadata()) {
+            if (kv.first.length() > strlen(key_suffix) &&
+                kv.first.compare(kv.first.length() - strlen(key_suffix), strlen(key_suffix), key_suffix) == 0) {
+                if (auto* v = std::get_if<float>(&kv.second)) return *v;
+            }
+        }
         return default_val;
     };
-    float rope_theta = get_meta_f("rope.freq_base", 1000000.0f);
+    float rope_theta = get_meta_f("rope.freq_base", 0.0f);
+    // Fallback: if rope_theta is 0, search file for klen(20)+"rope.freq_base" pattern
+    if (rope_theta == 0.0f) {
+        FILE* f = fopen(gguf_path, "rb");
+        if (f) {
+            char buf[8192];
+            size_t file_pos = 0;
+            while (fread(buf, 1, 8192, f) == 8192) {
+                for (size_t i = 0; i + 22 < 8192; i++) {  // 8 (klen) + 14 (key) <= 8192
+                    uint64_t klen = *(uint64_t*)(buf + i);
+                    if (klen == 20 && memcmp(buf + i + 8, "rope.freq_base", 14) == 0) {
+                        // Found klen=20 + "rope.freq_base". Value is at i + 8 + 20 + 4 = i + 32
+                        float v = *(float*)(buf + i + 32);
+                        if (v > 0) {
+                            rope_theta = v;
+                            printf("  Fallback read rope.freq_base = %.0f\n", rope_theta);
+                            break;
+                        }
+                    }
+                }
+                file_pos += 8192 - 22;
+                if (file_pos > 100000) break;  // metadata is at start of file
+                fseek(f, file_pos, SEEK_SET);
+            }
+            fclose(f);
+        }
+        if (rope_theta == 0.0f) rope_theta = 1000000.0f;  // default
+    }
 
     // Llama 3: rope_freqs array overrides rope_theta.
     // rope_freqs[i] = theta^{ -2*(i % 2) / head_dim } for position i.
