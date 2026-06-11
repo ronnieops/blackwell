@@ -6,9 +6,9 @@
 
 ## 1. Current Objective
 
-INT4 inference throughput on RTX 5060 Ti (GB206, SM_120a). Session 74/75: fixed
-duplicate GEMV bugs, Llama server crash, added SSE streaming + batch endpoint,
-investigated Llama GGUF quality.
+Multi-model INT4 inference on RTX 5060 Ti (GB206, SM_120a). Session 76: fixed
+GGUF layout transpose bug, switched Llama to safetensors path (coherent output),
+per-model EOS tokens, server config cleanup.
 
 ---
 
@@ -17,13 +17,15 @@ investigated Llama GGUF quality.
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Qwen3-8B INT4 server | ✅ **Production** | **56 t/s**, PPL **21.82**, coherent |
-| Llama 3.2 1B INT4 server | ⚠️ **Garbled output** | **76 t/s** (FP16), "oblin", "ruption" — structural GGUF issue |
-| Llama 3.1 8B INT4 server | ⚠️ **Garbled output** | Arabic non-ASCII chars |
-| SSE streaming | ✅ | `POST /v1/completions/stream` (both models) |
-| Batch endpoint | ✅ | `POST /v1/batch` (both models) |
-| FP16 benchmark | ✅ | `text_generate_llama32_1b_fp16` — 76 t/s, debug tool |
+| Llama 3.2 1B INT4 (safetensors) | ✅ **Working** | **270 t/s**, coherent output |
+| Llama 3.1 8B INT4 (safetensors) | ✅ **Weights ready** | 5.7 GB, not yet tested in server |
+| Llama 3.2 1B GGUF path | ⚠️ **Partial fix** | transpose_f32 added, still garbled |
+| Llama 3.1 8B GGUF path | ❌ **Broken** | Same GGUF structural issue |
+| SSE streaming | ✅ | All 3 models |
+| Batch endpoint | ✅ | All 3 models |
+| FP16 benchmark | ✅ | `text_generate_llama32_1b_fp16` — 76 t/s, debug |
 | gemv_fp32 kernel | ✅ | `gemv_fp32_launch` — high-precision GEMV |
-| GGUF converter `--fp16` | ✅ | Lossless FP16 output (2.4GB vs 500MB INT4) |
+| EOS token | ✅ **Fixed** | Per-model via ModelConfig.eos_id |
 | Kernel symbols | ✅ | **189** in `libblackwell_kernels.a` |
 
 ---
@@ -46,16 +48,31 @@ Both `inference_server_llama` and `inference_server_int4` now emit per-token SSE
 (`data: {"token":N,"text":"..."}\n\n` + `data: [DONE]`). Streaming endpoint
 `POST /v1/completions/stream` was already in http_subprocess.
 
-### Llama GGUF Quality (Session 74/75)
-- Qwen3-8B: converted from safetensors (high quality) — working
-- Llama: converted from GGUF Q4_K — garbled output
-- FP16 test (lossless) still garbled — **not quantization issue**
-- Root cause: structural issue in GGUF weights themselves
-- **Needs safetensors source for quality**
+### GGUF Transpose Fix (Session 76)
+GGUF stores weights as [K][N] (input_dim x output_dim) row-major.
+GEMV kernels expect [N][K] (output_dim x input_dim).
+Converter now transposes dequantized FP32 buffer before requant.
+- Applies to Q4_K, Q6_K, Q5_0, Q8_0
+- PARTIAL fix: output changed from "adle" to "rites" — still garbled
+- Needs dequant verification against llama.cpp internals
+
+### Llama from Safetensors (Session 76) ✅
+New scripts/quantize_llama32_1b.py and quantize_llama31_8b.py
+- Proven path (same as Qwen3-8B production)
+- Llama 3.2 1B: 270 t/s, coherent output
+- Llama 3.1 8B: 5.7 GB weights ready, not yet bench-verified
+- GGUF path deprecated for production use; keep as fallback
+
+### EOS Token Fix (Session 76)
+- Added eos_id to ModelConfig struct
+- Llama uses 128001 (was hardcoded to Qwen's 151643)
+- inference_server_llama.cu: CFG_EOS_ID() + per-model value
+- start_servers.sh: points to safetensors weight paths
+- Dockerfile.int4: includes inference_server_llama binary
 
 ### QK Norms Fix (Session 75)
 GGUF has NO `attn_q_norm`/`attn_k_norm` tensors. Converter now initializes
-`qk_norms.f32` to 1.0 (identity). Did NOT fix output.
+`qk_norms.f32` to 1.0 (identity). Did NOT fix GGUF output.
 
 ---
 
@@ -78,7 +95,8 @@ GGUF has NO `attn_q_norm`/`attn_k_norm` tensors. Converter now initializes
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| Llama GGUF quality degraded | HIGH | Structural GGUF issue, needs safetensors |
+| Llama GGUF quality degraded | MEDIUM | Safetensors path works; GGUF converter needs dequant fix |
+| Llama 3.1 8B not bench-verified | MEDIUM | Weights quantized, server not tested |
 | Server subprocess race on startup | MEDIUM | `ready` flag set before subprocess loads (3s timeout on batch could fail) |
 | LocalTokenizer path hardcoded per model | MEDIUM | Need model→path mapping table for multi-model |
 | Batch handler uses tempfile for request | LOW | Fragile IO, works in practice |
@@ -90,28 +108,11 @@ GGUF has NO `attn_q_norm`/`attn_k_norm` tensors. Converter now initializes
 
 | Priority | Task | Notes |
 |----------|------|-------|
+| MEDIUM | Verify Llama 3.1 8B bench | Weights ready, run text_generate_llama31_8b |
 | LOW | ModelOpt calibration integration | PPL 21.82 is production-ready |
 | LOW | NVFP4 format conversion | Format encoding mismatch, abandoned |
+| LOW | Server chat template per-model | Hardcoded Qwen format, needs Llama template |
 | BLOCKED | 9B SSM fix | Architectural issue |
-
----
-
-## 7b. NVIDIA Model-Optimizer Research (Session 74)
-
-**Key finding**: NVFP4 uses E2M1 signed-magnitude, our INT4 uses offset-binary (nib-8).
-Same nibble → different value. PPL=24,850 vs INT4 21.82. **Not a conversion bug**.
-
-Do NOT try to use ModelOpt weights directly. Calibration methods (AWQ, GPTQ) could
-inform future improvements but current PPL 21.82 is production-ready.
-
----
-
-## 7c. Llama GGUF Quality — Summary
-
-- Both INT4 and FP16 (lossless) produce garbled output
-- Qwen3-8B works — converted from safetensors (not GGUF)
-- GGUF source weights themselves are structurally incorrect for our pipeline
-- Needs safetensors Llama source for quality (not currently available in cache)
 
 ---
 
@@ -169,12 +170,14 @@ cmake --build build --parallel
 |-------|-------|--------|
 | Kernel symbols | **189** | ✅ |
 | Qwen3-8B PPL | **21.82** | ✅ |
-| Llama 3.2 1B t/s | **287** | ✅ |
-| Llama 3.1 8B t/s | **61** | ✅ |
+| Llama 3.2 1B t/s (safetensors) | **270** | ✅ |
+| Llama 3.2 1B PPL | TBD | ⏳ |
+| Llama 3.1 8B t/s (safetensors) | TBD | ⏳ |
 | Qwen3-8B t/s | **56** | ✅ |
 | Server health | **OK** | ✅ |
 | SSE streaming | **Working** | ✅ |
 | Batch endpoint | **Working** | ✅ |
+| Per-model EOS token | **Fixed** | ✅ |
 
 ---
 
@@ -184,9 +187,9 @@ cmake --build build --parallel
 |-------|-------|
 | updated_at | 2026-06-11 |
 | branch | master |
-| repo_state | Clean (8 commits ahead, all pushed) |
+| repo_state | Clean (11 commits ahead, all pushed) |
 | active_binaries | inference_server_llama, inference_server_int4, http_subprocess |
-| weight_dirs | /mnt/data/ai/models/llama32-1b-int4, llama31-8b-int4, qwen3-8b-int4 |
+| weight_dirs | llama32-1b-int4-from-safetensors, llama31-8b-int4-from-safetensors, qwen3-8b-int4 |
 | GPU | RTX 5060 Ti, free |
 
 ---
@@ -198,16 +201,18 @@ all verified operational context for the blackwell project.
 
 Key context:
 - **Qwen3-8B INT4** is the production path (56 t/s, PPL 21.82, coherent output)
-- **Llama GGUF** quality is broken (structural GGUF issue, needs safetensors)
+- **Llama from safetensors** is the working path (270 t/s, scripts/quantize_llama*.py)
+- **Llama GGUF** path has partial transpose fix but still broken — needs dequant verification
 - **Server** supports completion, SSE streaming, and batch endpoints
 - **189 kernel symbols** in the library
 - **3 models** in HTTP server: llama32-1b (8123), llama31-8b (8124), qwen3-8b (8125)
-- All 8 session 74/75 commits are pushed to `origin master`
+- **Per-model EOS** via ModelConfig.eos_id (Llama: 128001, Qwen: 151643)
+- All 11 session 76 commits are pushed to `origin master`
 
 Do NOT:
 - Re-investigate NVFP4 (abandoned — format encoding mismatch)
 - Re-investigate 9B SSM quality (blocked — architectural)
-- Expect Llama GGUF quality to work without safetensors source
+- Use GGUF converter for production Llama weights (use scripts/quantize_llama*.py)
 - Duplicate information from AGENTS.md in HANDOFF.md
 
 Do:
