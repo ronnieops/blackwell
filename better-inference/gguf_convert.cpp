@@ -47,6 +47,17 @@ static void write_file(const char* path, const void* data, size_t size) {
     fclose(f);
 }
 
+// Transpose FP32 buffer from GGUF [K][N] layout to kernel [N][K] layout.
+// GGUF stores row-major: data[k * N + n] = weight[input_k][output_n]
+// Kernel expects:       data[n * K + k] = weight[output_n][input_k]
+static void transpose_f32(float* buf, int K, int N) {
+    std::vector<float> tmp((size_t)K * N);
+    for (int k = 0; k < K; k++)
+        for (int n = 0; n < N; n++)
+            tmp[(size_t)n * K + k] = buf[(size_t)k * N + n];
+    memcpy(buf, tmp.data(), (size_t)K * N * 4);
+}
+
 // Write INT4 sym weight in blackwell format
 static void write_int4_weight(const char* out_dir, const char* name,
                                const uint8_t* packed, const float* scales,
@@ -401,6 +412,7 @@ int main(int argc, char** argv) {
 
             std::vector<float> f32_buf(n_el);
             dequant_q5_0(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
 
             if (fp16_mode) {
                 write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
@@ -442,6 +454,7 @@ int main(int argc, char** argv) {
             }
             std::vector<float> f32_buf(n_el);
             dequant_q8_0(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
 
             if (fp16_mode) {
                 write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
@@ -470,6 +483,7 @@ int main(int argc, char** argv) {
             // Dequantize Q4_K -> FP32
             std::vector<float> f32_buf(n_el);
             dequant_q4_K(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
 
             if (fp16_mode) {
                 // Write FP16 directly (lossless)
@@ -498,6 +512,7 @@ int main(int argc, char** argv) {
 
             std::vector<float> f32_buf(n_el);
             dequant_q6_K(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
 
             if (fp16_mode) {
                 write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);

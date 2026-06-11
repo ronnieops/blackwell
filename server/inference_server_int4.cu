@@ -340,14 +340,8 @@ int main(int argc, char** argv) {
     load_model();
     alloc_buffers();
 
-    // Warm up: run dummy inference to JIT-compile all CUDA kernels
-    // This ensures first real request has consistent timing and output
-    fprintf(stderr, "[WARMUP] Running dummy inference...\n"); fflush(stdout);
-    {
-        std::vector<uint32_t> dummy(1, 151643); // EOS token as dummy input
-        auto warmup = generate(dummy, 1, 0.0f, 0, 1.0f);
-    }
-    fprintf(stderr, "[WARMUP] Done.\n"); fflush(stdout);
+    // Warm up: DISABLED - causes output divergence
+    fprintf(stderr, "[WARMUP] Skipped\n"); fflush(stdout);
 
     fprintf(stderr, "Ready.\n"); fflush(stdout);
 
