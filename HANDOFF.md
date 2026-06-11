@@ -22,7 +22,7 @@ Session 72: CUDA Graph fix (2.1% speedup, graph-safe attention), GGUF bridge Pha
 | Deployment | ✅ | `deploy/` with systemd, nginx, monitoring |
 | API | ✅ | OpenAI-compatible (unique IDs, timestamps, usage) |
 | CUDA Graph | ⚠️ **Partial** | 2.1% speedup (867 nodes). Limited by GEMV 92% dominance. |
-| GGUF Bridge | ✅ **Phase 1-2** | Parser + Qwen3 converter working. 1.7B tested. |
+| GGUF Bridge | ✅ **Phase 1-3** | Qwen3 + Llama 3.2 converter. Llama 3.2 1B: 223 t/s, coherent. |
 | NVFP4 | ❌ **ABANDONED** | PPL=24,850. Format mismatch + double quant unsolvable. |
 | 9B quality | ❌ **BLOCKED** | SSM instability. A_log clamp insufficient. |
 | New model download | ❌ **BLOCKED** | Network issues. No 14B or 9B weights available. |
@@ -38,6 +38,10 @@ Session 72: CUDA Graph fix (2.1% speedup, graph-safe attention), GGUF bridge Pha
 - **Housekeeping**: 89→19 bench .cu files, removed stale binaries and backups.
 - **CUDA Graph fix (Session 72)**: Replaced H2D memcpy in attention with device-side seq_pos. New APIs: `attention_decode_batched_gqa_device()`, `attention_decode_gqa_device()`. Graph now captures 867 nodes including KV cache + attention + RoPE. Speedup: 2.1% (64→65 t/s). Limited by GEMV dominance.
 - **GGUF bridge Phase 1-2**: Parser reads GGUF v3, converter dequantizes Q8_0→INT4, writes blackwell format. Tested with Qwen3-1.7B Q8_0. Tokenizer export matches original format.
+- **GGUF bridge Phase 3 (Llama support)**: Unified `map_tensor_name()` for Qwen3 + Llama 3.1/3.2. Llama 3.2 1B Q4_K_M converted: 262 files, 891 MB. Tested with `bench/text_generate_llama32_1b`: 223 t/s, coherent output.
+- **GGUF converter bug (FIXED)**: Tensor data offset was used directly without adding `tensor_data_off`. GGUF v3 stores offsets relative to tensor data section. This caused all F32 weights (layernorms) to read from wrong offset → garbage layernorm weights → NaN logits. Fixed by adding `tensor_data_off` to all tensor reads.
+- **GGUF RoPE fix**: GGUF v3 uses nested prefixes (rope.freq_base stored under full repo URL). Fixed by searching for any key ending with the suffix.
+- **Llama 3.2 1B verified**: 16L, H=2048, I=8192, nqh=32, nkv=8, hd=64, V=128256, rope_theta=500000. Q4_K/Q6_K mixed quantization. Benchmark: 223 t/s, coherent text.
 
 ---
 

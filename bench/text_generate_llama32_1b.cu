@@ -251,7 +251,6 @@ int main(int argc, char** argv) {
 
         // ── INT4 Embedding: host dequant single row → GPU ──
         dequant_embed_row(h_embed.data(),tid,host_embed_d,host_embed_sc,H);        die(cudaMemcpyAsync(d_x32,h_embed.data(),H*4,cudaMemcpyHostToDevice,st),"embed_cpy");
-
         // ══ 28-layer decode ══
         for(int l=0;l<NL;++l){
 
@@ -337,6 +336,7 @@ int main(int argc, char** argv) {
             cudaMemcpy(&l0,d_logits,4,cudaMemcpyDeviceToHost);
             cudaMemcpy(&l264,d_logits+264,4,cudaMemcpyDeviceToHost);
             cudaMemcpy(&l37018,d_logits+37018,4,cudaMemcpyDeviceToHost);
+            printf("  logits: tok0=%.1f tok264=%.1f tok37018=%.1f\n",l0,l264,l37018);
             int next_id;
             die(blackwell::kernels::sample_gpu(d_logits,V,temperature,top_k,d_next_id,0xdeadbeefLL,step,st),"sample");
             die(cudaMemcpy(&next_id,d_next_id,4,cudaMemcpyDeviceToHost),"copy");

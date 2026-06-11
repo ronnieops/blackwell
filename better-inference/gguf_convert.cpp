@@ -292,12 +292,12 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // Get file data pointer — GGUF offset is relative to tensor data section start
-        // GGUF tensor offset is absolute from file start
-        uint64_t file_offset = ti.offset;
+        // Get file data pointer — GGUF v3 tensor offset is RELATIVE to tensor data section
+        uint64_t file_offset = tensor_data_off + ti.offset;
         if (file_offset + ti.file_size > gguf_mem.size) {
-            fprintf(stderr, "  ERROR: %s offset out of bounds (file_offset=%llu + size=%llu > %zu)\n",
-                    ti.name.c_str(), (unsigned long long)file_offset,
+            fprintf(stderr, "  ERROR: %s offset out of bounds (data_off=%llu + ti.off=%llu + size=%llu > %zu)\n",
+                    ti.name.c_str(), (unsigned long long)tensor_data_off,
+                    (unsigned long long)ti.offset,
                     (unsigned long long)ti.file_size, gguf_mem.size);
             continue;
         }

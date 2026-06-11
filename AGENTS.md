@@ -83,7 +83,12 @@ This is NOT a quantization issue — architectural/inference problem.
 
 **INT4/INT5 1.7B quality dead**. All sub-8-bit paths produce garbled text after 28+ layers.
 
-**GGUF Bridge (Session 72)**: `better-inference/` — GGUF → blackwell INT4 converter. Parser (`gguf.h`) reads GGUF v3 files, extracts metadata and tensors. Converter (`gguf_convert.cpp`) dequantizes Q8_0/Q4_K → FP32 → re-quantizes to INT4 block-16, writes blackwell weight format. Tested with Qwen3-1.7B Q8_0 GGUF → 454 files, 1.3GB. Weights verified correct (scales in [0.002,0.012], values reasonable). Tokenizer export matches original format. Phase 1 (parser) + Phase 2 (Qwen3 converter) complete. Phase 3 (Llama support) needs name mapper. Usage: `./better-inference/gguf_convert model.gguf output_dir/`
+**GGUF Bridge (Session 73)**: `better-inference/` — GGUF → blackwell INT4 converter. Parser (`gguf.h`) reads GGUF v3 files. Converter (`gguf_convert.cpp`) dequantizes Q4_K/Q5_0/Q6_K/Q8_0 → FP32 → re-quantizes to INT4 block-16. Phase 1 (parser) + Phase 2 (Qwen3 converter) + Phase 3 (Llama 3.1/3.2 support) complete.
+- **Critical fix**: GGUF v3 tensor offsets are RELATIVE to tensor data section, not absolute. Converter must add `tensor_data_off` to `ti.offset` when reading tensor data. This bug caused all F32 layernorm weights to be garbage → NaN logits.
+- **RoPE fix**: GGUF v3 uses nested prefixes (rope.freq_base stored under full repo URL). Fixed by searching for any key ending with the suffix.
+- **Llama 3.2 1B verified**: `bench/text_generate_llama32_1b` — 223 t/s, coherent output. 16L, H=2048, I=8192, nqh=32, nkv=8, hd=64, V=128256, rope_theta=500000. Mixed Q4_K/Q6_K quantization. 262 files, 891 MB.
+- **Qwen2.5-0.5B verified**: 392 files, mixed Q4_K/Q5_0/Q6_K/Q8_0. Config: 24 layers, H=896, I=4864, nqh=14, nkv=2, hd=64.
+- Usage: `./better-inference/gguf_convert model.gguf output_dir/`
 
 **PPL quality (1.7B, WikiText-2, 512 ctx)**
 | Config | PPL | vs BF16 |
