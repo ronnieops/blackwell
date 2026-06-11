@@ -131,7 +131,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 186 symbols in `build/libblackwell_kernels.a`
+**Library**: 189 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -238,7 +238,7 @@ killall hashcat 2>/dev/null
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 177
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 189
 ```
 
 ### Docker server (v0.7.0, 160 MB, weights mounted at runtime)
@@ -307,6 +307,7 @@ src/kernels/
   fused_rmsnorm.cu        — RMSNorm + quant + pack fusions
   gemm_int8.cu            — WMMA INT8 GEMM (prefill)
   gated_delta_net.cu       — GatedDeltaNet SSM kernels
+  gemv_fp32.cu             — Plain FP32 GEMV (high-precision inference)
   gemv_fp32_int4_asym.cu  — INT4 research (122 dB exact, dead-end)
   gemv_fp32_int5_asym.cu   — INT5 research (122 dB exact, dead-end)
   gemv_int8_gate_up.cu     — Fused gate+up GEMV (0.91×)
@@ -378,6 +379,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 - **INT4 8B is the throughput path** (56 t/s, PPL=21.82, AWQ α=0.6)
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
+- **v0.9.4**: Added --fp16 flag to GGUF converter, FP16 benchmark, gemv_fp32 kernel
 - **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
 - **8B mixed-precision: NO HELP (Session 59)**: ALL-INT8 and MIXED(8 FP16+28 INT8) produce identical coherent output. 8B quality with correct dims is already good.
 - **9B mixed-precision: NO HELP (Session 59)**: Even 16 FP16 layers produces same garbled output as 8 FP16 layers. SSM state accumulates noise across all 32 layers.
@@ -470,7 +472,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (M=1 benchmark)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 177)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 189)
 HTTP test: `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":1}'`
 
 ---
