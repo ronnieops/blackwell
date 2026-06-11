@@ -379,7 +379,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 - **INT4 8B is the throughput path** (56 t/s, PPL=21.82, AWQ α=0.6)
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
-- **v0.9.4**: Added --fp16 flag to GGUF converter, FP16 benchmark, gemv_fp32 kernel
+- **v0.9.4**: Added --fp16 flag to GGUF converter, FP16 benchmark, gemv_fp32 kernel, SSE streaming, batch endpoint fix
 - **No INT8 quality wall** — the 7.3M PPL was entirely a dimension config bug
 - **8B mixed-precision: NO HELP (Session 59)**: ALL-INT8 and MIXED(8 FP16+28 INT8) produce identical coherent output. 8B quality with correct dims is already good.
 - **9B mixed-precision: NO HELP (Session 59)**: Even 16 FP16 layers produces same garbled output as 8 FP16 layers. SSM state accumulates noise across all 32 layers.
