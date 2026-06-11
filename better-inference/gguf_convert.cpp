@@ -84,6 +84,42 @@ static void write_f32(const char* out_dir, const char* name, const float* data, 
     printf("  %s: %d F32\n", name, n);
 }
 
+// Write FP16 weight (lossless, for high quality)
+static void write_fp16_weight(const char* out_dir, const char* name, const float* data, int K, int N) {
+    char path[256];
+    snprintf(path, 256, "%s/%s.fp16", out_dir, name);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    // Header: [K, N]
+    int hdr[2] = {K, N};
+    fwrite(hdr, 4, 2, f);
+    // FP16 data (transpose KxN -> NxK for row-major GEMV)
+    std::vector<uint16_t> fp16((size_t)N * K);
+    for (int n = 0; n < N; n++) {
+        for (int k = 0; k < K; k++) {
+            float v = data[n * (size_t)K + k];  // [N, K] -> row n
+            // Float32 to float16
+            uint32_t f = *(uint32_t*)&v;
+            uint16_t h;
+            int exp = (f >> 23) & 0xFF;
+            if (exp == 0) { h = 0; }
+            else if (exp == 255) { h = (f & 0x80000000) ? 0xFC00 : 0x7C00; }
+            else {
+                int sign = (f >> 16) & 0x8000;
+                exp -= 127;
+                if (exp < -14) exp = -14;
+                else if (exp > 15) exp = 15;
+                h = sign | ((exp + 15) << 10) | ((f >> 13) & 0x3FF);
+            }
+            fp16[n * (size_t)K + k] = h;
+        }
+    }
+    fwrite(fp16.data(), 2, (size_t)N * K, f);
+    fclose(f);
+    double mb = (double)N * K * 2 / (1024 * 1024);
+    printf("  %s: %dx%d FP16 %.1fMB\n", name, N, K, mb);
+}
+
 // Write combined Q/K head norms
 static void write_qk_norms(const char* out_dir, int NL, int hd,
                            const float* qnorms, const float* knorms) {
@@ -101,12 +137,15 @@ static void write_qk_norms(const char* out_dir, int NL, int hd,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s model.gguf output_dir/\n", argv[0]);
+        fprintf(stderr, "Usage: %s model.gguf output_dir/ [--fp16]\n", argv[0]);
+        fprintf(stderr, "  --fp16: output FP16 instead of INT4 (lossless, larger)\n");
         return 1;
     }
 
     const char* gguf_path = argv[1];
     const char* out_dir = argv[2];
+    bool fp16_mode = (argc >= 4 && strcmp(argv[3], "--fp16") == 0);
+    if (fp16_mode) printf("FP16 mode: preserving original precision (larger files)\n");
 
     // Create output directory
     std::filesystem::create_directories(out_dir);
@@ -363,8 +402,12 @@ int main(int argc, char** argv) {
             std::vector<float> f32_buf(n_el);
             dequant_q5_0(src, f32_buf.data(), n_el);
 
-            auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
-            write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
         }
 
         // Handle Q8_0 quantized tensors
@@ -400,13 +443,13 @@ int main(int argc, char** argv) {
             std::vector<float> f32_buf(n_el);
             dequant_q8_0(src, f32_buf.data(), n_el);
 
-            // Requantize to INT4
-            // f32_buf is stored in row-major [N, K] — each row is K elements
-            // requant_int4 expects data in [N, K] layout (N rows, K columns)
-            auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
-
-            // Write
-            write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                // Requantize to INT4
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
         }
 
         // Handle Q4_K quantized tensors (GGUF Q4_K_M)
@@ -428,11 +471,14 @@ int main(int argc, char** argv) {
             std::vector<float> f32_buf(n_el);
             dequant_q4_K(src, f32_buf.data(), n_el);
 
-            // Requantize to INT4 block-16 (symmetric)
-            auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
-
-            // Write
-            write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            if (fp16_mode) {
+                // Write FP16 directly (lossless)
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                // Requantize to INT4 block-16 (symmetric)
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
         }
 
         // Handle Q6_K quantized tensors (used for lm_head + some ffn_down in Q4_K_M)
@@ -453,8 +499,12 @@ int main(int argc, char** argv) {
             std::vector<float> f32_buf(n_el);
             dequant_q6_K(src, f32_buf.data(), n_el);
 
-            auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
-            write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
         }
     }
 
