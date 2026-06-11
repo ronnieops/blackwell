@@ -197,6 +197,7 @@ endfunction()
 # INT4 benches
 add_blackwell_bench(text_generate_int4_1.7b bench/text_generate_int4_1.7b.cu)
 add_blackwell_bench(bench_ppl_llama32_1b bench/bench_ppl_llama32_1b.cu)
+add_blackwell_bench(bench_ppl_llama31_8b bench/bench_ppl_llama31_8b.cu)
 add_blackwell_bench(text_generate_llama31_8b bench/text_generate_llama31_8b.cu)
 add_blackwell_bench(text_generate_int4_batched bench/text_generate_int4_batched.cu)
 add_blackwell_bench(text_generate_int4_qwen3_8b bench/text_generate_int4_qwen3_8b.cu)
