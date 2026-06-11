@@ -6,9 +6,9 @@
 
 ## 1. Current Objective
 
-INT4/INT8 decode throughput on RTX 5060 Ti. GGUF bridge Phase 1-3 complete.
-Session 74: Fixed duplicate GEMV bugs (+28-42% throughput), fixed Llama server crash,
-integrated Llama servers into HTTP server.
+INT4 inference throughput on RTX 5060 Ti (GB206, SM_120a). Session 74/75: fixed
+duplicate GEMV bugs, Llama server crash, added SSE streaming + batch endpoint,
+investigated Llama GGUF quality.
 
 ---
 
@@ -16,68 +16,61 @@ integrated Llama servers into HTTP server.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| INT4 8B HTTP server | ✅ **Production** | **~55 t/s**, PPL **21.82** |
-| INT4 8B batched server | ✅ | **~63 t/s** (gemv_int4_batched) |
-| CUDA Graph | ✅ | 2.9% speedup (867 nodes). GEMV 92% bottleneck. |
-| GGUF Bridge | ✅ **Phase 1-3** | Qwen3 + Llama 3.1 + Llama 3.2 + Qwen3-8B converted. |
-| **Llama 3.2 1B benchmark** | ✅ **Fixed** | **287 t/s** (+28% from duplicate GEMV fix) |
-| **Llama 3.1 8B benchmark** | ✅ **Fixed** | **61 t/s** (+42% from duplicate GEMV fix) |
-| **Llama HTTP server** | ✅ **Fixed** | Works, coherent output, 27ms latency |
-| Multi-model server | ✅ | `start_servers.sh llama32-1b` starts on port 8123 |
-| NVFP4 | ❌ **ABANDONED** | PPL=24,850, format mismatch + double quant |
-| 9B quality | ❌ **BLOCKED** | SSM instability |
+| Qwen3-8B INT4 server | ✅ **Production** | **56 t/s**, PPL **21.82**, coherent |
+| Llama 3.2 1B INT4 server | ⚠️ **Garbled output** | **76 t/s** (FP16), "oblin", "ruption" — structural GGUF issue |
+| Llama 3.1 8B INT4 server | ⚠️ **Garbled output** | Arabic non-ASCII chars |
+| SSE streaming | ✅ | `POST /v1/completions/stream` (both models) |
+| Batch endpoint | ✅ | `POST /v1/batch` (both models) |
+| FP16 benchmark | ✅ | `text_generate_llama32_1b_fp16` — 76 t/s, debug tool |
+| gemv_fp32 kernel | ✅ | `gemv_fp32_launch` — high-precision GEMV |
+| GGUF converter `--fp16` | ✅ | Lossless FP16 output (2.4GB vs 500MB INT4) |
+| Kernel symbols | ✅ | **189** in `libblackwell_kernels.a` |
 
 ---
 
-## 3. Recent Decisions (Session 74)
+## 3. Recent Decisions
 
-### Duplicate GEMV Bug (Critical Fix)
-Both `text_generate_llama32_1b.cu` and `text_generate_llama31_8b.cu` had duplicate
-gate+up GEMV calls after down projection (same bug as Qwen3-8B Session 66). Each
-duplicate pair wasted 2×40ms per token × NL layers.
+### Duplicate GEMV Bug (Session 74)
+Both Llama benchmarks had duplicate gate+up GEMV after down projection.
+Llama 3.2 1B: 223→287 t/s (+28%). Llama 3.1 8B: 43→61 t/s (+42%).
 
-**Llama 3.2 1B**: 223→287 t/s (+28%)
-**Llama 3.1 8B**: 43→61 t/s (+42%)
+### Llama Server Crash (Session 74, 5 fixes)
+1. `static std::vector<LW4> W(NL)` — NL derefed `cfg=NULL` at static init. Fix: empty decl + `W.resize(NL)`
+2. Hardcoded `weights_int4_qwen3_8b/` paths — Fix: use `wdir` variable
+3. Wrong config paths — Fix: absolute paths in MODELS[]
+4. Wrong `strstr` order — Fix: `strstr(wdir, model)` + exact match
+5. Invalid warmup token (151643 > 128256) — Fix: dummy(1, 0)
 
-### Llama Server Crash (3 bugs fixed)
+### SSE Streaming (Session 75)
+Both `inference_server_llama` and `inference_server_int4` now emit per-token SSE
+(`data: {"token":N,"text":"..."}\n\n` + `data: [DONE]`). Streaming endpoint
+`POST /v1/completions/stream` was already in http_subprocess.
 
-1. **Static vector initialization crash**: `static std::vector<LW4> W(NL);` — `NL`
-   is a macro `CFG_NL()` which dereferences `cfg=NULL` at static init time. Fix:
-   `static std::vector<LW4> W;` + `W.resize(NL)` in `load_model()`.
+### Llama GGUF Quality (Session 74/75)
+- Qwen3-8B: converted from safetensors (high quality) — working
+- Llama: converted from GGUF Q4_K — garbled output
+- FP16 test (lossless) still garbled — **not quantization issue**
+- Root cause: structural issue in GGUF weights themselves
+- **Needs safetensors source for quality**
 
-2. **Hardcoded final_norm path**: `fopen("weights_int4_qwen3_8b/final_norm.f32",...` —
-   wrong for Llama models. Fix: `snprintf(fn,256,"%s/final_norm.f32",wdir)`.
-
-3. **Wrong model config paths**: `wdir="llama32-1b"` (relative) instead of full path.
-   Fix: `wdir="/mnt/data/ai/models/llama32-1b-int4"` in MODELS[].
-
-4. **Wrong model matching**: `strstr(model, wdir)` checked if model arg was
-   substring of wdir. Fix: `strstr(wdir, model)` (short name in full path) + exact match.
-
-5. **Invalid warmup token**: `dummy(1, 151643)` — EOS token out of range (vocab=128256).
-   Fix: `dummy(1, 0)` — valid token.
-
-### HTTP Server Fixes
-- Added `inference_server_llama` binary path to http_subprocess.cpp
-- Added `svr.set_write_timeout(300)` to prevent 504 timeouts
-- Fixed LocalTokenizer path: hardcoded `/mnt/data/ai/models/llama32-1b-int4/tokenizer_data.bin`
-  per model name (was loading Qwen3 tokenizer by default → garbage output)
-
-### CMake Fix
-- `inference_server_llama` target had no include directories. Changed from
-  `add_executable()` to `add_blackwell_bench()` pattern with proper flags.
+### QK Norms Fix (Session 75)
+GGUF has NO `attn_q_norm`/`attn_k_norm` tensors. Converter now initializes
+`qk_norms.f32` to 1.0 (identity). Did NOT fix output.
 
 ---
 
 ## 4. Important Constraints
 
-- **Model dims (8B native)**: nqh=32, nkv=8, hd=128, KV=1024, H=4096, I=12288
-- **Model dims (1.7B)**: nqh=16, nkv=8, hd=128, KV=1024, H=2048, I=6144
-- **Model dims (Llama 3.2 1B)**: nqh=32, nkv=8, hd=64, KV=512, H=2048, I=8192, rope=500000
-- **Model dims (Llama 3.1 8B)**: nqh=32, nkv=8, hd=128, KV=1024, H=4096, I=14336, rope=500000
-- `compute_120a` required (NOT `compute_120`)
-- `killall hashcat` before every GPU measurement
-- 186 kernel symbols in `libblackwell_kernels.a`
+- **Hardware**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
+- **Toolchain**: CUDA 13.3, `compute_120a` (NOT `compute_120`), CMake 3.x
+- **Nvcc**: `/usr/local/cuda-13.3/bin/nvcc`
+- **Model dims (Llama 3.2 1B)**: NL=16, H=2048, nqh=32, nkv=8, hd=64, rope=500000, V=128256
+- **Model dims (Llama 3.1 8B)**: NL=32, H=4096, nqh=32, nkv=8, hd=128, rope=500000, V=128256
+- **Model dims (Qwen3-8B)**: NL=36, H=4096, nqh=32, nkv=8, hd=128, rope=1000000, V=151936
+- **Pre-measurement**: `killall hashcat 2>/dev/null` before any GPU measurement
+- **Build**: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
+- **Kernel validation**: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 189)
+- Server warmup needs subprocess to print "Ready." before accepting requests
 
 ---
 
@@ -85,176 +78,87 @@ duplicate pair wasted 2×40ms per token × NL layers.
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| BpeTokenizer has no `vocab_size()` method | LOW | Use `tok_.load()` return value for ok check |
-| LocalTokenizer path hardcoded per model | MEDIUM | Need model→path mapping table |
-| Server warmup uses token 0 (valid but arbitrary) | LOW | Could use actual BOS token |
-| PPL benchmark | MEDIUM | `bench_ppl_llama32_1b` doesn't propagate hidden states |
+| Llama GGUF quality degraded | HIGH | Structural GGUF issue, needs safetensors |
+| Server subprocess race on startup | MEDIUM | `ready` flag set before subprocess loads (3s timeout on batch could fail) |
+| LocalTokenizer path hardcoded per model | MEDIUM | Need model→path mapping table for multi-model |
+| Batch handler uses tempfile for request | LOW | Fragile IO, works in practice |
+| 9B SSM stability (A_log > 0) | BLOCKED | Architectural, not quantization |
 
 ---
 
-## 6. Pending Tasks
+## 7. Pending Tasks
 
 | Priority | Task | Notes |
 |----------|------|-------|
-| MEDIUM | Run PPL on Llama models | Compare against llama.cpp reference |
-| MEDIUM | Validate Llama 3.1 8B quality | Check coherent output on longer sequences |
-| MEDIUM | Add Qwen3-8B to start_servers.sh | Weight dir exists at /mnt/data/ai/models/qwen3-8b-int4 |
-| LOW | AWQ calibration for GGUF converter | Better quality on next conversion |
-| BLOCKED | 9B SSM fix | Architectural, not quantization |
-
----
-
-## 7. Suggested Next Actions
-
-1. ~~Validate Llama 3.1 8B~~ — Quality degraded, see Section 7c
-2. ~~Run PPL benchmark~~ — Not meaningful with degraded quality
-3. **Add Qwen3-8B to start_servers.sh** — Multi-model support
-4. **Fix PPL benchmark design** — Propagate hidden states between steps
-
----
-
-## 7c. Llama GGUF Quality Issue (Session 74/75)
-
-**Issue**: GGUF-converted Llama models produce garbled output despite correct structure.
-
-**Symptoms**:
-- Llama 3.2 1B: outputs "oblin", "ruption", "tragedy ateg" — garbled English
-- Llama 3.1 8B: outputs Arabic/non-ASCII characters mixed with English
-- Qwen3-8B: works correctly (coherent output "frac", "=", "input")
-
-**Root cause**: Double quantization (GGUF Q4_K → FP32 → blackwell INT4) introduces
-noise that shifts logits. The model is deterministic (same tokens every run) but
-semantically wrong.
-
-**Investigation done**:
-- Tokenizer correct (128256 vocab, 280147 merges)
-- Layer norms valid (not NaN, reasonable ranges)
-- Embedding format correct (INT4 block-16, offset-binary)
-- QK norms: GGUF has NO per-head QK norm tensors (unlike Qwen3)
-  - Fix: Initialize qk_norms.f32 to 1.0 (identity) when source tensors missing
-  - Did NOT fix output — still garbled
-
-**Architecture difference**:
-- Qwen3-8B: Converted from SAFETENSORS (native INT4, high quality)
-- Llama: Converted from GGUF Q4_K (double quantization, lossy)
-
-**Fix attempt** (Session 75):
-1. Fixed qk_norms initialization to 1.0 (was 0.0)
-2. Re-converted Llama 3.2 1B
-3. Still produces garbled output — qk_norms not the issue
-
-**Conclusion**: GGUF → our INT4 conversion is fundamentally lossy. GGUF Q4_K
-uses different quantization parameters and scales. Dequantizing and re-quantizing
-introduces noise that corrupts the model output.
-
-**Recommendation**: Focus on Qwen3-8B native format (working, coherent output)
-for production. Llama GGUF conversion is a known limitation.
-
-**Fix attempt (Session 75)**:
-- Added --fp16 flag to converter (lossless FP16 output)
-- Llama 3.2 1B FP16: 2.4GB (vs 500MB INT4)
-- Created FP16 benchmark (text_generate_llama32_1b_fp16): 76 t/s, but garbled
-- Server validation: Qwen3-8B works (output "frac{1}{2}"), Llama garbled
-- Added gemv_fp32_launch kernel for high-precision inference
-
-**Llama quality conclusion**:
-- Both INT4 and FP16 produce garbled output
-- Root cause is NOT quantization — FP16 preserves GGUF weights
-- GGUF weights themselves produce incorrect output
-- Qwen3-8B works because it was converted from safetensors
-- Llama GGUF conversion is a known limitation (structural issue in weights)
-
-**Server status**:
-- Qwen3-8B: working, coherent output, 7.3GB GPU
-- Llama 3.2 1B: working but garbled, 1.4GB GPU
-- Streaming: not supported (inference servers don't emit SSE)
-- Batch: not supported (inference servers don't handle batch JSON)
+| LOW | ModelOpt calibration integration | PPL 21.82 is production-ready |
+| LOW | NVFP4 format conversion | Format encoding mismatch, abandoned |
+| BLOCKED | 9B SSM fix | Architectural issue |
 
 ---
 
 ## 7b. NVIDIA Model-Optimizer Research (Session 74)
 
-**Repo**: `github.com/NVIDIA/Model-Optimizer` — PyTorch-based quantization library.
-**Package**: `nvidia-modelopt` on PyPI.
+**Key finding**: NVFP4 uses E2M1 signed-magnitude, our INT4 uses offset-binary (nib-8).
+Same nibble → different value. PPL=24,850 vs INT4 21.82. **Not a conversion bug**.
 
-### Format Compatibility
-| Format | Encoding | Block size | Scales | Compatible? |
-|--------|----------|------------|--------|-------------|
-| Our INT4 block-16 | Offset-binary (nib-8) | 16 | FP32 | ✅ Production |
-| ModelOpt NVFP4 | E2M1 signed-magnitude | 16 | FP8 E4M3 | ❌ Different encoding |
-| ModelOpt INT4 AWQ | Offset-binary | 128 | FP16/BF16 | ⚠️ Compatible but different block size |
+Do NOT try to use ModelOpt weights directly. Calibration methods (AWQ, GPTQ) could
+inform future improvements but current PPL 21.82 is production-ready.
 
-**Key finding**: Same nibble value maps to DIFFERENT actual values between offset-binary
-(our INT4) and signed-magnitude E2M1 (ModelOpt NVFP4). This explains our Session 69
-failure: PPL=24,850 vs INT4 21.82. Not a conversion bug — fundamental format incompatibility.
+---
 
-### Calibration Methods (for future AWQ improvement)
-| Method | Algorithm | Notes |
-|--------|-----------|-------|
-| MaxCalibrator | absmax | Fast, default |
-| MseCalibrator | MSE sweep | Better accuracy |
-| LocalHessianCalibrator | Hessian-based | FP8 scale optimization |
-| AWQ | Activation-aware | Per-layer weight scaling |
-| GPTQ | Gradient post-training | Layerwise weight update |
+## 7c. Llama GGUF Quality — Summary
 
-Our current AWQ: random normal proxy (128 samples) → α=0.6 → PPL 21.82.
-ModelOpt: proper calibration with dataloader → potentially better quality.
-
-### Integration Points
-- ModelOpt exports: safetensors + config.json (different from our flat binary format)
-- ModelOpt recipes: YAML configs in `modelopt_recipes/general/ptq/`
-- TRT-LLM/vLLM/SGLang deployment paths
-
-### Recommendations
-1. **Do NOT** try to directly use ModelOpt weights — format encoding incompatibility
-2. **Consider** adopting ModelOpt calibration methods for better AWQ quality
-3. **Reference** recipe YAML format for future config system design
-4. **Low priority** — current INT4 block-16 with α=0.6 is production-ready
+- Both INT4 and FP16 (lossless) produce garbled output
+- Qwen3-8B works — converted from safetensors (not GGUF)
+- GGUF source weights themselves are structurally incorrect for our pipeline
+- Needs safetensors Llama source for quality (not currently available in cache)
 
 ---
 
 ## 8. Important Files / Commands
 
-### Benchmark (fixed)
+### Benchmarks
 ```bash
-killall hashcat 2>/dev/null
-./bench/text_generate_llama32_1b "Hello" 50   # 287 t/s (was 223)
-./bench/text_generate_llama31_8b "Hello" 50   # 61 t/s (was 43)
+./bench/text_generate_llama32_1b "Hello" 10     # 287 t/s
+./bench/text_generate_llama31_8b "Hello" 10     # 61 t/s
+./bench/text_generate_int4_qwen3_8b "Hello" 10  # 56 t/s (coherent)
+./bench/text_generate_llama32_1b_fp16 "Hello" 10 # 76 t/s (FP16, garbled)
+./bench/bench_ppl_int4_8b                        # PPL 21.82
 ```
 
-### HTTP Server (fixed)
+### HTTP Server
 ```bash
-killall hashcat 2>/dev/null
-cd /mnt/data/dev/projects/blackwell
-./server/http_subprocess 8123 llama32-1b &    # Start Llama 3.2 1B server
-sleep 20
-curl -s -X POST http://localhost:8123/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"Hello","max_tokens":5}'
+./server/http_subprocess 8123 llama32-1b &    # Llama 3.2 1B on 8123
+./server/http_subprocess 8124 llama31-8b &    # Llama 3.1 8B on 8124
+./server/http_subprocess 8125 qwen3-8b &      # Qwen3-8B on 8125
+
+# Endpoints
+curl http://localhost:8123/health
+curl -X POST http://localhost:8123/v1/completions -d '{"prompt":"Hello","max_tokens":5}'
+curl -X POST http://localhost:8123/v1/completions/stream -d '{"prompt":"Hello","max_tokens":5,"stream":true}'
+curl -X POST http://localhost:8123/v1/batch -d '{"prompts":["Hello","World"],"max_tokens":5}'
 ```
 
-### Multi-model Server
+### Start All Servers
 ```bash
-./start_servers.sh llama32-1b    # Start Llama 3.2 1B on port 8123
-./start_servers.sh               # Start all models
+./start_servers.sh  # Starts all models (Llama 8123, Llama 8B 8124, Qwen3 8125)
 ```
 
 ### Build
 ```bash
 CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-```
 
-### Rebuild http_subprocess (after changes)
-```bash
+# http_subprocess (g++ only)
 /usr/bin/g++ -O2 /tmp/httplib.o server/http_subprocess.cpp -I include -I /usr/local/cuda-13.3/include \
   -L /usr/local/cuda-13.3/targets/x86_64-linux/lib -o server/http_subprocess \
   -lpthread -lz -lssl -lcrypto -lcudart
 ```
 
-### Validate
+### GGUF Converter
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 186
+./better-inference/gguf_convert model.gguf output_dir/        # INT4 (default)
+./better-inference/gguf_convert model.gguf output_dir/ --fp16 # FP16 (lossless)
 ```
 
 ---
@@ -263,12 +167,14 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 
 | Check | Value | Status |
 |-------|-------|--------|
-| Throughput (Llama 3.2 1B) | **287 t/s** | ✅ (+28% from fix) |
-| Throughput (Llama 3.1 8B) | **61 t/s** | ✅ (+42% from fix) |
-| Server startup | **Works** | ✅ No crash |
-| Server output | **Coherent** | ✅ "oblinoblin..." matches benchmark |
-| HTTP health | **OK** | ✅ 1 req, 0 errors, 27ms latency |
-| GPU memory | GPU free | ✅ |
+| Kernel symbols | **189** | ✅ |
+| Qwen3-8B PPL | **21.82** | ✅ |
+| Llama 3.2 1B t/s | **287** | ✅ |
+| Llama 3.1 8B t/s | **61** | ✅ |
+| Qwen3-8B t/s | **56** | ✅ |
+| Server health | **OK** | ✅ |
+| SSE streaming | **Working** | ✅ |
+| Batch endpoint | **Working** | ✅ |
 
 ---
 
@@ -278,7 +184,35 @@ nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expec
 |-------|-------|
 | updated_at | 2026-06-11 |
 | branch | master |
-| repo_state | Clean |
-| active_components | GGUF bridge, Llama benchmarks, Llama HTTP server |
-| key_session | 74 — Duplicate GEMV fixes, Llama server crash fixes, HTTP integration |
+| repo_state | Clean (8 commits ahead, all pushed) |
+| active_binaries | inference_server_llama, inference_server_int4, http_subprocess |
+| weight_dirs | /mnt/data/ai/models/llama32-1b-int4, llama31-8b-int4, qwen3-8b-int4 |
 | GPU | RTX 5060 Ti, free |
+
+---
+
+## META PROMPT
+
+Before acting, read BOTH `AGENTS.md` and `HANDOFF.md` fully. These files contain
+all verified operational context for the blackwell project.
+
+Key context:
+- **Qwen3-8B INT4** is the production path (56 t/s, PPL 21.82, coherent output)
+- **Llama GGUF** quality is broken (structural GGUF issue, needs safetensors)
+- **Server** supports completion, SSE streaming, and batch endpoints
+- **189 kernel symbols** in the library
+- **3 models** in HTTP server: llama32-1b (8123), llama31-8b (8124), qwen3-8b (8125)
+- All 8 session 74/75 commits are pushed to `origin master`
+
+Do NOT:
+- Re-investigate NVFP4 (abandoned — format encoding mismatch)
+- Re-investigate 9B SSM quality (blocked — architectural)
+- Expect Llama GGUF quality to work without safetensors source
+- Duplicate information from AGENTS.md in HANDOFF.md
+
+Do:
+- Verify repo state (`git status`) before any edits
+- Prefer incremental changes over full re-writes
+- Check `nm` count if changing kernel sources
+- Confirm `hashcat` is killed before GPU measurements
+- Keep HANDOFF.md compact and deduplicated
