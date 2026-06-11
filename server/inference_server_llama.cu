@@ -145,6 +145,22 @@ static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
 }
 
 // ── JSON helpers ──
+static std::string json_escape_str(const std::string& s) {
+    // Inline version of json_escape for use in generate()
+    std::string r;
+    for (char c : s) {
+        if (c == '"') r += "\\\"";
+        else if (c == '\\') r += "\\\\";
+        else if (c == '\n') r += "\\n";
+        else if (c == '\r') r += "\\r";
+        else if (c == '<') r += "\\u003c";
+        else if (c == '>') r += "\\u003e";
+        else if ((unsigned char)c >= 0x80) { char buf[8]; snprintf(buf,8,"\\u00%02x",(unsigned char)c); r += buf; }
+        else r += c;
+    }
+    return r;
+}
+
 static std::string read_stdin_line() {
     std::string line; int c;
     while ((c = getchar()) != EOF && c != '\n') line.push_back((char)c);
@@ -281,7 +297,8 @@ static void alloc_buffers() {
 
 // ── Generate: exact decode loop from benchmark ──
 static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
-                                       int max_new, float temperature, int top_k, float rep_pen) {
+                                       int max_new, float temperature, int top_k, float rep_pen,
+                                       bool streaming = false, int seq_idx = 0, int nseq = 1) {
     std::vector<uint32_t> all_ids = input_ids;
     int gen_start = (int)input_ids.size();
     int total = gen_start + max_new;
@@ -346,6 +363,15 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
             die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k, d_next_id, 0xdeadbeefLL, step, st), "sample");
             die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy");
             all_ids.push_back(next_id);
+
+            // SSE streaming: emit per-token JSON
+            if (streaming) {
+                std::string tok_text = tokenizer.decode(next_id);
+                std::string escaped = json_escape_str(tok_text);
+                printf("data: {\"token\":%u,\"text\":\"%s\"}\n\n", next_id, escaped.c_str());
+                fflush(stdout);
+            }
+
             if (next_id == 151643) break;
         }
     }
@@ -401,6 +427,7 @@ int main(int argc, char** argv) {
     {
         std::vector<uint32_t> dummy(1, 0); // Valid token (0) as dummy input
         auto warmup = generate(dummy, 1, 0.0f, 0, 1.0f);
+
     }
     fprintf(stderr, "[WARMUP] Done.\n"); fflush(stdout);
 
@@ -415,6 +442,7 @@ int main(int argc, char** argv) {
         int max_tokens = parse_int(line, "\"max_tokens\"", 30);
         float temperature = parse_float(line, "\"temperature\"", 0.0f);
         int top_k = parse_int(line, "\"top_k\"", 0);
+        int stream_flag = parse_int(line, "\"stream\"", 0);
 
         auto str_prompts = parse_string_prompts(line);
         if (str_prompts.empty()) {
@@ -428,30 +456,44 @@ int main(int argc, char** argv) {
         
         for (size_t pi = 0; pi < str_prompts.size(); pi++) {
             auto input_ids = tokenizer.encode(str_prompts[pi]);
-            auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen);
             std::string text;
-            for (auto id : gen_tokens) text += tokenizer.decode(id);
-            all_gen_tokens.push_back(std::move(gen_tokens));
+
+            if (stream_flag) {
+                // Streaming mode: generate emits SSE per token
+                auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen, true, (int)pi, (int)str_prompts.size());
+                for (auto id : gen_tokens) text += tokenizer.decode(id);
+                all_gen_tokens.push_back(std::move(gen_tokens));
+            } else {
+                auto gen_tokens = generate(input_ids, max_tokens, temperature, top_k, rep_pen);
+                for (auto id : gen_tokens) text += tokenizer.decode(id);
+                all_gen_tokens.push_back(std::move(gen_tokens));
+            }
+
             all_texts.push_back(std::move(text));
         }
 
-        // Output JSON
-        printf("{\"tokens\":[");
-        for (size_t pi = 0; pi < all_gen_tokens.size(); pi++) {
-            if (pi) printf(",");
-            printf("[");
-            for (size_t i = 0; i < all_gen_tokens[pi].size(); i++) {
-                if (i) printf(",");
-                printf("%u", all_gen_tokens[pi][i]);
+        if (stream_flag) {
+            // Streaming: emit [DONE] after all sequences
+            printf("data: [DONE]\n\n"); fflush(stdout);
+        } else {
+            // Non-streaming: output JSON
+            printf("{\"tokens\":[");
+            for (size_t pi = 0; pi < all_gen_tokens.size(); pi++) {
+                if (pi) printf(",");
+                printf("[");
+                for (size_t i = 0; i < all_gen_tokens[pi].size(); i++) {
+                    if (i) printf(",");
+                    printf("%u", all_gen_tokens[pi][i]);
+                }
+                printf("]");
             }
-            printf("]");
+            printf("],\"text\":[");
+            for (size_t pi = 0; pi < all_texts.size(); pi++) {
+                if (pi) printf(",");
+                printf("\"%s\"", json_escape(all_texts[pi]).c_str());
+            }
+            printf("]}\n"); fflush(stdout);
         }
-        printf("],\"text\":[");
-        for (size_t pi = 0; pi < all_texts.size(); pi++) {
-            if (pi) printf(",");
-            printf("\"%s\"", json_escape(all_texts[pi]).c_str());
-        }
-        printf("]}\n"); fflush(stdout);
     }
     return 0;
 }
