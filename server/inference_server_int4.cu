@@ -27,7 +27,7 @@ static void die(cudaError_t e, const char* m) {
 }
 
 const int H=4096, Q=4096, KV=1024, I=12288;
-const int nqh=32, nkv=8, hd=128, MAXSEQ=4096;
+const int nqh=32, nkv=8, hd=128, MAXSEQ=2048;
 const float eps=1e-6f;
 const int V=151936;
 const int NL=36;

@@ -36,8 +36,8 @@ struct ModelConfig {
 static const ModelConfig MODELS[] = {
     // Llama 3.2 1B (from safetensors)
     {"/mnt/data/ai/models/llama32-1b-int4-from-safetensors", 16, 2048, 2048, 512, 8192, 32, 8, 64, 128256, 4096, 128001, 1e-6f, 500000.0f},
-    // Llama 3.1 8B (from safetensors)
-    {"/mnt/data/ai/models/llama31-8b-int4-from-safetensors", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 4096, 128001, 1e-6f, 500000.0f},
+    // Llama 3.1 8B (from safetensors, MAXSEQ=2048 for 16GB GPU)
+    {"/mnt/data/ai/models/llama31-8b-int4-from-safetensors", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 2048, 128001, 1e-6f, 500000.0f},
     {NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0.0f}
 };
 
