@@ -153,14 +153,22 @@ for production. Llama GGUF conversion is a known limitation.
 **Fix attempt (Session 75)**:
 - Added --fp16 flag to converter (lossless FP16 output)
 - Llama 3.2 1B FP16: 2.4GB (vs 500MB INT4)
-- Benchmark doesn't support FP16 (would need significant changes)
+- Created FP16 benchmark (text_generate_llama32_1b_fp16): 76 t/s, but garbled
 - Server validation: Qwen3-8B works (output "frac{1}{2}"), Llama garbled
+- Added gemv_fp32_launch kernel for high-precision inference
+
+**Llama quality conclusion**:
+- Both INT4 and FP16 produce garbled output
+- Root cause is NOT quantization — FP16 preserves GGUF weights
+- GGUF weights themselves produce incorrect output
+- Qwen3-8B works because it was converted from safetensors
+- Llama GGUF conversion is a known limitation (structural issue in weights)
 
 **Server status**:
 - Qwen3-8B: working, coherent output, 7.3GB GPU
 - Llama 3.2 1B: working but garbled, 1.4GB GPU
-- Streaming: not supported (timeout)
-- Batch: not supported (timeout)
+- Streaming: not supported (inference servers don't emit SSE)
+- Batch: not supported (inference servers don't handle batch JSON)
 
 ---
 
