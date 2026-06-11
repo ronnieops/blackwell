@@ -40,7 +40,7 @@ RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
 WORKDIR /app
 
 # Binaries + tokenizer data (weights mounted from host at runtime)
-COPY server/http_subprocess server/inference_server_int4 /app/server/
+COPY server/http_subprocess server/inference_server_int4 server/inference_server_llama /app/server/
 COPY tokenizer_data.bin /app/
 
 RUN ldconfig || true
