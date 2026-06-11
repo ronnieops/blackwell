@@ -35,19 +35,20 @@ struct ModelConfig {
 
 static const ModelConfig MODELS[] = {
     // Llama 3.2 1B
-    {"llama32-1b", 16, 2048, 2048, 512, 8192, 32, 8, 64, 128256, 4096, 1e-6f, 500000.0f},
+    {"/mnt/data/ai/models/llama32-1b-int4", 16, 2048, 2048, 512, 8192, 32, 8, 64, 128256, 4096, 1e-6f, 500000.0f},
     // Llama 3.1 8B
-    {"llama31-8b", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 4096, 1e-6f, 500000.0f},
+    {"/mnt/data/ai/models/llama31-8b-int4", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 4096, 1e-6f, 500000.0f},
     {NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0.0f}
 };
 
 static const ModelConfig* get_config(const char* model) {
-    for (int i = 0; MODELS[i].wdir != NULL; i++) {
-        if (strstr(model, MODELS[i].wdir)) return &MODELS[i];
-    }
-    // Try exact match
+    // Try full path match first
     for (int i = 0; MODELS[i].wdir != NULL; i++) {
         if (strcmp(model, MODELS[i].wdir) == 0) return &MODELS[i];
+    }
+    // Try short name as substring of full path
+    for (int i = 0; MODELS[i].wdir != NULL; i++) {
+        if (strstr(MODELS[i].wdir, model)) return &MODELS[i];
     }
     fprintf(stderr, "Unknown model: %s\n", model);
     return NULL;
@@ -202,7 +203,7 @@ static float *d_fn, *d_kc, *d_vc, *d_logits;
 static int *d_next_id, *d_recent;
 static cudaStream_t st;
 
-static std::vector<LW4> W(NL);
+static std::vector<LW4> W;
 static DevW4 embed_w, lm_head_w;
 static uint8_t* host_embed_d;
 static float* host_embed_sc;
@@ -212,6 +213,7 @@ static blackwell::BpeTokenizer tokenizer;
 
 static void load_model() {
     fprintf(stderr, "Loading %d-layer INT4 model...\n", NL);
+    W.resize(NL);
     char p[256];
     for (int l = 0; l < NL; ++l) {
         snprintf(p,256,"%s/%d_self_attn.q_proj",wdir,l); W[l].q=upload_w4(p);
@@ -243,7 +245,8 @@ static void load_model() {
     }
     // Final norm
     {float*w=(float*)malloc(H*4);
-     FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+     char fn[256]; snprintf(fn,256,"%s/final_norm.f32",wdir);
+     FILE*f=fopen(fn,"rb");(void)fread(w,4,H,f);fclose(f);
      AL(d_fn,H*4); cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice); free(w);}
     // Embed + lm_head
     {char ep[256]; snprintf(ep,256,"%s/embed_tokens",wdir); embed_w=upload_w4(ep);}
@@ -396,7 +399,7 @@ int main(int argc, char** argv) {
     // This ensures first real request has consistent timing and output
     fprintf(stderr, "[WARMUP] Running dummy inference...\n"); fflush(stdout);
     {
-        std::vector<uint32_t> dummy(1, 151643); // EOS token as dummy input
+        std::vector<uint32_t> dummy(1, 0); // Valid token (0) as dummy input
         auto warmup = generate(dummy, 1, 0.0f, 0, 1.0f);
     }
     fprintf(stderr, "[WARMUP] Done.\n"); fflush(stdout);

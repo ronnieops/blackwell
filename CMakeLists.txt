@@ -209,3 +209,7 @@ add_blackwell_bench(tokenize_text bench/tokenize_text.cu)
 # Llama 3.1
 add_blackwell_bench(text_generate_llama32_1b bench/text_generate_llama32_1b.cu)
 add_executable(inference_server_llama server/inference_server_llama.cu)
+target_link_libraries(inference_server_llama PRIVATE blackwell_kernels CUDA::cudart)
+target_compile_options(inference_server_llama PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)
+target_include_directories(inference_server_llama PRIVATE include)
+set_target_properties(inference_server_llama PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../server")

@@ -99,23 +99,27 @@ int main(int argc, char** argv) {
     bool chat_mode = false;
     float temperature = 0.0f;
     int top_k = 0;
-    if(argc>1) prompt=argv[1];
-    if(argc>2) max_new=atoi(argv[2]);
-    for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--chat")==0) chat_mode=true;
-        if(strcmp(argv[i],"-t")==0&&i+1<argc) temperature=atof(argv[++i]);
-        if(strcmp(argv[i],"-k")==0&&i+1<argc) top_k=atoi(argv[++i]);
-    }
-
+    float rep_pen = 1.5f;
     const char* wdir = "/mnt/data/ai/models/llama32-1b-int4";
-    if (argc >= 4) wdir = argv[3];
+    for(int i=1;i<argc;i++){
+        if(argv[i][0]=='-'){
+            if(strcmp(argv[i],"--chat")==0) chat_mode=true;
+            else if(strcmp(argv[i],"-t")==0&&i+1<argc) temperature=atof(argv[++i]);
+            else if(strcmp(argv[i],"-k")==0&&i+1<argc) top_k=atoi(argv[++i]);
+            else if(strcmp(argv[i],"-r")==0&&i+1<argc) rep_pen=atof(argv[++i]);
+            else if(strcmp(argv[i],"-w")==0&&i+1<argc) wdir=argv[++i];
+        } else {
+            prompt=argv[i];
+            if(i+1<argc&&argv[i+1][0]!='-'){ max_new=atoi(argv[++i]); }
+        }
+    }
     
     cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
     printf("# Text Generation — Qwen3-1.7B INT4 (GGUF converted)\n");
     printf("  Weights: %s\n", wdir);
     printf("  Device: %s\n", P.name);
     printf("  Prompt: \"%s\"%s\n", prompt, chat_mode?" (chat)":"");
-    printf("  Temp: %.1f, Top-K: %d, Max new: %d\n\n", temperature, top_k, max_new);
+    printf("  Temp: %.1f, Top-K: %d, Rep-pen: %.2f, Max new: %d\n\n", temperature, top_k, rep_pen, max_new);
 
     blackwell::BpeTokenizer tokenizer;
     char tok_path[512]; snprintf(tok_path,512,"%s/tokenizer_data.bin",wdir);
@@ -145,7 +149,7 @@ int main(int argc, char** argv) {
     float *d_proj, *d_gate, *d_up;
     uint8_t *d_mlp_i4; float *d_mlp_i4_sc;
     float *d_fn, *d_fn_sc, *d_kc, *d_vc, *d_logits;
-    int *d_next_id;
+    int *d_next_id, *d_recent;
 
     // const int NL=28; // Qwen3-1.7B — now using global NL=16 for Llama 3.2 1B
     #define AL(p,n){cudaError_t _e=cudaMalloc(&(p),(n));\
@@ -159,7 +163,7 @@ int main(int argc, char** argv) {
     AL(d_fn,H*4);AL(d_fn_sc,(H/16)*4);
     AL(d_kc,(size_t)NL*nkv*MAXSEQ*hd*4);
     AL(d_vc,(size_t)NL*nkv*MAXSEQ*hd*4);
-    AL(d_logits,V*4);AL(d_next_id,4);
+    AL(d_logits,V*4);AL(d_next_id,4);AL(d_recent,64*4);
     #undef AL
 
     float iv7=1.f/7.f;
@@ -317,8 +321,6 @@ int main(int argc, char** argv) {
 
             // Down projection
             die(blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc,I,H,st),"down");
-            die(blackwell::kernels::gemv_int4_warp(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc,H,I,st),"gate");
-            die(blackwell::kernels::gemv_int4_warp(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc,H,I,st),"up");
 
             // MLP residual: d_x32 = d_proj + d_res (pre-MLP state)
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");
@@ -337,6 +339,13 @@ int main(int argc, char** argv) {
             cudaMemcpy(&l264,d_logits+264,4,cudaMemcpyDeviceToHost);
             cudaMemcpy(&l37018,d_logits+37018,4,cudaMemcpyDeviceToHost);
             printf("  logits: tok0=%.1f tok264=%.1f tok37018=%.1f\n",l0,l264,l37018);
+            // Repetition penalty: penalize recently generated tokens
+            if(rep_pen>1.0f&&(int)all_ids.size()>gen_start){
+                int nr=(int)all_ids.size()-gen_start;if(nr>64)nr=64;
+                std::vector<int> h_rec(all_ids.end()-nr,all_ids.end());
+                cudaMemcpy(d_recent,h_rec.data(),nr*4,cudaMemcpyHostToDevice);
+                die(blackwell::kernels::apply_repetition_penalty(d_logits,d_recent,nr,rep_pen,V,st),"rep_pen");
+            }
             int next_id;
             die(blackwell::kernels::sample_gpu(d_logits,V,temperature,top_k,d_next_id,0xdeadbeefLL,step,st),"sample");
             die(cudaMemcpy(&next_id,d_next_id,4,cudaMemcpyDeviceToHost),"copy");

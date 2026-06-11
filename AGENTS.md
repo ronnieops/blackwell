@@ -114,6 +114,8 @@ PPL than INT8 block-16. Reference code kept in src/kernels/gemv_fp8.cu.
 
 **NVFP4 path (Session 69) — ABANDONED**: Double quantization (INT4→FP32→NVFP4) shifts weights, causing catastrophic quality degradation. PPL=24,850 vs INT4 21.82 (1000× worse). Format encoding mismatch (offset-binary INT4 vs signed-magnitude E2M1) means same nibble → different value. Speed 21 t/s is 2.67× slower than INT4 (56 t/s) due to scalar PTX dequant. No production path without retraining.
 
+**NVIDIA Model-Optimizer research (Session 74)**: NVIDIA's `modelopt` library uses NVFP4 E2M1 encoding with FP8 E4M3 per-block scales. Our INT4 block-16 uses offset-binary encoding (nib-8) with FP32 scales. These are incompatible formats — same nibble value maps to different actual values. ModelOpt provides proper calibration (max/MSE/Hessian/AWQ/GPTQ) vs our random normal proxy (128 samples). ModelOpt exports to safetensors+config.json vs our flat binary files. Not directly reusable, but calibration methods could inform future AWQ improvements.
+
 **9B q_proj dimension mismatch (suspected)**: Qwen3.5-9B full_attention q_proj
 weight N=8192=32 heads × 256 dim. Server hardcodes NQ=16. If correct config uses
 32 heads, half of Q projection is unused → quality degradation.
@@ -129,7 +131,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 181 symbols in `build/libblackwell_kernels.a` (was 195 — cleanup removed dead-end INT4/INT5/FP4/FP8 kernel symbols; +2 new graph-safe attention variants in Session 72)
+**Library**: 186 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)

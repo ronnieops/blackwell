@@ -37,9 +37,16 @@ class LocalTokenizer {
     blackwell::BpeTokenizer tok_;
     bool ok_{false};
 public:
-    LocalTokenizer(const char* weight_dir) {
-        std::string td = "./tokenizer_data.bin";
+    LocalTokenizer(const char* model) {
+        // Build path to tokenizer in weight directory
+        // model names: llama32-1b, llama31-8b, qwen3-8b, 1.7b, 8b, 9b, batched
+        std::string td;
+        if(strstr(model, "llama32-1b")) td = "/mnt/data/ai/models/llama32-1b-int4/tokenizer_data.bin";
+        else if(strstr(model, "llama31-8b")) td = "/mnt/data/ai/models/llama31-8b-int4/tokenizer_data.bin";
+        else if(strstr(model, "qwen3-8b") || strstr(model, "qwen3")) td = "/mnt/data/ai/models/qwen3-8b-int4/tokenizer_data.bin";
+        else td = "./tokenizer_data.bin"; // fallback
         ok_ = tok_.load(td.c_str()) == 0;
+        fprintf(stderr, "[LocalTokenizer] ok=%d\n", ok_);
     }
     std::string decode(const std::vector<uint32_t>& ids) {
         std::string s;
@@ -70,8 +77,11 @@ public:
         std::string bin9b = "./server/inference_server_9b";
         std::string bin_int4 = "./server/inference_server_int4";
         std::string bin_int4_batched = "./server/inference_server_int4_batched";
+        std::string bin_llama = "./server/inference_server_llama";
         if(strstr(model,"9b")) bin = bin9b.c_str();
         else if(strstr(model,"batched")) bin = bin_int4_batched.c_str();
+        else if(strstr(model,"llama32-1b") || strstr(model,"llama31-8b") || strstr(model,"llama")) bin = bin_llama.c_str();
+        else if(strstr(model,"qwen3-8b") || strstr(model,"qwen3-1.7b") || strstr(model,"qwen3")) bin = bin_int4.c_str();
         else if(strstr(model,"int4")) bin = bin_int4.c_str();
 
         int pin[2], pout[2];
@@ -472,6 +482,7 @@ int main(int argc, char** argv) {
 
     httplib::Server svr;
     svr.set_read_timeout(300);
+    svr.set_write_timeout(300);
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         // Get GPU memory info

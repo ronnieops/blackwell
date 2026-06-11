@@ -13,6 +13,7 @@ sleep 1
 MODELS=(
     "llama32-1b:8123:/mnt/data/ai/models/llama32-1b-int4"
     "llama31-8b:8124:/mnt/data/ai/models/llama31-8b-int4"
+    "qwen3-8b:8125:/mnt/data/ai/models/qwen3-8b-int4"
 )
 
 start_model() {

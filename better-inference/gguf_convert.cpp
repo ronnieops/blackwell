@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
     // Buffers for norms (collected per layer)
     std::vector<float> input_norms((size_t)NL * H);
     std::vector<float> post_norms((size_t)NL * H);
-    std::vector<float> q_norms((size_t)NL * hd);
-    std::vector<float> k_norms((size_t)NL * hd);
+    std::vector<float> q_norms((size_t)NL * hd, 1.0f);  // init to 1.0 (identity)
+    std::vector<float> k_norms((size_t)NL * hd, 1.0f);  // init to 1.0 (identity)
 
     // Process each tensor
     for (auto& ti : tensors) {
