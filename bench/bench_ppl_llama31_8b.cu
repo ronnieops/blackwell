@@ -274,7 +274,13 @@ int main(int argc, char** argv) {
         int correct = ids[step+1];
         // Check for NaN in logits
         float l0; cudaMemcpy(&l0, d_logits, 4, cudaMemcpyDeviceToHost);
-        if(step<2) fprintf(stderr,"  step%d logits[0]=%.1f correct=%d\n",step,l0,correct);
+        if(step<2) {
+            // Debug: read a few logits around the correct token
+            int debug_ids[3] = {correct, 0, 264};
+            float debug_v[3];
+            for(int di=0;di<3;di++) cudaMemcpy(&debug_v[di], d_logits+debug_ids[di], 4, cudaMemcpyDeviceToHost);
+            fprintf(stderr,"  step%d logits[0]=%.1f tok264=%.1f correct=%d logits[correct]=%.1f\n",step,l0,debug_v[2],correct,debug_v[0]);
+        }
         if(isnan(l0)) { fprintf(stderr,"\n  NaN at step %d\n",step); break; }
         logprob_kernel<<<1,256,256*4,st>>>(d_logits,V,correct,d_logp);
         die(cudaGetLastError(),"logprob");

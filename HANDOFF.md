@@ -30,6 +30,35 @@ per-model EOS tokens, server config cleanup.
 
 ---
 
+## 3a. Root Cause: Llama 3.1 8B PPL Degradation (273K)
+
+**Finding**: Activation quantization accumulation over 32 layers destroys the
+logit distribution. The correct token's logit is negative (-2.0) while incorrect
+tokens dominate (tok264=+0.2). The greedy decoder still produces coherent text
+because argmax picks plausible tokens, but the full probability distribution is
+near-uniform (avg_logp=-12.5 vs uniform -11.76).
+
+**Evidence**:
+| Model | Layers | Step0 correct logit | PPL |
+|-------|--------|-------------------|-----|
+| Llama 3.2 1B INT4 | 16 | +2.2 (favored) | 315 |
+| Llama 3.1 8B INT4 | 32 | -2.0 (suppressed) | 273,767 |
+| Qwen3-8B INT4 AWQ | 36 | +6.8 (strongly favored) | 21.82 |
+
+Qwen3-8B survives 36 layers of INT4 activation quantization because its
+weight/activation distributions are more quantization-friendly. Llama 3.1
+does not — the accumulated round-off error after 32 layers swamps the signal.
+
+**Potential fix**: FP16 residual stream (skip activation quantization, use
+gemv_fp32_launch + FP32/FP16 weights). Would sacrifice throughput (FP32 GEMV
+is ~76 t/s for 1B) but restore quality. Not implemented — would negate INT4
+memory advantage for the 8B model.
+
+**AWQ calibration did NOT help**: PPL 274,648 vs 273,767 (no significant
+difference). The issue is activation quantization, not weight saliency.
+
+---
+
 ## 3. Recent Decisions
 
 ### Duplicate GEMV Bug (Session 74)

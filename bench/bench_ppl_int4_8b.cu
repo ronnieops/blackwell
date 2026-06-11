@@ -245,6 +245,12 @@ int main(int argc, char** argv) {
 
         // Compute logprob
         int correct = ids[step+1];
+        if(step<2) {
+            int dids[3] = {correct, 0, 264};
+            float dvs[3];
+            for(int di=0;di<3;di++) cudaMemcpy(&dvs[di], d_logits+dids[di], 4, cudaMemcpyDeviceToHost);
+            fprintf(stderr,"  step%d logits[0]=%.1f tok264=%.1f correct=%d logits[correct]=%.1f\n",step,dvs[1],dvs[2],correct,dvs[0]);
+        }
         logprob_kernel<<<1,256,256*4,st>>>(d_logits,V,correct,d_logp);
         die(cudaGetLastError(),"logprob");
         float h_logp; die(cudaMemcpy(&h_logp,d_logp,4,cudaMemcpyDeviceToHost),"logp_cp");
