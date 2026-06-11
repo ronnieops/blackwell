@@ -41,8 +41,8 @@ public:
         // Build path to tokenizer in weight directory
         // model names: llama32-1b, llama31-8b, qwen3-8b, 1.7b, 8b, 9b, batched
         std::string td;
-        if(strstr(model, "llama32-1b")) td = "/mnt/data/ai/models/llama32-1b-int4/tokenizer_data.bin";
-        else if(strstr(model, "llama31-8b")) td = "/mnt/data/ai/models/llama31-8b-int4/tokenizer_data.bin";
+        if(strstr(model, "llama32-1b")) td = "/mnt/data/ai/models/llama32-1b-int4-from-safetensors/tokenizer_data.bin";
+        else if(strstr(model, "llama31-8b")) td = "/mnt/data/ai/models/llama31-8b-int4-from-safetensors/tokenizer_data.bin";
         else if(strstr(model, "qwen3-8b") || strstr(model, "qwen3")) td = "/mnt/data/ai/models/qwen3-8b-int4/tokenizer_data.bin";
         else td = "./tokenizer_data.bin"; // fallback
         ok_ = tok_.load(td.c_str()) == 0;
@@ -348,6 +348,22 @@ public:
 
 static SubprocessEngine g_engine;
 static std::string g_model_name;
+static std::string g_model_raw; // original model arg for template selection
+
+// Chat template per model architecture
+// Llama 3: <|begin_of_text|><|start_header_id|>system<|end_header_id|>...
+// Qwen3: <|im_start|>system\n...
+static const char* get_chat_template(const char* model) {
+    // g_model_name is set to display name ("1.7B", "8B") not model identifier.
+    // The model string passed to start() contains the actual model name.
+    if(strstr(model,"llama")) {
+        return "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+               "You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
+               "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    }
+    // Default Qwen3 template
+    return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n";
+}
 
 std::string json_string_at(const std::string& body, const char* key) {
     std::string skey = "\"";
@@ -468,6 +484,7 @@ int main(int argc, char** argv) {
             else model = argv[i];
         }
     }
+    g_model_raw = model;
     if(strstr(model,"8b")) g_model_name = "8B";
     else if(strstr(model,"9b")) g_model_name = "9B";
     else if(strstr(model,"batched")) g_model_name = "8B";
@@ -529,9 +546,9 @@ int main(int argc, char** argv) {
         int top_k = json_int_at(body, "top_k", 0);
         float rep_pen = json_float_at(body, "repetition_penalty", 1.5f);
 
-        std::string prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
-        prompt += content;
-        prompt += "<|im_end|>\n<|im_start|>assistant\n";
+        char prompt_buf[65536];
+        snprintf(prompt_buf, sizeof(prompt_buf), get_chat_template(g_model_raw.c_str()), content.c_str());
+        std::string prompt = prompt_buf;
 
         std::vector<uint32_t> tokens; std::string text;
         if(!g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text)) {

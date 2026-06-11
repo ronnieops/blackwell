@@ -29,16 +29,16 @@ static void die(cudaError_t e, const char* m) {
 // Model configuration
 struct ModelConfig {
     const char* wdir;
-    int NL, H, Q, KV, I, nqh, nkv, hd, V, MAXSEQ;
+    int NL, H, Q, KV, I, nqh, nkv, hd, V, MAXSEQ, eos_id;
     float eps, rope_theta;
 };
 
 static const ModelConfig MODELS[] = {
-    // Llama 3.2 1B
-    {"/mnt/data/ai/models/llama32-1b-int4", 16, 2048, 2048, 512, 8192, 32, 8, 64, 128256, 4096, 1e-6f, 500000.0f},
-    // Llama 3.1 8B
-    {"/mnt/data/ai/models/llama31-8b-int4", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 4096, 1e-6f, 500000.0f},
-    {NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0.0f}
+    // Llama 3.2 1B (from safetensors)
+    {"/mnt/data/ai/models/llama32-1b-int4-from-safetensors", 16, 2048, 2048, 512, 8192, 32, 8, 64, 128256, 4096, 128001, 1e-6f, 500000.0f},
+    // Llama 3.1 8B (from safetensors)
+    {"/mnt/data/ai/models/llama31-8b-int4-from-safetensors", 32, 4096, 4096, 1024, 14336, 32, 8, 128, 128256, 4096, 128001, 1e-6f, 500000.0f},
+    {NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0.0f}
 };
 
 static const ModelConfig* get_config(const char* model) {
@@ -68,6 +68,7 @@ inline int CFG_nkv() { return cfg->nkv; }
 inline int CFG_hd() { return cfg->hd; }
 inline int CFG_V() { return cfg->V; }
 inline int CFG_MAXSEQ() { return cfg->MAXSEQ; }
+inline int CFG_EOS_ID() { return cfg->eos_id; }
 inline float CFG_eps() { return cfg->eps; }
 inline float CFG_rope_theta() { return cfg->rope_theta; }
 inline const char* CFG_wdir() { return cfg->wdir; }
@@ -82,6 +83,7 @@ inline const char* CFG_wdir() { return cfg->wdir; }
 #define hd   CFG_hd()
 #define V    CFG_V()
 #define MAXSEQ CFG_MAXSEQ()
+#define EOS_ID CFG_EOS_ID()
 #define eps  CFG_eps()
 #define rope_theta CFG_rope_theta()
 #define wdir CFG_wdir()
@@ -372,7 +374,7 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
                 fflush(stdout);
             }
 
-            if (next_id == 151643) break;
+            if (next_id == CFG_EOS_ID()) break;
         }
     }
     // Return only generated tokens
