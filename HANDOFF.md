@@ -64,7 +64,7 @@ Session 72: CUDA Graph fix (2.1% speedup, graph-safe attention), GGUF bridge Pha
 |-------|----------|-------|
 | GPU non-determinism | LOW | Different outputs on same prompt. Expected for FP on GPU. Quality is consistent. |
 | 9B quality BLOCKED | HIGH | SSM A_log > 0 for 68.8% layer-4 channels. Clamp insufficient. |
-| Server prefill | MEDIUM | Prompts processed token-by-token. Major refactor needed. |
+| Server prefill | MEDIUM | Prompts processed token-by-token. Use `start_servers.sh` for multi-model.
 | New model blocked | HIGH | No network access to HuggingFace. 14B download would need ~15 GB. |
 
 ---
