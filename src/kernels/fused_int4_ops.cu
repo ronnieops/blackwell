@@ -151,7 +151,15 @@ __global__ void fused_rmsnorm_quant_int4_kernel(
     }
 }
 
-// Simpler approach: 2-pass with smem
+// Simpler approach: single-block with grid-stride over N chunks of THREADS*EPT.
+// RMSNorm requires a GLOBAL sum_sq over all N elements. Multi-block would need a
+// cross-block reduction (2-pass + global memory or cooperative groups), which is
+// overkill for these tiny (~1-5µs) ops. One block looping over N in chunks keeps
+// the reduction trivial and still finishes in microseconds.
+//
+// Works for any N (multiple of 32): H=4096 (1 chunk), I=12288 (3 chunks), etc.
+// N must be multiple of THREADS*EPT/2 = 2048 for clean byte packing, but we handle
+// the tail explicitly. We require N % 32 == 0 at the API boundary.
 __launch_bounds__(THREADS, 1)
 __global__ void fused_rmsnorm_quant_int4_v2_kernel(
     uint8_t* __restrict__ x_out,
@@ -160,32 +168,31 @@ __global__ void fused_rmsnorm_quant_int4_v2_kernel(
     const float* __restrict__ weight,
     int N, float eps)
 {
-    extern __shared__ float smem[];
+    extern __shared__ float smem[];   // size = N floats (caller allocates N*4)
     int tid = threadIdx.x;
     constexpr int NE = EPT;
-    constexpr int NUM_BLKS = THREADS * NE / B;  // 256*16/16 = 256 blocks
+    constexpr int CHUNK = THREADS * NE;   // 4096 elements per grid-stride iteration
 
-    // Phase 1: load + sum_sq
-    float vals[NE];
-    float sum_sq = 0.0f;
-
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int idx = tid + e * THREADS;
-        if (idx < N) {
-            vals[e] = proj[idx];
-            sum_sq += vals[e] * vals[e];
-        } else {
-            vals[e] = 0.0f;
+    // Phase 1: load all N values into smem, accumulate global sum_sq.
+    // Grid-stride over chunks of CHUNK elements.
+    float my_sum_sq = 0.0f;
+    for (int base = 0; base < N; base += CHUNK) {
+        #pragma unroll
+        for (int e = 0; e < NE; ++e) {
+            int idx = base + tid + e * THREADS;
+            if (idx < N) {
+                float v = proj[idx];
+                smem[idx] = v;
+                my_sum_sq += v * v;
+            }
         }
     }
 
-    sum_sq = warp_reduce_sum_f(sum_sq);
-
+    // Block-wide reduce of my_sum_sq
+    my_sum_sq = warp_reduce_sum_f(my_sum_sq);
     __shared__ float warp_sums[8];
-    if ((tid & 31) == 0) warp_sums[tid >> 5] = sum_sq;
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = my_sum_sq;
     __syncthreads();
-
     float block_sum = (tid < 8) ? warp_sums[tid] : 0.0f;
     block_sum = warp_reduce_sum_f(block_sum);
 
@@ -194,48 +201,47 @@ __global__ void fused_rmsnorm_quant_int4_v2_kernel(
     __syncthreads();
     float rstd = s_rstd;
 
-    // Store normalized values to smem
-    float* smem_norm = smem;
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int idx = tid + e * THREADS;
-        smem_norm[idx] = (idx < N) ? vals[e] * weight[idx] * rstd : 0.0f;
-    }
-    __syncthreads();
-
-    // Phase 2: compute block scales from NORMALIZED values (smem_norm)
+    // Phase 2: compute block scales (absmax/7 per 16 elements) over normalized values.
+    // Write normalized values back into smem in place (we no longer need raw values).
+    // Match production quantize_int4: scale = (absmax>1e-10) ? absmax/7 : 1/7,
+    // quant range [-8,7] (4-bit signed, 15 levels).
     int num_blocks = (N + B - 1) / B;
     for (int blk_id = tid; blk_id < num_blocks; blk_id += THREADS) {
         int blk_start = blk_id * B;
         float absmax = 0.0f;
-        for (int i = 0; i < B && blk_start + i < N; ++i) {
-            absmax = fmaxf(absmax, fabsf(smem_norm[blk_start + i]));
+        #pragma unroll
+        for (int i = 0; i < B; ++i) {
+            int idx = blk_start + i;
+            if (idx < N) {
+                float normed = smem[idx] * weight[idx] * rstd;
+                smem[idx] = normed;           // store normalized back
+                absmax = fmaxf(absmax, fabsf(normed));
+            }
         }
-        x_out_scale[blk_id] = fmaxf(absmax / 7.0f, 1e-9f);
+        x_out_scale[blk_id] = (absmax > 1e-10f) ? (absmax / 7.0f) : (1.0f / 7.0f);
     }
     __syncthreads();
 
-    // Phase 3: quantize + pack (each thread handles 2 elements = 1 byte)
+    // Phase 3: quantize + pack (each thread handles 2 elements = 1 byte).
+    // Range [-8,7], offset-binary (q+8), low nibble first.
     int num_bytes = N / 2;
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int byte_idx = tid + e * THREADS;
-        if (byte_idx >= num_bytes) continue;
-
+    for (int byte_idx = tid; byte_idx < num_bytes; byte_idx += THREADS) {
         int lo_idx = byte_idx * 2;
         int hi_idx = lo_idx + 1;
 
-        float lo_val = (lo_idx < N) ? smem_norm[lo_idx] : 0.0f;
-        float hi_val = (hi_idx < N) ? smem_norm[hi_idx] : 0.0f;
+        float lo_val = smem[lo_idx];
+        float hi_val = (hi_idx < N) ? smem[hi_idx] : 0.0f;
 
         float lo_sc = x_out_scale[lo_idx / B];
         float hi_sc = x_out_scale[hi_idx / B];
 
-        float lo_q = fminf(7.0f, fmaxf(-7.0f, roundf(lo_val / lo_sc)));
-        float hi_q = fminf(7.0f, fmaxf(-7.0f, roundf(hi_val / hi_sc)));
+        int lo_q = (int)roundf(lo_val / lo_sc);
+        int hi_q = (int)roundf(hi_val / hi_sc);
+        lo_q = max(-8, min(7, lo_q));
+        hi_q = max(-8, min(7, hi_q));
 
-        uint8_t lo_nib = static_cast<uint8_t>(lo_q + 8);  // -7..7 → 1..15
-        uint8_t hi_nib = static_cast<uint8_t>(hi_q + 8);
+        uint8_t lo_nib = (uint8_t)((lo_q + 8) & 0x0F);
+        uint8_t hi_nib = (uint8_t)((hi_q + 8) & 0x0F);
 
         x_out[byte_idx] = lo_nib | (hi_nib << 4);
     }
@@ -251,6 +257,13 @@ __global__ void fused_rmsnorm_quant_int4_v2_kernel(
 //
 // Replaces: apply_swiglu + quantize_int4  (2 kernels → 1)
 // ─────────────────────────────────────────────────────────────────────────
+// Single-block kernel: SwiGLU activation + INT4 quant (block-16, absmax/7).
+// Grid-stride over N chunks of THREADS*EPT so any N works with one block.
+//
+// Input:  gate [N] FP32, up [N] FP32
+// Output: x_out [N/2] packed INT4, x_out_scale [N/16] FP32 scales
+//
+// Replaces: apply_swiglu + quantize_int4  (2 kernels → 1)
 __launch_bounds__(THREADS, 1)
 __global__ void fused_swiglu_quant_int4_kernel(
     uint8_t* __restrict__ x_out,
@@ -259,68 +272,59 @@ __global__ void fused_swiglu_quant_int4_kernel(
     const float* __restrict__ up,
     int N)
 {
-    extern __shared__ float smem[];
+    extern __shared__ float smem[];   // size = N floats
     int tid = threadIdx.x;
-    constexpr int NE = EPT;
+    constexpr int CHUNK = THREADS * EPT;
 
-    // Phase 1: SwiGLU activation + store to smem
-    float vals[NE];
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int idx = tid + e * THREADS;
-        if (idx < N) {
-            float g = gate[idx];
-            float u = up[idx];
-            // silu(x) = x * sigmoid(x)
-            float s = 1.0f / (1.0f + expf(-g));
-            vals[e] = g * s * u;
-        } else {
-            vals[e] = 0.0f;
+    // Phase 1: SwiGLU activation over all N, store to smem.
+    // silu(g) * u, where silu(x) = x * sigmoid(x).
+    for (int base = 0; base < N; base += CHUNK) {
+        #pragma unroll
+        for (int e = 0; e < EPT; ++e) {
+            int idx = base + tid + e * THREADS;
+            if (idx < N) {
+                float g = gate[idx];
+                float s = 1.0f / (1.0f + expf(-g));
+                smem[idx] = g * s * up[idx];
+            }
         }
-    }
-
-    // Store to smem for block scale computation
-    float* smem_act = smem;
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int idx = tid + e * THREADS;
-        smem_act[idx] = vals[e];
     }
     __syncthreads();
 
-    // Phase 2: compute block scales
+    // Phase 2: compute block scales (absmax/7 per 16 elements).
+    // Match production quantize_int4: scale clamp + range [-8,7].
     int num_blocks = (N + B - 1) / B;
     for (int blk_id = tid; blk_id < num_blocks; blk_id += THREADS) {
         int blk_start = blk_id * B;
         float absmax = 0.0f;
-        for (int i = 0; i < B && blk_start + i < N; ++i) {
-            absmax = fmaxf(absmax, fabsf(smem_act[blk_start + i]));
+        #pragma unroll
+        for (int i = 0; i < B; ++i) {
+            int idx = blk_start + i;
+            if (idx < N) absmax = fmaxf(absmax, fabsf(smem[idx]));
         }
-        x_out_scale[blk_id] = fmaxf(absmax / 7.0f, 1e-9f);
+        x_out_scale[blk_id] = (absmax > 1e-10f) ? (absmax / 7.0f) : (1.0f / 7.0f);
     }
     __syncthreads();
 
-    // Phase 3: quantize + pack
+    // Phase 3: quantize + pack (each thread handles 2 elements = 1 byte).
     int num_bytes = N / 2;
-    #pragma unroll
-    for (int e = 0; e < NE; ++e) {
-        int byte_idx = tid + e * THREADS;
-        if (byte_idx >= num_bytes) continue;
-
+    for (int byte_idx = tid; byte_idx < num_bytes; byte_idx += THREADS) {
         int lo_idx = byte_idx * 2;
         int hi_idx = lo_idx + 1;
 
-        float lo_val = (lo_idx < N) ? smem_act[lo_idx] : 0.0f;
-        float hi_val = (hi_idx < N) ? smem_act[hi_idx] : 0.0f;
+        float lo_val = smem[lo_idx];
+        float hi_val = (hi_idx < N) ? smem[hi_idx] : 0.0f;
 
         float lo_sc = x_out_scale[lo_idx / B];
         float hi_sc = x_out_scale[hi_idx / B];
 
-        float lo_q = fminf(7.0f, fmaxf(-7.0f, roundf(lo_val / lo_sc)));
-        float hi_q = fminf(7.0f, fmaxf(-7.0f, roundf(hi_val / hi_sc)));
+        int lo_q = (int)roundf(lo_val / lo_sc);
+        int hi_q = (int)roundf(hi_val / hi_sc);
+        lo_q = max(-8, min(7, lo_q));
+        hi_q = max(-8, min(7, hi_q));
 
-        uint8_t lo_nib = static_cast<uint8_t>(lo_q + 8);
-        uint8_t hi_nib = static_cast<uint8_t>(hi_q + 8);
+        uint8_t lo_nib = (uint8_t)((lo_q + 8) & 0x0F);
+        uint8_t hi_nib = (uint8_t)((hi_q + 8) & 0x0F);
 
         x_out[byte_idx] = lo_nib | (hi_nib << 4);
     }
@@ -332,10 +336,12 @@ __global__ void fused_swiglu_quant_int4_kernel(
 // Public API
 // ===========================================================================
 
-// fused_rmsnorm_quant_int4 — RMSNorm + INT4 pack (single kernel)
+// fused_rmsnorm_quant_int4 — RMSNorm + INT4 pack (single kernel, single block).
 // Input:  proj [N] FP32, weight [N] FP32 RMSNorm weight
 // Output: x_out [N/2] packed INT4, x_out_scale [N/16] FP32 scales
-// N must be multiple of 32 (for 256 threads × 16 elements).
+// N must be multiple of 32. Single block with grid-stride handles any N (H=4096,
+// I=12288, etc.). smem = N floats for the in-place normalization buffer.
+// I=12288 → 48 KB smem; larger sizes need opt-in (one-time cudaFuncSetAttribute).
 cudaError_t fused_rmsnorm_quant_int4(
     uint8_t* x_out,
     float* x_out_scale,
@@ -346,25 +352,22 @@ cudaError_t fused_rmsnorm_quant_int4(
     cudaStream_t stream)
 {
     if (N % 32 != 0) return cudaErrorInvalidValue;
-    if (N > THREADS * EPT) {
-        // For large N (e.g., H=4096, I=12288), need multiple blocks
-        // Use grid-stride loop: each block handles THREADS*EPT elements
-        int smem_bytes = THREADS * EPT * sizeof(float);  // for smem_norm
-        int grid = (N + THREADS * EPT - 1) / (THREADS * EPT);
-        fused_rmsnorm_quant_int4_v2_kernel<<<grid, THREADS, smem_bytes, stream>>>(
-            x_out, x_out_scale, proj, weight, N, eps);
-    } else {
-        // Single block for small N
-        int smem_bytes = N * sizeof(float);
-        fused_rmsnorm_quant_int4_v2_kernel<<<dim3(1), dim3(THREADS), smem_bytes, stream>>>(
-            x_out, x_out_scale, proj, weight, N, eps);
+    if (N * sizeof(float) > 100 * 1024) return cudaErrorInvalidValue;  // 100 KB Blackwell smem
+    int smem_bytes = N * sizeof(float);
+    // Opt-in to >48KB dynamic smem (needed for I=12288 → 48KB, exactly at default limit).
+    if (smem_bytes + 256 > 48 * 1024) {  // +256 for static smem slack
+        cudaFuncSetAttribute(fused_rmsnorm_quant_int4_v2_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes + 256);
     }
+    fused_rmsnorm_quant_int4_v2_kernel<<<dim3(1), dim3(THREADS), smem_bytes, stream>>>(
+        x_out, x_out_scale, proj, weight, N, eps);
     return cudaPeekAtLastError();
 }
 
-// fused_swiglu_quant_int4 — SwiGLU + INT4 quant (single kernel)
+// fused_swiglu_quant_int4 — SwiGLU + INT4 quant (single kernel, single block).
 // Input:  gate [N] FP32, up [N] FP32
 // Output: x_out [N/2] packed INT4, x_out_scale [N/16] FP32 scales
+// N must be multiple of 32. Single block with grid-stride handles any N.
 cudaError_t fused_swiglu_quant_int4(
     uint8_t* x_out,
     float* x_out_scale,
@@ -374,17 +377,14 @@ cudaError_t fused_swiglu_quant_int4(
     cudaStream_t stream)
 {
     if (N % 32 != 0) return cudaErrorInvalidValue;
-    int smem_bytes = THREADS * EPT * sizeof(float);
-
-    if (N <= THREADS * EPT) {
-        fused_swiglu_quant_int4_kernel<<<dim3(1), dim3(THREADS), smem_bytes, stream>>>(
-            x_out, x_out_scale, gate, up, N);
-    } else {
-        // Multi-block for large N (e.g., I=12288)
-        int grid = (N + THREADS * EPT - 1) / (THREADS * EPT);
-        fused_swiglu_quant_int4_kernel<<<grid, dim3(THREADS), smem_bytes, stream>>>(
-            x_out, x_out_scale, gate, up, N);
+    if (N * sizeof(float) > 100 * 1024) return cudaErrorInvalidValue;  // 100 KB Blackwell smem
+    int smem_bytes = N * sizeof(float);
+    if (smem_bytes + 256 > 48 * 1024) {  // +256 for static smem slack
+        cudaFuncSetAttribute(fused_swiglu_quant_int4_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes + 256);
     }
+    fused_swiglu_quant_int4_kernel<<<dim3(1), dim3(THREADS), smem_bytes, stream>>>(
+        x_out, x_out_scale, gate, up, N);
     return cudaPeekAtLastError();
 }
 

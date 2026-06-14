@@ -53,7 +53,8 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 **INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
 
 **Version history**:
-- v0.12.0: INT4 8B FP16 weight scales. PPL 23.52→24.39 (+0.87). M=1 56→74 t/s (+32%). M=8 207→205, M=16 217→220. New kernels `gemv_int4_warp_f16wsc`/`gemv_int4_batched_f16wsc` (templated on WScaleT). New weight dir `weights_int4_qwen3_8b_fp16sc/` (4.8 GB, scales FP16). Conversion script `scripts/convert_scales_fp16.py`. dp4a INT4 inner loop (prior phase). Norm fusion (3 H=4096 sites) wired in warp bench (+2 t/s). SwiGLU fusion blocked by multi-block RMSNorm bug.
+- v0.12.1: Fixed multi-block RMSNorm bug in fusion kernels. Wired all 4 fusion sites (3 RMSNorm + 1 SwiGLU). M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better than baseline 23.52!). New unit test bench/test_fused_int4.cu (bit-identical at N=4096/12288).
+- v0.12.0: INT4 8B FP16 weight scales. PPL 23.52→24.39 (+0.87). M=1 56→74 t/s (+32%). M=8 207→205, M=16 217→220. New kernels `gemv_int4_warp_f16wsc`/`gemv_int4_batched_f16wsc` (templated on WScaleT). New weight dir `weights_int4_qwen3_8b_fp16sc/` (4.8 GB, scales FP16). Conversion script `scripts/convert_scales_fp16.py`. dp4a INT4 inner loop (prior phase).
 - v0.11.0: Multi-chunk prefill (any prompt length). Fixed pinned buffer seq_pos race. Server hardening (rate limit all endpoints, restart, payload limit, max_tokens clamp, security fixes).
 - v0.10.0: Gemma 4 12B INT4 support (24 t/s, hd=512, GeGLU). Server hardening (rate limiting, graceful shutdown, config file, Prometheus metrics). GGUF parser fixes for Gemma metadata.
 - v0.9.3: INT4 8B server (56 t/s, PPL 23.52, repetition penalty)
@@ -382,7 +383,9 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 |--------|-----|---------|------|
 | BF16 (llama.cpp Q8_0) | **12.4** | 1.0× | Baseline |
 | INT8 block-16 (correct dims) | **18.65** | 1.5× | Production path |
-| INT4 symmetric (8B, baseline) | **23.52** | 1.9× | 56 t/s, no calibration, production ✅ |
+| INT4 symmetric (8B, baseline) | **23.52** | 1.9× | 56 t/s, no calibration, FP32 scales |
+| INT4 symmetric (8B, FP16 scales) | **24.39** | 1.97× | 74 t/s M=1, +32% throughput |
+| **INT4 symmetric (8B, FP16 sc + fusion)** | **21.98** | **1.77×** | **70 t/s warp, BETTER PPL than baseline!** |
 | INT4 + AWQ α=0.6 (8B) | **21.82** | 1.76× | AWQ calibration, random normal proxy |
 | **INT2 8B** | **47,529,500** | **3.8M×** | ❌ ABANDONED — activation quant accumulation |
 | NVFP4 E2M1 (8B) | **24,850** | 2005× | ❌ ABANDONED — double quantization, PPL vs INT4 |
@@ -406,9 +409,9 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 | 1.7B INT8 M=8 CUDA Graph benchmark | 575 t/s (196% of Q4_K_M) |
 | Effective BW (1.7B) | 260 GB/s (52% of 500 GB/s peak) |
 | **llama.cpp Q4_K_M (8B, RTX 5060 Ti)** | **84 t/s** |
-| **Blackwell INT4 M=1 (8B, v0.12 FP16 sc)** | **74 t/s (88% of llama.cpp)** |
+| **Blackwell INT4 M=1 (8B, v0.12.1 fusion)** | **70 t/s (83% of llama.cpp)** |
 | **Blackwell INT4 M=1 (8B, v0.12 + graph)** | **76.6 t/s (91% of llama.cpp)** |
-| Blackwell INT4 M=1 (8B, v0.11 FP32 sc) | 56 t/s (67% of llama.cpp) |
+| Blackwell INT4 M=1 (8B, v0.12 FP16 sc, no fusion) | 74 t/s (88% of llama.cpp) |
 | **Blackwell INT4 M=8 (8B, v0.12)** | **205 t/s (244% of llama.cpp)** |
 | **Blackwell INT4 M=16 (8B, v0.12)** | **220 t/s (262% of llama.cpp)** |
 | Blackwell INT4 M=48 (8B, v0.11) | 154 t/s (183% of llama.cpp) |
@@ -423,7 +426,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 - **INT4 8B FP16 scales is the throughput path** (74 t/s M=1, PPL=24.39). FP32 scales (56 t/s, PPL 23.52) kept for max quality. AWQ α=0.6 (PPL 21.82) not yet combined with FP16 scales.
 - **dp4a INT4 inner loop**: +74% on batched M=8 (119→207), ~0% on M=1 (memory-bound). Always on (bit-identical math).
 - **Occupancy cap (32,8) is NOT the M=1 bottleneck**: bumping to (32,16) gave 0% gain. Kernel memory-saturated (95% of 448 GB/s peak).
-- **Fusion kernels**: `fused_rmsnorm_quant_int4` works for N≤4096 (grid=1). `fused_swiglu_quant_int4` + v2 multi-block RMSNorm BROKEN for N>4096 (no cross-block reduction). SwiGLU fusion (I=12288) not usable without 2-pass kernel fix.
+- **Fusion kernels (v0.12.1 FIXED)**: `fused_rmsnorm_quant_int4` + `fused_swiglu_quant_int4` rewritten as single-block grid-stride (correct global sum_sq). Wired at all 4 sites in warp bench + PPL bench. +6 t/s (64→70), PPL 24.39→21.98 (different FP32 reduction order). Unit test `bench/test_fused_int4.cu` bit-identical at N=4096/12288.
 - **FP8 path ABANDONED** — worse quality AND 4.5× slower than INT8
 - **FP8 kernel code kept as reference** (src/kernels/gemv_fp8.cu, weights/benchmarks deleted)
 - **v0.9.4**: Added --fp16 flag to GGUF converter, FP16 benchmark, gemv_fp32 kernel, SSE streaming, batch endpoint fix
@@ -719,19 +722,21 @@ Not fixable without higher weight precision (FP16/INT8) or retraining.
 
 **Current status**: Qwen3 8B INT4 is the production path. Llama 3.1 at INT4 is abandoned.
 
-### fused_rmsnorm_quant_int4_v2 multi-block RMSNorm bug (2026-06-14) — UNFIXED, WORKAROUND
+### fused_rmsnorm_quant_int4_v2 multi-block RMSNorm bug (2026-06-14) — FIXED v0.12.1
 `src/kernels/fused_int4_ops.cu:156` `fused_rmsnorm_quant_int4_v2_kernel`: multi-block launch (grid>1,
-N>4096) computes RMSNorm incorrectly. Each block computes its own partial `sum_sq`, reduces
-within-block via `warp_sums[8]`, then divides by full `N` — but never reduces across blocks. Result:
-for N=12288 (MLP), `rstd` is ~3× too small → under-normalization → garbage activations → illegal
-memory access in downstream GEMV.
-**Scope**: `fused_rmsnorm_quant_int4` (wrapper dispatches to v2 for N>4096) and
-`fused_swiglu_quant_int4` (same multi-block pattern). Both UNSAFE for N>4096.
-**Workaround**: Only fuse RMSNorm+quant for N≤4096 (H, single-block grid=1). Keep `apply_swiglu` +
-`quantize_int4` separate for I=12288 MLP path. Wired in `bench/text_generate_int4_qwen3_8b.cu`
-(3 H=4096 sites: pre-attn norm, post-attn norm, final norm). SwiGLU fusion NOT wired.
-**Fix needed**: 2-pass kernel (pass 1: atomic/global reduce sum_sq; pass 2: normalize+quant) or
-single-block kernel with grid-stride for large N. Not pursued — gain is ~2 t/s, not worth kernel rewrite.
+N>4096) computed RMSNorm incorrectly. Each block computed its own partial `sum_sq`, reduced
+within-block via `warp_sums[8]`, then divided by full `N` — but never reduced across blocks.
+For N=12288 (MLP), `rstd` was ~3× too small → under-normalization → garbage.
+**Fix**: Rewrote both kernels as SINGLE-BLOCK grid-stride (one block loops over N in chunks
+of THREADS*EPT). Global sum_sq reduction is now trivial (one block). Handles any N (H=4096,
+I=12288, V=151936). Smem opt-in via `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` for
+>48KB. Aligned quant range to production `[-8,7]` (was `[-7,7]`).
+**Unit test**: `bench/test_fused_int4.cu` — bit-identical to CPU reference at N=4096 and N=12288.
+**Result**: All 4 fusion sites wired. M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better
+than baseline 23.52!). PPL improvement from different FP32 reduction order (128→256 threads).
+**Lesson**: FP32 reduction is NOT associative. Different thread count → different summation
+order → different rounding. Not "more correct", just different — happens to give better PPL
+on WikiText-2. Both paths produce coherent text.
 
 ### INT4 M=1 memory-bound, not compute-bound (2026-06-14) — VALIDATED
 Prior plans assumed INT4 M=1 GEMV was compute-bound on scalar FP32 unpack (41 instr/16-elem).

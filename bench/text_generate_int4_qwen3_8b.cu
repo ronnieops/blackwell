@@ -312,9 +312,8 @@ int main(int argc, char** argv) {
             die(blackwell::kernels::gemv_int4_warp_f16wsc(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc16,H,I,st),"gate");
             die(blackwell::kernels::gemv_int4_warp_f16wsc(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc16,H,I,st),"up");
 
-            // Fused SwiGLU + INT4 quant
-            blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
-            blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I, st);
+            // SwiGLU + INT4 quant (fused: skips d_gate rewrite + read)
+            die(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4,d_mlp_i4_sc,d_gate,d_up,I,st),"swiglu_quant");
 
             // Down projection
             die(blackwell::kernels::gemv_int4_warp_f16wsc(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc16,I,H,st),"down");
