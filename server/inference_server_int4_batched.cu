@@ -323,6 +323,230 @@ static std::vector<uint32_t> generate_one(
     return std::vector<uint32_t>(all_ids.begin() + gen_start, all_ids.end());
 }
 
+// =====================================================================
+// M>1 batched generation — processes M prompts in PARALLEL through batched GEMV.
+// Ported from bench/text_generate_int4_batched.cu (205 t/s at M=8).
+// Uses gemv_int4_batched_f16wsc(M>1) for all projections.
+// =====================================================================
+const int MAXBATCH = 8;
+const int MAXSEQ_BATCHED = 512;  // reduced KV cache for M>1 (memory)
+
+struct BatchState {
+    int M;
+    float *d_x32, *d_xi_f;      // [M][H]
+    float *d_residual;            // [M][H]
+    uint8_t *d_x_i4;             // [M][H/2]
+    float *d_x_i4_sc;            // [M][H/16]
+    float *d_Q, *d_K, *d_V;      // [M][Q/KV]
+    float *d_attn;                // [M][Q]
+    uint8_t *d_attn_i4;         // [M][Q/2]
+    float *d_attn_i4_sc;         // [M][Q/16]
+    float *d_proj;                // [M][H]
+    float *d_gate, *d_up;         // [M][I]
+    uint8_t *d_mlp_i4;          // [M][I/2]
+    float *d_mlp_i4_sc;          // [M][I/16]
+    float *d_logits;              // [M][V]
+    int *d_next_id;               // [M]
+    float *d_kc, *d_vc;           // KV cache [M][NL][MAXSEQ_BATCHED][nkv][hd]
+};
+
+static BatchState g_bs;
+static bool g_bs_alloc = false;
+
+static void alloc_batch_buffers() {
+    if (g_bs_alloc) return;
+    int M = MAXBATCH;
+    g_bs.M = M;
+    size_t kv_cache = (size_t)M * NL * nkv * MAXSEQ_BATCHED * hd * 4;
+    #define ALB(p,n){die(cudaMalloc(&(p),(size_t)(n)),"malloc "#p);}
+    ALB(g_bs.d_x32, M*H*4);    ALB(g_bs.d_xi_f, M*H*4);
+    ALB(g_bs.d_residual, M*H*4);
+    ALB(g_bs.d_x_i4, M*H/2);   ALB(g_bs.d_x_i4_sc, M*H/16*4);
+    ALB(g_bs.d_Q, M*Q*4);      ALB(g_bs.d_K, M*KV*4);  ALB(g_bs.d_V, M*KV*4);
+    ALB(g_bs.d_attn, M*Q*4);   ALB(g_bs.d_attn_i4, M*Q/2); ALB(g_bs.d_attn_i4_sc, M*Q/16*4);
+    ALB(g_bs.d_proj, M*H*4);   ALB(g_bs.d_gate, M*I*4); ALB(g_bs.d_up, M*I*4);
+    ALB(g_bs.d_mlp_i4, M*I/2); ALB(g_bs.d_mlp_i4_sc, M*I/16*4);
+    ALB(g_bs.d_logits, (size_t)M*V*4);
+    ALB(g_bs.d_next_id, M*4);
+    ALB(g_bs.d_kc, kv_cache);  ALB(g_bs.d_vc, kv_cache);
+    #undef ALB
+    // Init scale buffers to 1/7
+    float iv7 = 1.f/7.f;
+    std::vector<float> tmp(H/16, iv7);
+    for (int m = 0; m < M; ++m) {
+        cudaMemcpy(g_bs.d_x_i4_sc + (size_t)m*(H/16), tmp.data(), (H/16)*4, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_bs.d_attn_i4_sc + (size_t)m*(Q/16), tmp.data(), (Q/16)*4, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_bs.d_mlp_i4_sc + (size_t)m*(I/16), tmp.data(), (I/16)*4, cudaMemcpyHostToDevice);
+    }
+    g_bs_alloc = true;
+    fprintf(stderr, "Batch buffers allocated (M=%d, KV cache %zu MB)\n", M, kv_cache*2/(1024*1024));
+}
+
+// Generate tokens for M sequences in parallel using batched GEMV.
+static std::vector<std::vector<uint32_t>> generate_batch_multi(
+    const std::vector<std::vector<uint32_t>>& input_ids_vec,
+    int max_new, float temperature, int top_k, float rep_pen)
+{
+    int M = input_ids_vec.size();
+    if (M > MAXBATCH) M = MAXBATCH;
+    alloc_batch_buffers();
+
+    std::vector<std::vector<uint32_t>> all_ids(M);
+    std::vector<int> gen_start(M), seq_pos(M, 0);
+    for (int m = 0; m < M; ++m) {
+        all_ids[m] = input_ids_vec[m];
+        gen_start[m] = (int)input_ids_vec[m].size();
+    }
+
+    // Clear KV cache for M sequences
+    size_t kv_total = (size_t)M * NL * nkv * MAXSEQ_BATCHED * hd * 4;
+    cudaMemsetAsync(g_bs.d_kc, 0, kv_total, st);
+    cudaMemsetAsync(g_bs.d_vc, 0, kv_total, st);
+
+    int max_steps = max_new + *std::max_element(gen_start.begin(), gen_start.end());
+
+    for (int step = 0; step < max_steps; ++step) {
+        // Embed all M sequences (D2D from pre-loaded FP32 table)
+        for (int m = 0; m < M; ++m) {
+            uint32_t tid = (step < gen_start[m]) ? all_ids[m][step] : all_ids[m].back();
+            cudaMemcpyAsync(g_bs.d_x32 + (size_t)m*H, d_embed_fp32 + (size_t)tid*H,
+                           H*4, cudaMemcpyDeviceToDevice, st);
+        }
+
+        for (int l = 0; l < NL; ++l) {
+            // Save residual (M*H copy)
+            cudaMemcpyAsync(g_bs.d_residual, g_bs.d_x32, (size_t)M*H*4,
+                           cudaMemcpyDeviceToDevice, st);
+            // Pre-attn norm + quant (batched)
+            blackwell::kernels::fused_rmsnorm_batched(
+                g_bs.d_xi_f, g_bs.d_x32, W[l].rn_in, H, eps, M, st);
+            blackwell::kernels::quantize_int4_batched(
+                g_bs.d_x_i4, g_bs.d_x_i4_sc, g_bs.d_xi_f, H, M, st);
+            // QKV projections (batched M)
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_Q, g_bs.d_x_i4, g_bs.d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, M, st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_K, g_bs.d_x_i4, g_bs.d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, M, st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_V, g_bs.d_x_i4, g_bs.d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, M, st);
+            // Q/K head norms + RoPE (per-seq: different rope_pos)
+            for (int m = 0; m < M; ++m) {
+                int rope_pos = (step >= gen_start[m]-1) ? gen_start[m]-1+seq_pos[m] : step;
+                head_norm_kernel<<<nqh,128,0,st>>>(g_bs.d_Q + (size_t)m*Q, W[l].qn, nqh, hd, eps);
+                head_norm_kernel<<<nkv,128,0,st>>>(g_bs.d_K + (size_t)m*KV, W[l].kn, nkv, hd, eps);
+                apply_rope_kernel<<<nqh,hd/2,0,st>>>(g_bs.d_Q + (size_t)m*Q, nqh, hd, rope_pos);
+                apply_rope_kernel<<<nkv,hd/2,0,st>>>(g_bs.d_K + (size_t)m*KV, nkv, hd, rope_pos);
+            }
+            // KV cache update (per-seq)
+            size_t l_kv_off = (size_t)l * nkv * MAXSEQ_BATCHED * hd;
+            for (int m = 0; m < M; ++m) {
+                size_t m_kv_off = (size_t)m * NL * nkv * MAXSEQ_BATCHED * hd + l_kv_off;
+                blackwell::kernels::update_kv_cache(
+                    g_bs.d_kc + m_kv_off, g_bs.d_vc + m_kv_off,
+                    g_bs.d_K + (size_t)m*KV, g_bs.d_V + (size_t)m*KV,
+                    0, step, nkv, hd, MAXSEQ_BATCHED, st);
+            }
+            // Attention (per-seq, M=1 batched call per sequence)
+            for (int m = 0; m < M; ++m) {
+                size_t m_kv_off = (size_t)m * NL * nkv * MAXSEQ_BATCHED * hd;
+                blackwell::kernels::attention_decode_batched_gqa(
+                    g_bs.d_attn + (size_t)m*Q, g_bs.d_Q + (size_t)m*Q,
+                    g_bs.d_kc + m_kv_off, g_bs.d_vc + m_kv_off,
+                    step, nqh, nkv, hd, MAXSEQ_BATCHED, 1,
+                    (size_t)nkv*MAXSEQ_BATCHED*hd, l_kv_off, st);
+            }
+            // Wo projection (batched M)
+            blackwell::kernels::quantize_int4_batched(
+                g_bs.d_attn_i4, g_bs.d_attn_i4_sc, g_bs.d_attn, Q, M, st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_proj, g_bs.d_attn_i4, g_bs.d_attn_i4_sc,
+                W[l].o.d, W[l].o.sc16, Q, H, M, st);
+            // Residual add (per-seq)
+            for (int m = 0; m < M; ++m)
+                blackwell::kernels::vector_add_fp32(
+                    g_bs.d_x32+(size_t)m*H, g_bs.d_proj+(size_t)m*H, g_bs.d_residual+(size_t)m*H, H, st);
+            cudaMemcpyAsync(g_bs.d_residual, g_bs.d_x32, (size_t)M*H*4, cudaMemcpyDeviceToDevice, st);
+            // Pre-MLP norm + quant (batched)
+            blackwell::kernels::fused_rmsnorm_batched(
+                g_bs.d_xi_f, g_bs.d_x32, W[l].rn_post, H, eps, M, st);
+            blackwell::kernels::quantize_int4_batched(
+                g_bs.d_x_i4, g_bs.d_x_i4_sc, g_bs.d_xi_f, H, M, st);
+            // Gate + up (batched M)
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_gate, g_bs.d_x_i4, g_bs.d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, M, st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_up, g_bs.d_x_i4, g_bs.d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, M, st);
+            // SwiGLU (per-seq)
+            for (int m = 0; m < M; ++m)
+                blackwell::kernels::apply_swiglu(
+                    g_bs.d_gate+(size_t)m*I, g_bs.d_gate+(size_t)m*I, g_bs.d_up+(size_t)m*I, I, st);
+            // Quantize MLP output (batched)
+            blackwell::kernels::quantize_int4_batched(
+                g_bs.d_mlp_i4, g_bs.d_mlp_i4_sc, g_bs.d_gate, I, M, st);
+            // Down projection (batched M)
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_proj, g_bs.d_mlp_i4, g_bs.d_mlp_i4_sc,
+                W[l].d.d, W[l].d.sc16, I, H, M, st);
+            // Residual add (per-seq)
+            for (int m = 0; m < M; ++m)
+                blackwell::kernels::vector_add_fp32(
+                    g_bs.d_x32+(size_t)m*H, g_bs.d_proj+(size_t)m*H, g_bs.d_residual+(size_t)m*H, H, st);
+        }
+
+        // Final norm + lm_head + sampling (for sequences that are generating)
+        int min_gen = *std::min_element(gen_start.begin(), gen_start.end());
+        if (step >= min_gen - 1) {
+            blackwell::kernels::fused_rmsnorm_batched(
+                g_bs.d_xi_f, g_bs.d_x32, d_fn, H, eps, M, st);
+            blackwell::kernels::quantize_int4_batched(
+                g_bs.d_x_i4, g_bs.d_x_i4_sc, g_bs.d_xi_f, H, M, st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                g_bs.d_logits, g_bs.d_x_i4, g_bs.d_x_i4_sc,
+                lm_head_w.d, lm_head_w.sc16, H, V, M, st);
+            for (int m = 0; m < M; ++m) {
+                if (step >= gen_start[m] - 1) {
+                    // Repetition penalty
+                    if (rep_pen > 1.0f) {
+                        int num_recent = (int)all_ids[m].size() - gen_start[m];
+                        if (num_recent > 0) {
+                            if (num_recent > 64) num_recent = 64;
+                            std::vector<int> h_rec(all_ids[m].end()-num_recent, all_ids[m].end());
+                            cudaMemcpyAsync(d_recent, h_rec.data(), num_recent*4, cudaMemcpyHostToDevice, st);
+                            blackwell::kernels::apply_repetition_penalty(
+                                g_bs.d_logits+(size_t)m*V, d_recent, num_recent, rep_pen, V, st);
+                        }
+                    }
+                    blackwell::kernels::sample_gpu(
+                        g_bs.d_logits+(size_t)m*V, V, temperature, top_k,
+                        g_bs.d_next_id+m, 0xdeadbeefLL, step, st);
+                }
+            }
+        }
+
+        cudaStreamSynchronize(st);
+
+        // Collect results
+        std::vector<int> next_ids(M, 0);
+        bool all_done = true;
+        for (int m = 0; m < M; ++m) {
+            if (step >= gen_start[m] - 1) {
+                cudaMemcpy(&next_ids[m], g_bs.d_next_id+m, 4, cudaMemcpyDeviceToHost);
+                all_ids[m].push_back(next_ids[m]);
+                seq_pos[m]++;
+                if (next_ids[m] != 151643 && next_ids[m] != 151645) all_done = false;
+            } else {
+                all_done = false;
+            }
+        }
+        if (all_done) break;
+    }
+
+    std::vector<std::vector<uint32_t>> results(M);
+    for (int m = 0; m < M; ++m)
+        results[m] = std::vector<uint32_t>(all_ids[m].begin()+gen_start[m], all_ids[m].end());
+    return results;
+}
+
 static std::string json_escape(const std::string& s) {
     std::string r;
     for (char c : s) {
@@ -372,14 +596,11 @@ int main(int argc, char** argv) {
             printf("{\"error\":\"no prompts\"}\n"); fflush(stdout); continue;
         }
 
-        // Process each prompt sequentially, clear KV cache between
-        std::vector<std::vector<uint32_t>> all_results;
-        for (size_t i = 0; i < prompts.size(); ++i) {
-            auto input_ids = tokenizer.encode(prompts[i]);
-            auto gen = generate_one(input_ids, max_tokens, temperature, top_k, rep_pen);
-            all_results.push_back(gen);
-            cudaStreamSynchronize(st);
-        }
+        // Process all prompts in PARALLEL using batched GEMV (M>1)
+        std::vector<std::vector<uint32_t>> all_input_ids;
+        for (size_t i = 0; i < prompts.size(); ++i)
+            all_input_ids.push_back(tokenizer.encode(prompts[i]));
+        auto all_results = generate_batch_multi(all_input_ids, max_tokens, temperature, top_k, rep_pen);
 
         // Output batched JSON
         printf("{\"tokens\":[");
