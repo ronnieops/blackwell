@@ -8,6 +8,11 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <future>
+#include <deque>
+#include <thread>
+#include <vector>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -364,6 +369,156 @@ public:
 };
 
 static SubprocessEngine g_engine;
+
+// =====================================================================
+// BatchDispatcher — continuous batching for concurrent /v1/completions
+//
+// Collects up to BATCH_SIZE requests within BATCH_WAIT_MS, dispatches as one
+// /v1/batch call, distributes results via promise/future.
+// Streaming requests and param-mismatched requests bypass batching (direct generate).
+// =====================================================================
+struct BatchReq {
+    std::string prompt;
+    int max_tokens;
+    float temp;
+    int top_k;
+    float rep_pen;
+    std::promise<std::pair<std::vector<uint32_t>, std::string>> result;
+};
+
+class BatchDispatcher {
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::deque<BatchReq> queue_;
+    std::thread dispatcher_;
+    std::atomic<bool> running_{false};
+    int max_batch_;
+    int wait_ms_;
+public:
+    void start(int max_batch, int wait_ms) {
+        max_batch_ = max_batch;
+        wait_ms_ = wait_ms;
+        running_ = true;
+        dispatcher_ = std::thread(&BatchDispatcher::run, this);
+    }
+    void stop() {
+        running_ = false;
+        cv_.notify_all();
+        if (dispatcher_.joinable()) dispatcher_.join();
+    }
+
+    // Submit a request, get a future for the result.
+    // Returns false if batch is full (caller should fall back to direct generate).
+    std::future<std::pair<std::vector<uint32_t>, std::string>> submit(
+            const std::string& prompt, int max_tok, float temp, int top_k, float rep_pen) {
+        BatchReq req;
+        req.prompt = prompt;
+        req.max_tokens = max_tok;
+        req.temp = temp;
+        req.top_k = top_k;
+        req.rep_pen = rep_pen;
+        auto fut = req.result.get_future();
+        {
+            std::lock_guard<std::mutex> g(mtx_);
+            queue_.push_back(std::move(req));
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    void run() {
+        while (running_) {
+            std::vector<BatchReq> batch;
+            {
+                std::unique_lock<std::mutex> g(mtx_);
+                // Wait for at least one request
+                cv_.wait(g, [this]{ return !queue_.empty() || !running_; });
+                if (!running_) break;
+                // Take first request immediately
+                batch.push_back(std::move(queue_.front()));
+                queue_.pop_front();
+                // Collect more requests up to max_batch_, with wait_ms_ timeout
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(wait_ms_);
+                while ((int)batch.size() < max_batch_) {
+                    if (cv_.wait_until(g, deadline) == std::cv_status::timeout) break;
+                    while (!queue_.empty() && (int)batch.size() < max_batch_) {
+                        batch.push_back(std::move(queue_.front()));
+                        queue_.pop_front();
+                    }
+                    if ((int)batch.size() >= max_batch_) break;
+                }
+            }
+            // Dispatch batch. Group by params (max_tokens, temp, top_k, rep_pen).
+            // Requests with different params go in separate generate_batch calls.
+            dispatch_grouped(batch);
+        }
+        // Drain remaining on shutdown
+        std::lock_guard<std::mutex> g(mtx_);
+        for (auto& req : queue_) {
+            req.result.set_value({{}, ""});
+        }
+        queue_.clear();
+    }
+
+    void dispatch_grouped(std::vector<BatchReq>& batch) {
+        // Group by (max_tokens, temp, top_k, rep_pen) — each group is one batch call.
+        // Simple approach: sort by params, then contiguous groups.
+        std::sort(batch.begin(), batch.end(), [](const BatchReq& a, const BatchReq& b) {
+            if (a.max_tokens != b.max_tokens) return a.max_tokens < b.max_tokens;
+            if (a.temp != b.temp) return a.temp < b.temp;
+            if (a.top_k != b.top_k) return a.top_k < b.top_k;
+            return a.rep_pen < b.rep_pen;
+        });
+
+        size_t i = 0;
+        while (i < batch.size()) {
+            // Find contiguous group with same params
+            size_t j = i;
+            while (j < batch.size() &&
+                   batch[j].max_tokens == batch[i].max_tokens &&
+                   batch[j].temp == batch[i].temp &&
+                   batch[j].top_k == batch[i].top_k &&
+                   batch[j].rep_pen == batch[i].rep_pen) {
+                j++;
+            }
+            // Dispatch group [i, j) as one batch (capped at max_batch_)
+            size_t k = i;
+            while (k < j) {
+                size_t end = std::min(k + max_batch_, j);
+                dispatch_one(batch, k, end);
+                k = end;
+            }
+            i = j;
+        }
+    }
+
+    void dispatch_one(std::vector<BatchReq>& batch, size_t start, size_t end) {
+        std::vector<std::string> prompts;
+        for (size_t i = start; i < end; i++) prompts.push_back(batch[i].prompt);
+
+        std::vector<std::vector<uint32_t>> all_tokens;
+        std::vector<std::string> all_text;
+        bool ok = g_engine.generate_batch(prompts, batch[start].max_tokens,
+                                          batch[start].temp, batch[start].top_k,
+                                          batch[start].rep_pen, all_tokens, all_text);
+
+        for (size_t i = start; i < end; i++) {
+            size_t idx = i - start;
+            if (ok && idx < all_tokens.size()) {
+                batch[i].result.set_value({all_tokens[idx],
+                    idx < all_text.size() ? all_text[idx] : ""});
+            } else {
+                batch[i].result.set_value({{}, ""});
+            }
+        }
+    }
+};
+
+static BatchDispatcher g_batcher;
+static int g_batch_size = 8;
+static int g_batch_wait_ms = 2;
 // Subprocess restart: check if process is alive, restart if dead
 static bool ensure_subprocess_alive(const char* model) {
     if (g_engine.ready) {
@@ -528,6 +683,21 @@ int main(int argc, char** argv) {
     }
     sleep(2);
 
+    // Continuous batching config (env-configurable)
+    const char* bs_env = getenv("BATCH_SIZE");
+    if (bs_env) g_batch_size = atoi(bs_env);
+    const char* bw_env = getenv("BATCH_WAIT_MS");
+    if (bw_env) g_batch_wait_ms = atoi(bw_env);
+    if (g_batch_size < 1) g_batch_size = 1;
+    if (g_batch_size > 8) g_batch_size = 8;
+    if (g_batch_wait_ms < 0) g_batch_wait_ms = 0;
+    if (g_batch_size > 1) {
+        g_batcher.start(g_batch_size, g_batch_wait_ms);
+        fprintf(stderr, "  Continuous batching: ON (max=%d, wait=%dms)\n", g_batch_size, g_batch_wait_ms);
+    } else {
+        fprintf(stderr, "  Continuous batching: OFF (BATCH_SIZE=1)\n");
+    }
+
     httplib::Server svr;
     svr.set_read_timeout(300);
     svr.set_write_timeout(300);
@@ -667,7 +837,22 @@ int main(int argc, char** argv) {
         bool stream = json_int_at(body, "stream", 0) == 1;
 
         std::vector<uint32_t> tokens; std::string text;
-        if(!g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text, stream)) {
+        bool ok;
+        if (stream) {
+            // Streaming can't batch — direct generate
+            ok = g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text, stream);
+        } else if (g_batch_size > 1) {
+            // Continuous batching: submit to dispatcher, wait for result
+            auto fut = g_batcher.submit(prompt, max_tokens, temp, top_k, rep_pen);
+            auto result = fut.get();
+            tokens = result.first;
+            text = result.second;
+            ok = !tokens.empty();
+        } else {
+            // Batching disabled — direct generate
+            ok = g_engine.generate(prompt, max_tokens, temp, top_k, rep_pen, tokens, text, stream);
+        }
+        if(!ok) {
             res.status = 504;
             res.set_content(R"({"error":{"message":"Generation timeout or error","type":"internal_error"}})", "application/json");
             return;
