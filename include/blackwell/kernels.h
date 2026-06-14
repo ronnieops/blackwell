@@ -214,6 +214,23 @@ cudaError_t attention_decode_batched_gqa(
     size_t          kv_layer_elems, // floats from seq base to current layer
     cudaStream_t    stream = 0);
 
+// Direct seq_pos variant: no H2D copy, no pinned buffer race.
+// Use in prefill loops where multiple positions are processed sequentially.
+cudaError_t attention_decode_batched_gqa_pos(
+    float*          output,
+    const float*    Q,
+    const float*    K_cache,
+    const float*    V_cache,
+    int             seq_pos,         // direct value (no device pointer)
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             head_dim,
+    int             max_seq_len,
+    int             M,
+    size_t          kv_batch_elems,
+    size_t          kv_layer_elems,
+    cudaStream_t    stream = 0);
+
 // Graph-safe batched GQA: takes device-side seq_pos pointer (no H2D memcpy)
 cudaError_t attention_decode_batched_gqa_device(
     float*          output,
@@ -288,6 +305,21 @@ cudaError_t attention_prefill_v2(
     int             num_q_per_group,
     cudaStream_t    stream = 0);
 
+// Prefill attention v3: [M, num_heads, head_dim] layout, hd=128, M≤16
+// Supports larger head_dim (128) and M up to 16.
+// Uses 32 threads (1 warp), Q in registers, K in shared memory, causal masking.
+cudaError_t attention_prefill_v3(
+    float*          output,
+    const float*    Q,
+    const float*    K,
+    const float*    V,
+    int             M,
+    int             head_dim,
+    int             num_q_heads,
+    int             num_kv_heads,
+    int             num_q_per_group,
+    cudaStream_t    stream = 0);
+
 // ---------------------------------------------------------------------------
 // Prefill layer orchestration
 // ---------------------------------------------------------------------------
@@ -326,6 +358,19 @@ cudaError_t update_kv_cache_device(
     const float*    v_new,
     int             batch_idx,
     const int*      d_seq_pos,   // device pointer (skip H2D copy)
+    int             num_heads,
+    int             head_dim,
+    int             max_seq_len,
+    cudaStream_t    stream = 0);
+
+// Direct seq_pos variant: no H2D copy, no pinned buffer race.
+// Use in tight loops where multiple positions are written sequentially.
+cudaError_t update_kv_cache_pos(
+    float*          k_cache,
+    float*          v_cache,
+    const float*    k_new,
+    const float*    v_new,
+    int             seq_pos,     // direct value (no device pointer)
     int             num_heads,
     int             head_dim,
     int             max_seq_len,
@@ -657,6 +702,18 @@ cudaError_t gemv_fp32_int8_per_row_warp(
     int             N,
     cudaStream_t   stream = 0);
 
+// Warp-cooperative FP32×INT4 GEMV — 1 warp/row, shuffle reduction.
+// FP32 activations × INT4 packed weights (no activation quantization).
+// Uses same block-16 INT4 format as gemv_int4_warp_kernel.
+cudaError_t gemv_fp32_int4_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t   stream = 0);
+
 // Per-row INT8 GEMV with FP32 activations — 1 scale per output row.
 // Scale format: W_scale [N] FP32 (per-row max), int8 data same block-16 layout.
 
@@ -761,6 +818,21 @@ cudaError_t gemv_int4_warp(
     int             K,
     int             N,
     cudaStream_t   stream = 0);
+
+// FP16 weight-scale variant of gemv_int4_warp.
+// Identical math; W_scale points to [N][K/16] __half instead of FP32.
+// Halves weight-scale memory traffic (~33% of total GEMV bytes). Use when
+// weights were quantized with FP16 scales (scripts/convert_scales_fp16.py).
+// Activation scales (x_scale) stay FP32 (tiny, reused across N rows).
+cudaError_t gemv_int4_warp_f16wsc(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const void*     W_scale,       // __half* [N][K/16]
+    int             K,
+    int             N,
+    cudaStream_t    stream = 0);
 
 // Fused Q/K/V GEMV with inline INT4 quantization
 // Loads FP32 x once, computes scales, quantizes to INT4 in registers,
@@ -1288,6 +1360,35 @@ cudaError_t fused_quant_attn_wo(
 // Grid: N × M blocks, 32 threads/block.
 // Weight loaded once per K-block, reused across M tokens.
 cudaError_t gemv_int4_batched(
+    float*          y_out,
+    const uint8_t*  x_packed,
+    const float*    x_scale,
+    const uint8_t*  W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream = 0);
+
+// FP16 weight-scale variant of gemv_int4_batched.
+// W_scale points to [N][K/16] __half. Halves weight-scale traffic.
+// Same M=1..16 template dispatch. Activation scales stay FP32.
+cudaError_t gemv_int4_batched_f16wsc(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const void*     W_scale,       // __half* [N][K/16]
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream = 0);
+
+// INT2 symmetric block-16 GEMV.
+// W: [N][K/4] packed INT2, W_scale: [N][K/16] FP32.
+// x: [M][K/2] packed INT4, x_scale: [M][K/16] FP32.
+// Grid: N blocks, 32 threads/block (1 warp per output row).
+cudaError_t gemv_int2_batched(
     float*          y_out,
     const uint8_t*  x_packed,
     const float*    x_scale,

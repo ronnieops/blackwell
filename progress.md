@@ -1,28 +1,19 @@
-# Blackwell Project Progress
+# Progress Log
 
-## 2026-06-09 — Research Complete
+## Session: M=1 GEMV External Research (2026-06-14)
 
-### Research Findings
-- Read `include/blackwell/kernels.h` — 177 kernel symbols, full API documented
-- Read `bench/text_generate_int4_batched.cu` (525 lines) — batched architecture
-- Read `server/inference_server_int4.cu` (350 lines) — server implementation
+**Task**: Research llama.cpp MMVQ kernel memory patterns + Blackwell memory best practices for M=1 INT4 GEMV optimization.
 
-### Key Kernel Signatures Documented
-1. **INT4**: `gemv_int4_warp`, `gemv_int4_batched`, `quantize_int4`, `quantize_int4_batched`
-2. **INT8**: `gemv_int8_warp` (production), `gemv_int8_batched`, `gemv_int8_gate_up`
-3. **Attention**: `attention_decode_gqa`, `attention_decode_batched_gqa`
-4. **Quantization**: `quantize_int8`, `fused_rmsnorm_quant_int8`, `fused_rmsnorm_batched`
-5. **KV/RoPE**: `update_kv_cache`, `update_kv_cache_device`, `fused_rope_decode`
+**Status**: IN PROGRESS — compiling findings into handoff/m1-external.md
 
-### Architecture Decisions
-- Batched benchmark: M×buffer layout, separate KV caches per sequence
-- Server: sequential prompt processing (no GPU batching)
-- 36-layer decode loop with INT4 quantization at each projection
+### Research angles covered:
+1. ✅ llama.cpp mmvq.cu kernel architecture (thread/warp config, memory access patterns)
+2. ✅ CUDA Graph usage in llama.cpp / vLLM for launch overhead elimination
+3. ✅ Blackwell SM_120 memory best practices (TMA, cp.async, LDG, L2 hints)
+4. ✅ Occupancy / warp utilization analysis for 1-warp-per-row GEMV
+5. ✅ Software pipelining / double buffering for memory-bound kernels
+6. ✅ Megakernel / persistent kernel approaches
+7. ✅ Our kernel architecture review (gemv_int8_warp_kernel: 1 warp/row, 32 threads, stride-32 K-blocks, dp4a, __launch_bounds__(32,8))
 
-### Output
-- Research report: `research.md` (8794 bytes)
-
-## TODO
-- [ ] No batched `apply_swiglu` — per-sequence loop required
-- [ ] No batched `vector_add_fp32` — per-sequence loop required
-- [ ] CUDA Graph integration deferred until head_norm/RoPE fusion
+### Key finding:
+Our kernel: `__launch_bounds__(32, 8)` = max 8 warps/SM × 36 SMs = 288 concurrent warps. Grid = N blocks (N=output dim). Each block = 1 warp = 1 output row. Weight loads coalesced (same row, stride-32 across threads). The bottleneck is NOT coalescing — it's likely **launch overhead** (9720 launches/token × ~2-5µs = 19-49ms overhead) and **occupancy** (only 8 warps/SM may not fully hide DRAM latency).

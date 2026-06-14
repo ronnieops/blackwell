@@ -177,6 +177,11 @@ private:
 
     std::string read_string() {
         uint64_t len = read_scalar<uint64_t>();
+        // Sanity check: reject absurd string lengths (> 100 MB)
+        if (len > 100 * 1024 * 1024) {
+            fprintf(stderr, "String sanity check failed: len=%llu\n", (unsigned long long)len);
+            return std::string();
+        }
         std::string s(len, '\0');
         if (len > 0) fread(&s[0], 1, len, f_);
         return s;
@@ -224,6 +229,10 @@ private:
     }
 
     GGUFValue read_value(uint32_t type) {
+        // Note: despite GGUF v3 official spec, most GGUF files (including
+        // Unsloth Qwen3, Gemma 4 exports) use LEGACY type codes:
+        // 0=uint8, 1=int8, 2=uint16, 3=int16, 4=uint32, 5=int32,
+        // 6=float32, 7=bool, 8=string, 9=array, 10=uint64, 11=int64
         switch (type) {
             case 0: return (uint64_t)read_scalar<uint8_t>();
             case 1: return (int32_t)(int)read_scalar<int8_t>();
@@ -235,12 +244,11 @@ private:
             case 7: return (bool)read_scalar<uint8_t>();
             case 8: return read_string();
             case 9: return read_array();
-            case 10: return read_scalar<uint64_t>();
-            case 11: return read_scalar<int64_t>();
-            case 12: return (double)read_scalar<uint16_t>() / 16384.0; // fp16 approx
-            case 13: return (double)read_scalar<double>();
+            case 10: return (uint64_t)read_scalar<uint64_t>();
+            case 11: return (int64_t)read_scalar<uint64_t>();
+            case 12: { double d; fread(&d,8,1,f_); return d; }  // float64
+            case 13: return (double)read_scalar<uint16_t>() / 16384.0; // fp16 approx
             default: {
-                // Skip unknown type
                 fseek(f_, 4, SEEK_CUR);
                 return std::string("<unknown>");
             }
@@ -272,9 +280,16 @@ private:
             std::vector<int32_t> arr(arr_len);
             for (uint64_t i = 0; i < arr_len; i++) arr[i] = read_scalar<int8_t>();
             return arr;
+        } else if (arr_type == 7) {  // bool array
+            // Skip (1 byte per element)
+            if (arr_len > 0) fseek(f_, arr_len, SEEK_CUR);
+            return std::vector<int32_t>();
         } else {
-            // Skip unknown array type
-            fseek(f_, arr_len * 4, SEEK_CUR);
+            // Skip unknown array type — guess element size
+            int elem_size = 4;
+            if (arr_type == 0 || arr_type == 1 || arr_type == 5 || arr_type == 7) elem_size = 1;
+            else if (arr_type == 2 || arr_type == 3) elem_size = 2;
+            if (arr_len > 0) fseek(f_, (long)(arr_len * elem_size), SEEK_CUR);
             return std::vector<std::string>();
         }
     }

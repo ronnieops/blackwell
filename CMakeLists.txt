@@ -62,6 +62,7 @@ set(KERNEL_SOURCES
     src/kernels/fused_o_norm.cu
     src/kernels/gemv_v2.cu
     src/kernels/gemv_int8.cu
+    src/kernels/gemv_int2.cu
     src/kernels/gemv_fp8.cu
     src/kernels/gemv_fp16.cu
     src/kernels/gemv_fp32.cu
@@ -198,9 +199,13 @@ endfunction()
 add_blackwell_bench(text_generate_int4_1.7b bench/text_generate_int4_1.7b.cu)
 add_blackwell_bench(bench_ppl_llama32_1b bench/bench_ppl_llama32_1b.cu)
 add_blackwell_bench(bench_ppl_llama31_8b bench/bench_ppl_llama31_8b.cu)
+add_blackwell_bench(bench_ppl_llama31_8b_fp32_res bench/bench_ppl_llama31_8b_fp32_res.cu)
 add_blackwell_bench(text_generate_llama31_8b bench/text_generate_llama31_8b.cu)
+add_blackwell_bench(text_generate_llama31_8b_fp32_res bench/text_generate_llama31_8b_fp32_res.cu)
+add_blackwell_bench(text_generate_llama31_8b_int8 bench/text_generate_llama31_8b_int8.cu)
 add_blackwell_bench(text_generate_int4_batched bench/text_generate_int4_batched.cu)
 add_blackwell_bench(text_generate_int4_qwen3_8b bench/text_generate_int4_qwen3_8b.cu)
+add_blackwell_bench(text_generate_gemma bench/text_generate_gemma.cu)
 add_blackwell_bench(bench_ppl_int4_8b bench/bench_ppl_int4_8b.cu)
 add_blackwell_bench(decode_int4_cgraph_8b bench/decode_int4_cgraph_8b.cu)
 
@@ -216,3 +221,8 @@ target_link_libraries(inference_server_llama PRIVATE blackwell_kernels CUDA::cud
 target_compile_options(inference_server_llama PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)
 target_include_directories(inference_server_llama PRIVATE include)
 set_target_properties(inference_server_llama PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../server")
+add_blackwell_bench(bench_gemv_int4 bench/bench_gemv_int4.cu)
+add_blackwell_bench(bench_gemv_int2 bench/bench_gemv_int2.cu)
+add_blackwell_bench(bench_ppl_int2_8b bench/bench_ppl_int2_8b.cu)
+add_blackwell_bench(text_generate_int2_qwen3_8b bench/text_generate_int2_qwen3_8b.cu)
+add_blackwell_bench(text_generate_speculative bench/text_generate_speculative.cu)

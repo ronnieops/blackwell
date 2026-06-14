@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda/std/cmath>
 #include <cuda_fp4.h>
+#include <cuda_fp16.h>
 #include "blackwell/kernels.h"
 #include "blackwell/config.h"
 
@@ -295,8 +296,8 @@ __global__ void gemv_fp32_int8_per_row_warp_kernel(
         sum_b += SE_W(w2 >> 16) * v2.z;  sum_b += SE_W(w2 >> 24) * v2.w;
         sum_b += SE_W(w3 >>  0) * v3.x;  sum_b += SE_W(w3 >>  8) * v3.y;
         sum_b += SE_W(w3 >> 16) * v3.z;  sum_b += SE_W(w3 >> 24) * v3.w;
-        #undef SE_W
         acc += sum_b * w_sc;
+        #undef SE_W
     }
 
     // Warp shuffle reduction
@@ -463,8 +464,9 @@ __global__ void gemv_fp32_fp4_warp_kernel(
 // ===========================================================================
 // Warp-cooperative INT4 GEMV — 1 warp per output row, packed 2 vals/byte
 // Signed INT4 weights [-8,7] packed as 2 nibbles per byte.
-// Strategy: scalar FP32 multiply-accumulate (no dp4a).
-// Unpack nibble → float, multiply, accumulate. Simpler than dp4a path.
+// Strategy: nibble -> INT8 upcast + __dp4a INT8 SIMD dot product.
+// Unpack 8 bytes -> 4 int32 lanes (4 int8 each) -> 4x __dp4a -> scale.
+// Bit-identical math to scalar float path, ~10x fewer instructions.
 // Weight layout: W_packed [N][K/2], scale layout: W_scale [N][K/16] FP32.
 // ===========================================================================
 
@@ -478,13 +480,58 @@ __device__ __forceinline__ void int4_byte_to_floats(uint8_t b, float &f0, float 
     f1 = static_cast<float>(hi);
 }
 
+// Device-side: unpack 8 packed bytes (16 INT4 nibbles) into 4 int32 lanes,
+// each lane holding 4 signed INT8 values ready for __dp4a.
+// Offset-binary nibble [0..15] -> signed value [-8..7] via `nib - 8`.
+// Values fit signed int8 range [-128,127], so dp4a handles them natively.
+// Byte ordering within each lane is identical for weights and activations,
+// so the dot product is correct regardless of lane-internal order.
+__device__ __forceinline__ void int4_8bytes_to_int4lanes(const uint8_t* bytes,
+                                                        int &l0, int &l1, int &l2, int &l3) {
+    // Lane 0 <- nibbles 0,1,2,3 (bytes 0,1)
+    int b0 = bytes[0], b1 = bytes[1], b2 = bytes[2], b3 = bytes[3];
+    int b4 = bytes[4], b5 = bytes[5], b6 = bytes[6], b7 = bytes[7];
+
+    int n00 = (b0 & 0xF) - 8, n01 = ((b0 >> 4) & 0xF) - 8;
+    int n02 = (b1 & 0xF) - 8, n03 = ((b1 >> 4) & 0xF) - 8;
+    int n04 = (b2 & 0xF) - 8, n05 = ((b2 >> 4) & 0xF) - 8;
+    int n06 = (b3 & 0xF) - 8, n07 = ((b3 >> 4) & 0xF) - 8;
+    int n08 = (b4 & 0xF) - 8, n09 = ((b4 >> 4) & 0xF) - 8;
+    int n10 = (b5 & 0xF) - 8, n11 = ((b5 >> 4) & 0xF) - 8;
+    int n12 = (b6 & 0xF) - 8, n13 = ((b6 >> 4) & 0xF) - 8;
+    int n14 = (b7 & 0xF) - 8, n15 = ((b7 >> 4) & 0xF) - 8;
+
+    l0 = (n00 & 0xFF) | ((n01 & 0xFF) << 8) | ((n02 & 0xFF) << 16) | ((n03 & 0xFF) << 24);
+    l1 = (n04 & 0xFF) | ((n05 & 0xFF) << 8) | ((n06 & 0xFF) << 16) | ((n07 & 0xFF) << 24);
+    l2 = (n08 & 0xFF) | ((n09 & 0xFF) << 8) | ((n10 & 0xFF) << 16) | ((n11 & 0xFF) << 24);
+    l3 = (n12 & 0xFF) | ((n13 & 0xFF) << 8) | ((n14 & 0xFF) << 16) | ((n15 & 0xFF) << 24);
+}
+
+// Load weight scale element and convert to float. Templated so the same
+// kernel serves FP32 and FP16 weight-scale formats (FP16 halves the scale
+// memory traffic, ~33% of total GEMV bytes). Activation scales stay FP32.
+__device__ __forceinline__ float load_wsc(const float* sc, size_t idx) { return sc[idx]; }
+__device__ __forceinline__ float load_wsc(const __half* sc, size_t idx) {
+    return __half2float(sc[idx]);
+}
+
+// ===========================================================================
+// Warp-cooperative INT4 GEMV — 1 warp per output row, packed 2 vals/byte
+// Signed INT4 weights [-8,7] packed as 2 nibbles per byte.
+// Strategy: nibble -> INT8 upcast + __dp4a INT8 SIMD dot product.
+// Unpack 8 bytes -> 4 int32 lanes (4 int8 each) -> 4x __dp4a -> scale.
+// Bit-identical math to scalar float path, ~10x fewer instructions.
+// Weight layout: W_packed [N][K/2], scale layout: W_scale [N][K/16].
+// WScaleT = float (FP32 scales) or __half (FP16 scales, half the traffic).
+// ===========================================================================
+template <typename WScaleT>
 __launch_bounds__(32, 8)
 __global__ void gemv_int4_warp_kernel(
     float* __restrict__ y_out,
     const uint8_t* __restrict__ x_packed,    // [K/2] packed INT4 activations
     const float* __restrict__ x_scale,       // [K/16] FP32 activation scales
     const uint8_t* __restrict__ W_packed,    // [N][K/2] packed INT4 weights
-    const float* __restrict__ W_scale,       // [N][K/16] FP32 weight scales
+    const WScaleT* __restrict__ W_scale,     // [N][K/16] weight scales (FP32 or FP16)
     int K, int N)
 {
     constexpr int B = 16;    // quantization block size
@@ -505,23 +552,26 @@ __global__ void gemv_int4_warp_kernel(
         const uint8_t* x_ptr = &x_packed[kb * PB];
         uint2 x_packed_val = *reinterpret_cast<const uint2*>(x_ptr);
 
-        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+        float w_sc = load_wsc(W_scale, (size_t)n_out * num_K_blks + kb);
         float x_sc = x_scale[kb];
         float prod_scale = w_sc * x_sc;
 
-        // Scalar unpack + dot product: 8 bytes → 16 floats → 16 multiplies
+        // dp4a INT8 dot product: 8 packed bytes -> 4 int32 lanes (4 int8 each)
+        // -> 4x __dp4a -> INT32 accumulate -> scale. Bit-identical math to the
+        // old scalar float path, ~10x fewer instructions.
         const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w_packed);
         const uint8_t* xb = reinterpret_cast<const uint8_t*>(&x_packed_val);
 
-        float sum_f = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < PB; ++j) {
-            float w0, w1, x0, x1;
-            int4_byte_to_floats(wb[j], w0, w1);
-            int4_byte_to_floats(xb[j], x0, x1);
-            sum_f += w0 * x0 + w1 * x1;
-        }
-        acc += sum_f * prod_scale;
+        int wl0, wl1, wl2, wl3, xl0, xl1, xl2, xl3;
+        int4_8bytes_to_int4lanes(wb, wl0, wl1, wl2, wl3);
+        int4_8bytes_to_int4lanes(xb, xl0, xl1, xl2, xl3);
+
+        int sumi = 0;
+        sumi = __dp4a(wl0, xl0, sumi);
+        sumi = __dp4a(wl1, xl1, sumi);
+        sumi = __dp4a(wl2, xl2, sumi);
+        sumi = __dp4a(wl3, xl3, sumi);
+        acc += static_cast<float>(sumi) * prod_scale;
     }
 
     // Warp shuffle reduction
@@ -535,6 +585,67 @@ __global__ void gemv_int4_warp_kernel(
 }
 
 } // anonymous namespace
+
+// ===========================================================================
+// FP32×INT4 GEMV — FP32 activations × INT4 packed weights (no activation quant)
+// ===========================================================================
+// 1 warp/row, strided K loop, scalar INT4 unpack + FP32 dot product.
+// Weights use block-16 INT4 offset-binary format (same as gemv_int4_warp_kernel).
+// No activation quantization — takes raw FP32 activations directly.
+// ~48 regs/thread. 8 blocks/SM.
+__launch_bounds__(32, 8)
+__global__ void gemv_fp32_int4_warp_kernel(
+    float* __restrict__ y_out,
+    const float* __restrict__ x_fp32,
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ W_scale,
+    int K, int N)
+{
+    constexpr int B = 16;
+    constexpr int PB = 8;
+    int n_out = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int num_K_blks = K / B;
+    float acc = 0.0f;
+
+    for (int kb = tid; kb < num_K_blks; kb += 32) {
+        // Load 16 FP32 activation values into a union for indexing
+        int x_off = kb * B;
+        union { float f[16]; float4 v[4]; } xv;
+        xv.v[0] = reinterpret_cast<const float4*>(&x_fp32[x_off])[0];
+        xv.v[1] = reinterpret_cast<const float4*>(&x_fp32[x_off])[1];
+        xv.v[2] = reinterpret_cast<const float4*>(&x_fp32[x_off])[2];
+        xv.v[3] = reinterpret_cast<const float4*>(&x_fp32[x_off])[3];
+
+        // Load 8 packed bytes = 16 INT4 weight values
+        const uint8_t* w_ptr = &W_packed[(size_t)n_out * (K / 2) + kb * PB];
+        uint2 w_packed = *reinterpret_cast<const uint2*>(w_ptr);
+
+        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+
+        // Scalar unpack: 8 bytes → 16 INT4 values → multiply with FP32 acts
+        const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w_packed);
+
+        float sum_f = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < PB; ++j) {
+            float w0, w1;
+            int4_byte_to_floats(wb[j], w0, w1);
+            sum_f += w0 * xv.f[j*2] + w1 * xv.f[j*2+1];
+        }
+        acc += sum_f * w_sc;
+    }
+
+    // Warp shuffle reduction
+    acc += __shfl_xor_sync(0xffffffff, acc, 16);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+
+    if (tid == 0) y_out[n_out] = acc;
+}
 
 // ===========================================================================
 // FP32×INT8 GEMV — FP32 activations × INT8 weights
@@ -584,8 +695,8 @@ __global__ void gemv_fp32_int8_kernel(
         sum_b += SE(w2 >> 16) * v2.z;  sum_b += SE(w2 >> 24) * v2.w;
         sum_b += SE(w3 >>  0) * v3.x;  sum_b += SE(w3 >>  8) * v3.y;
         sum_b += SE(w3 >> 16) * v3.z;  sum_b += SE(w3 >> 24) * v3.w;
-        #undef SE
         acc += sum_b * w_sc;
+        #undef SE
     }
 
     y_out[n_out] = acc;
@@ -682,8 +793,8 @@ __global__ void gemv_fp32_int8_per_row_kernel(
         sum_b += SE2(w2 >> 16) * v2.z;  sum_b += SE2(w2 >> 24) * v2.w;
         sum_b += SE2(w3 >>  0) * v3.x;  sum_b += SE2(w3 >>  8) * v3.y;
         sum_b += SE2(w3 >> 16) * v3.z;  sum_b += SE2(w3 >> 24) * v3.w;
-        #undef SE2
         acc += sum_b * w_sc;
+        #undef SE2
     }
 
     y_out[n_out] = acc;
@@ -831,6 +942,28 @@ cudaError_t gemv_fp32_int8_per_row_warp(
 }
 
 // ===========================================================================
+// FP32×INT4 warp GEMV — FP32 activations × INT4 packed weights
+// ===========================================================================
+cudaError_t gemv_fp32_int4_warp(
+    float*          y_out,
+    const float*    x_fp32,
+    const void*     W_packed,
+    const float*    W_scale,
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    gemv_fp32_int4_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+        y_out, x_fp32,
+        static_cast<const uint8_t*>(W_packed), W_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
 // Packed FP4 warp GEMV — packed FP4 activations × packed FP4 weights
 // ===========================================================================
 cudaError_t gemv_fp4_warp(
@@ -891,10 +1024,35 @@ cudaError_t gemv_int4_warp(
     if (K % 16 != 0 || N % 16 != 0)
         return cudaErrorInvalidValue;
 
-    gemv_int4_warp_kernel<<<dim3(N), dim3(32), 0, stream>>>(
+    gemv_int4_warp_kernel<float><<<dim3(N), dim3(32), 0, stream>>>(
         y_out,
         static_cast<const uint8_t*>(x_packed), x_scale,
         static_cast<const uint8_t*>(W_packed), W_scale,
+        K, N);
+    return cudaPeekAtLastError();
+}
+
+// FP16 weight-scale variant: W_scale points to [N][K/16] __half. Halves the
+// weight-scale memory traffic (~33% of total GEMV bytes). Use when weights
+// were quantized with FP16 scales (scripts/convert_scales_fp16.py).
+cudaError_t gemv_int4_warp_f16wsc(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const void*     W_scale,       // __half* [N][K/16]
+    int             K,
+    int             N,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        return cudaErrorInvalidValue;
+
+    gemv_int4_warp_kernel<__half><<<dim3(N), dim3(32), 0, stream>>>(
+        y_out,
+        static_cast<const uint8_t*>(x_packed), x_scale,
+        static_cast<const uint8_t*>(W_packed),
+        static_cast<const __half*>(W_scale),
         K, N);
     return cudaPeekAtLastError();
 }
@@ -910,14 +1068,15 @@ constexpr int kINT4Block = 32;  // threads per block (1 warp)
 // Batched INT4 GEMV: M sequences × same weight matrix in one kernel launch.
 // Grid: N blocks, 32 threads/block (1 warp). Each warp computes 1 output row
 // for all M sequences. Weight loaded once, reused across M activations.
-template <int M>
+// WScaleT = float (FP32 scales) or __half (FP16 scales, half the traffic).
+template <int M, typename WScaleT>
 __launch_bounds__(32, 8)
 __global__ void gemv_int4_batched_kernel(
     float* __restrict__ y_out,            // [M][N] output
     const uint8_t* __restrict__ x_packed,  // [M][K/2] packed INT4 activations
-    const float* __restrict__ x_scale,    // [M][K/16] activation scales
+    const float* __restrict__ x_scale,    // [M][K/16] activation scales (FP32)
     const uint8_t* __restrict__ W_packed, // [N][K/2] packed INT4 weights
-    const float* __restrict__ W_scale,    // [N][K/16] weight scales
+    const WScaleT* __restrict__ W_scale,  // [N][K/16] weight scales (FP32 or FP16)
     int K, int N)
 {
     constexpr int B = 16;    // quantization block size
@@ -938,7 +1097,13 @@ __global__ void gemv_int4_batched_kernel(
         // Load 8 packed bytes = 16 INT4 values from weight row (shared across M)
         const uint8_t* w_ptr = &W_packed[(size_t)n_out * (K / 2) + kb * PB];
         uint2 w_packed = *reinterpret_cast<const uint2*>(w_ptr);
-        float w_sc = W_scale[(size_t)n_out * num_K_blks + kb];
+        float w_sc = load_wsc(W_scale, (size_t)n_out * num_K_blks + kb);
+
+        // Unpack weight nibbles to INT8 lanes ONCE per K-block (loop-invariant
+        // across M). Hoisted out of the M loop to avoid M-fold recompute.
+        const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w_packed);
+        int wl0, wl1, wl2, wl3;
+        int4_8bytes_to_int4lanes(wb, wl0, wl1, wl2, wl3);
 
         // Load activation for each of M tokens (strided access)
         #pragma unroll
@@ -948,19 +1113,19 @@ __global__ void gemv_int4_batched_kernel(
             float x_sc = x_scale[(size_t)mi * num_K_blks + kb];
             float prod_scale = w_sc * x_sc;
 
-            // Scalar unpack + dot product
-            const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w_packed);
+            // dp4a INT8 dot product: 8 packed bytes -> 4 int32 lanes (4 int8 each)
+            // -> 4x __dp4a -> INT32 accumulate -> scale. Bit-identical math to
+            // the old scalar float path, ~10x fewer instructions.
             const uint8_t* xb = reinterpret_cast<const uint8_t*>(&x_packed_val);
+            int xl0, xl1, xl2, xl3;
+            int4_8bytes_to_int4lanes(xb, xl0, xl1, xl2, xl3);
 
-            float sum_f = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < PB; ++j) {
-                float w0, w1, x0, x1;
-                int4_byte_to_floats(wb[j], w0, w1);
-                int4_byte_to_floats(xb[j], x0, x1);
-                sum_f += w0 * x0 + w1 * x1;
-            }
-            acc[mi] += sum_f * prod_scale;
+            int sumi = 0;
+            sumi = __dp4a(wl0, xl0, sumi);
+            sumi = __dp4a(wl1, xl1, sumi);
+            sumi = __dp4a(wl2, xl2, sumi);
+            sumi = __dp4a(wl3, xl3, sumi);
+            acc[mi] += static_cast<float>(sumi) * prod_scale;
         }
     }
 
@@ -1002,22 +1167,65 @@ cudaError_t gemv_int4_batched(
     dim3 grid(N, 1);
 
     switch (M) {
-        case 1: gemv_int4_batched_kernel<1><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 2: gemv_int4_batched_kernel<2><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 3: gemv_int4_batched_kernel<3><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 4: gemv_int4_batched_kernel<4><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 5: gemv_int4_batched_kernel<5><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 6: gemv_int4_batched_kernel<6><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 7: gemv_int4_batched_kernel<7><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 8: gemv_int4_batched_kernel<8><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 9: gemv_int4_batched_kernel<9><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 10: gemv_int4_batched_kernel<10><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 11: gemv_int4_batched_kernel<11><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 12: gemv_int4_batched_kernel<12><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 13: gemv_int4_batched_kernel<13><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 14: gemv_int4_batched_kernel<14><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 15: gemv_int4_batched_kernel<15><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
-        case 16: gemv_int4_batched_kernel<16><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 1: gemv_int4_batched_kernel<1, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 2: gemv_int4_batched_kernel<2, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 3: gemv_int4_batched_kernel<3, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 4: gemv_int4_batched_kernel<4, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 5: gemv_int4_batched_kernel<5, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 6: gemv_int4_batched_kernel<6, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 7: gemv_int4_batched_kernel<7, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 8: gemv_int4_batched_kernel<8, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 9: gemv_int4_batched_kernel<9, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 10: gemv_int4_batched_kernel<10, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 11: gemv_int4_batched_kernel<11, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 12: gemv_int4_batched_kernel<12, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 13: gemv_int4_batched_kernel<13, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 14: gemv_int4_batched_kernel<14, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 15: gemv_int4_batched_kernel<15, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        case 16: gemv_int4_batched_kernel<16, float><<<grid, kINT4Block, 0, stream>>>(y_out, (const uint8_t*)x_packed, x_scale, (const uint8_t*)W_packed, W_scale, K, N); break;
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaPeekAtLastError();
+}
+
+// FP16 weight-scale batched variant: W_scale points to [N][K/16] __half.
+// Same kernel logic; halves weight-scale memory traffic. M=1..16 supported.
+cudaError_t gemv_int4_batched_f16wsc(
+    float*          y_out,
+    const void*     x_packed,
+    const float*    x_scale,
+    const void*     W_packed,
+    const void*     W_scale,       // __half* [N][K/16]
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream)
+{
+    if (K % 16 != 0 || N % 16 != 0 || M < 1 || M > 16)
+        return cudaErrorInvalidValue;
+
+    const __half* Wsc = static_cast<const __half*>(W_scale);
+    const uint8_t* xp = static_cast<const uint8_t*>(x_packed);
+    const uint8_t* Wp = static_cast<const uint8_t*>(W_packed);
+    dim3 grid(N, 1);
+
+    switch (M) {
+        case 1: gemv_int4_batched_kernel<1, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 2: gemv_int4_batched_kernel<2, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 3: gemv_int4_batched_kernel<3, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 4: gemv_int4_batched_kernel<4, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 5: gemv_int4_batched_kernel<5, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 6: gemv_int4_batched_kernel<6, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 7: gemv_int4_batched_kernel<7, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 8: gemv_int4_batched_kernel<8, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 9: gemv_int4_batched_kernel<9, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 10: gemv_int4_batched_kernel<10, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 11: gemv_int4_batched_kernel<11, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 12: gemv_int4_batched_kernel<12, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 13: gemv_int4_batched_kernel<13, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 14: gemv_int4_batched_kernel<14, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 15: gemv_int4_batched_kernel<15, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
+        case 16: gemv_int4_batched_kernel<16, __half><<<grid, kINT4Block, 0, stream>>>(y_out, xp, x_scale, Wp, Wsc, K, N); break;
         default: return cudaErrorInvalidValue;
     }
     return cudaPeekAtLastError();

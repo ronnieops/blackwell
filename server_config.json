@@ -1,0 +1,7 @@
+{
+  "port": 8123,
+  "model": "int4_8b",
+  "rate_limit_per_sec": 60,
+  "weights_dir": "weights_int4_qwen3_8b",
+  "tokenizer_path": "tokenizer_data.bin"
+}

@@ -328,5 +328,131 @@ cudaError_t attention_prefill_v2(
     return cudaPeekAtLastError();
 }
 
+// ── Prefill attention v3: [M, num_heads, head_dim] layout, hd=128, M≤16 ──
+//
+// Server layout: Q/K/V stored as [M, num_heads, head_dim]
+// Supports head_dim=128, M up to 16.
+// Uses 32 threads (1 warp). Q in registers, K in shared memory.
+// Causal mask: Q_m attends to K_0..K_m, V_0..V_m.
+//
+// Grid: (num_q_heads, M) blocks, 32 threads per block
+// Smem: K[M*head_dim] + S[M] floats
+
+__global__ void prefill_attention_v3_kernel(
+    float* __restrict__ O_out,
+    const float* __restrict__ Q_in,
+    const float* __restrict__ K_in,
+    const float* __restrict__ V_in,
+    int M, int head_dim, int num_q_heads, int num_kv_heads, int num_q_per_group) {
+
+    int q_head = blockIdx.x;
+    int m = blockIdx.y;
+    if (q_head >= num_q_heads || m >= M) return;
+    assert(head_dim == 128);  // kernel hardcodes 128-element Q/K/V via tid*4
+
+    int kv_head = q_head / num_q_per_group;
+    float scale = rsqrtf((float)head_dim);
+    int tid = threadIdx.x;
+
+    extern __shared__ char smem_base[];
+    float* K_s = (float*)smem_base;
+    float* S_s = K_s + M * head_dim;
+
+    // Load Q[m, head] into registers (32 threads × 4 elements = 128)
+    float q[4];
+    const float* Q_row = Q_in + (size_t)m * num_q_heads * head_dim + q_head * head_dim;
+    q[0] = Q_row[tid * 4];
+    q[1] = Q_row[tid * 4 + 1];
+    q[2] = Q_row[tid * 4 + 2];
+    q[3] = Q_row[tid * 4 + 3];
+
+    // Load K[0..M-1, kv_head] into shared memory
+    // K layout: K_in[m][kv_h][hd] = K_in + m * num_kv_heads * head_dim + kv_head * head_dim
+    for (int i = tid; i < M * head_dim; i += blockDim.x) {
+        int m_idx = i / head_dim;
+        int d_idx = i % head_dim;
+        K_s[i] = K_in[(size_t)m_idx * num_kv_heads * head_dim + kv_head * head_dim + d_idx];
+    }
+    __syncthreads();
+
+    // Compute scores S[j] = Q[m] · K[j] for j=0..m (causal mask)
+    // 32 threads, each with 4 Q elements. All threads contribute to same K row j.
+    for (int j = 0; j <= m; ++j) {
+        float s = 0.0f;
+        int k_base = j * head_dim;
+        s += q[0] * K_s[k_base + tid * 4];
+        s += q[1] * K_s[k_base + tid * 4 + 1];
+        s += q[2] * K_s[k_base + tid * 4 + 2];
+        s += q[3] * K_s[k_base + tid * 4 + 3];
+        // Shuffle reduce within warp
+        s += __shfl_xor_sync(0xffffffff, s, 16);
+        s += __shfl_xor_sync(0xffffffff, s, 8);
+        s += __shfl_xor_sync(0xffffffff, s, 4);
+        s += __shfl_xor_sync(0xffffffff, s, 2);
+        s += __shfl_xor_sync(0xffffffff, s, 1);
+        if (tid == 0) S_s[j] = s * scale;
+    }
+    __syncthreads();
+
+    // Online softmax (single-threaded, M ≤ 16)
+    if (tid == 0) {
+        float mx = S_s[0];
+        for (int j = 1; j <= m; ++j) mx = fmaxf(mx, S_s[j]);
+        float sum = 0.0f;
+        for (int j = 0; j <= m; ++j) {
+            S_s[j] = expf(S_s[j] - mx);
+            sum += S_s[j];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int j = 0; j <= m; ++j) S_s[j] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Accumulate O[m][d] = Σ_j P[m][j] * V[j][d]
+    // V layout: V_in[m][kv_h][hd] = V_in + m * num_kv_heads * head_dim + kv_head * head_dim
+    float* O_row = O_out + (size_t)m * num_q_heads * head_dim + q_head * head_dim;
+    float o[4] = {0, 0, 0, 0};
+    for (int j = 0; j <= m; ++j) {
+        float p = S_s[j];
+        const float* Vj = V_in + (size_t)j * num_kv_heads * head_dim + kv_head * head_dim;
+        o[0] += p * Vj[tid * 4];
+        o[1] += p * Vj[tid * 4 + 1];
+        o[2] += p * Vj[tid * 4 + 2];
+        o[3] += p * Vj[tid * 4 + 3];
+    }
+    O_row[tid * 4] = o[0];
+    O_row[tid * 4 + 1] = o[1];
+    O_row[tid * 4 + 2] = o[2];
+    O_row[tid * 4 + 3] = o[3];
+}
+
+cudaError_t attention_prefill_v3(
+    float* output,
+    const float* Q,
+    const float* K,
+    const float* V,
+    int M, int head_dim, int num_q_heads, int num_kv_heads,
+    int num_q_per_group, cudaStream_t stream) {
+
+    dim3 grid(num_q_heads, M);
+    int threads = 32;
+    int smem = (M * head_dim + M) * sizeof(float);
+    int max_M = 16;
+    int max_smem = (max_M * head_dim + max_M) * sizeof(float);
+
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaError_t e = cudaFuncSetAttribute(prefill_attention_v3_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem);
+        if (e != cudaSuccess) return e;
+        attr_set = true;
+    }
+
+    prefill_attention_v3_kernel<<<grid, threads, smem, stream>>>(
+        output, Q, K, V, M, head_dim, num_q_heads, num_kv_heads, num_q_per_group);
+
+    return cudaPeekAtLastError();
+}
+
 } // namespace kernels
 } // namespace blackwell

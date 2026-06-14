@@ -194,7 +194,19 @@ int main(int argc, char** argv) {
     int I = get_meta("feed_forward_length", 0);
     int nqh = get_meta("attention.head_count", 0);
     int nkv = get_meta("attention.head_count_kv", 0);
-    int hd = (nqh > 0) ? H / nqh : 0;
+    // Gemma 4 stores head_count_kv as a per-layer array (all values equal)
+    // If nkv == 0 from the array, try extracting the first element
+    if (nkv == 0) {
+        const auto& meta = reader.metadata();
+        auto it = meta.find("gemma4.attention.head_count_kv");
+        if (it != meta.end()) {
+            if (auto* v = std::get_if<std::vector<int32_t>>(&it->second)) {
+                if (!v->empty()) nkv = (*v)[0];
+            }
+        }
+    }
+    int hd = get_meta("attention.key_length", 0);
+    if (hd == 0) hd = (nqh > 0) ? H / nqh : 0;
     // Get vocab size from tokens array count in metadata
     auto it = reader.metadata().find("tokenizer.ggml.tokens");
     int V = 151936;
@@ -282,35 +294,71 @@ int main(int argc, char** argv) {
     // Load all GGUF data into memory
     GGUFFile gguf_mem = load_whole_file(gguf_path);
 
-    // Compute tensor data section offset: after header + metadata + tensor infos (aligned)
-    // Read from memory: magic(4) + version(4) + tensor_count(8) + meta_count(8) = 24
-    uint64_t total_tensors = *(const uint64_t*)(gguf_mem.data + 8);
-    uint64_t meta_count = *(const uint64_t*)(gguf_mem.data + 16);
-
+    // Tensor data offset: after header + metadata + tensor infos (aligned to 32)
+    // Compute from the last tensor's offset + file_size in GGUFReader data.
+    // The reader holds the raw file data, we need the start of the data section.
+    // Simplest: compute from the reader's tensor info — last tensor offset + size
+    // gives data section end, which equals data section start + data section size.
+    // Actually the reader doesn't have data section start readily. Compute manually:
     uint64_t tensor_data_off = 24;  // skip header
     {
+        // Re-read header values
+        uint64_t meta_count = *(const uint64_t*)(gguf_mem.data + 16);
+        uint64_t total_tensors = *(const uint64_t*)(gguf_mem.data + 8);
+        // Use GGUFReader's internal position to get tensor data offset
+        // The reader already parsed metadata + tensor info. We need the offset
+        // AFTER tensor info, aligned to 32 bytes.
+        // Compute from the file by finding the last tensor offset and its file_size.
+        auto& tensors = reader.tensors();
+        if (!tensors.empty()) {
+            uint64_t max_end = 0;
+            for (auto& t : tensors) {
+                uint64_t end = t.offset + t.file_size;
+                if (end > max_end) max_end = end;
+            }
+            // max_end is relative to data section start. The actual data section
+            // end in file = tensor_data_off + max_end. But we don't know tensor_data_off.
+            // Instead, compute from the first tensor offset.
+            // The first tensor's offset is 0, so tensor_data_off = first_tensor_file_pos.
+            // We can't get this from the reader since it stores relative offsets.
+            // Fallback: walk raw memory
+        }
+        // Walk raw memory to compute tensor_data_off
         const uint8_t* pp = gguf_mem.data + 24;
-        // Skip metadata
+        fprintf(stderr, "DEBUG: gguf_mem.size=%zu, pp-offset=%llu\n", gguf_mem.size, (unsigned long long)(pp - gguf_mem.data));
         for (uint64_t i = 0; i < meta_count; i++) {
+            if ((uint64_t)(pp - gguf_mem.data) + 12 > gguf_mem.size) {
+                fprintf(stderr, "META WALK: hit end of file at metadata %llu\n", (unsigned long long)i);
+                break;
+            }
             uint64_t klen = *(const uint64_t*)pp; pp += 8;
             pp += klen;
-            uint32_t vtype = *(const uint32_t*)pp; pp += 4;
-            if (vtype == 8) { uint64_t slen = *(const uint64_t*)pp; pp += 8; pp += slen; }
-            else if (vtype == 9) {
+            uint32_t raw_type = *(const uint32_t*)pp; pp += 4;
+            if (raw_type == 0) { pp += 1; }
+            else if (raw_type == 1) { pp += 1; }
+            else if (raw_type == 2) { pp += 2; }
+            else if (raw_type == 3) { pp += 2; }
+            else if (raw_type == 4) { pp += 4; }
+            else if (raw_type == 5) { pp += 4; }
+            else if (raw_type == 6) { pp += 4; }
+            else if (raw_type == 7) { pp += 1; }
+            else if (raw_type == 8) { uint64_t slen = *(const uint64_t*)pp; pp += 8; pp += slen; }
+            else if (raw_type == 9) {
                 uint32_t atype = *(const uint32_t*)pp; pp += 4;
                 uint64_t alen = *(const uint64_t*)pp; pp += 8;
-                if (atype == 8) { for (uint64_t j = 0; j < alen; j++) { uint64_t sl = *(const uint64_t*)pp; pp += 8; pp += sl; } }
+                if (atype == 8) { while (alen-- > 0) { uint64_t sl = *(const uint64_t*)pp; pp += 8; pp += sl; } }
+                else if (atype == 7 || atype == 0 || atype == 1) { pp += alen; }
+                else if (atype == 2 || atype == 3) { pp += alen * 2; }
                 else { pp += alen * 4; }
-            } else if (vtype <= 7 || vtype == 10 || vtype == 11) {
-                int sz = (vtype == 0 || vtype == 1 || vtype == 7) ? 1 :
-                         (vtype == 2 || vtype == 3 || vtype == 12) ? 2 :
-                         (vtype == 4 || vtype == 5 || vtype == 6) ? 4 :
-                         (vtype == 10 || vtype == 11 || vtype == 13) ? 8 : 4;
-                pp += sz;
-            } else { pp += 4; }
+            }
+            else if (raw_type == 10 || raw_type == 11) { pp += 8; }
+            else if (raw_type == 12) { pp += 2; }
+            else if (raw_type == 13) { pp += 8; }
+            else { pp += 4; }
         }
         // Skip tensor info entries
-        for (uint64_t i = 0; i < total_tensors; i++) {
+        uint64_t total_tensors_from_header = *(const uint64_t*)(gguf_mem.data + 8);
+        for (uint64_t i = 0; i < total_tensors_from_header; i++) {
             uint64_t nlen = *(const uint64_t*)pp; pp += 8;
             pp += nlen;
             uint32_t ndims = *(const uint32_t*)pp; pp += 4;
@@ -318,14 +366,19 @@ int main(int argc, char** argv) {
             pp += 4;  // type
             pp += 8;  // offset
         }
-        // Align to 32 bytes
         tensor_data_off = (uint64_t)(pp - gguf_mem.data);
         tensor_data_off = (tensor_data_off + 31) & ~31;
         printf("Tensor data offset: %llu\n", (unsigned long long)tensor_data_off);
+        fflush(stdout);
     }
 
     // Process all tensors from GGUF reader
     auto& tensors = reader.tensors();
+    fprintf(stderr, "Processing %zu tensors...\n", tensors.size());
+    fprintf(stderr, "DEBUG: tensor_data_off=%llu, first tensor '%s' offset=%llu file_size=%llu\n",
+        (unsigned long long)tensor_data_off, tensors[0].name.c_str(),
+        (unsigned long long)tensors[0].offset,
+        (unsigned long long)tensors[0].file_size);
 
     // Buffers for norms (collected per layer)
     std::vector<float> input_norms((size_t)NL * H);
@@ -479,6 +532,106 @@ int main(int argc, char** argv) {
                 printf("    -> too small, skipping\n");
                 continue;
             }
+            // Large tensors (embed_tokens, lm_head > 100M elements) — process in chunks
+            if (n_el > 100 * 1024 * 1024) {
+                printf("    -> too large (%llu elements), chunked conversion\n",
+                       (unsigned long long)n_el);
+                
+                // Create INT4 header files first
+                char int4_path[256], scale_path[256];
+                snprintf(int4_path, 256, "%s/%s.int4_t", out_dir, bw_name);
+                snprintf(scale_path, 256, "%s/%s.scale_t", out_dir, bw_name);
+                
+                if (!std::filesystem::exists(int4_path)) {
+                    // Write headers
+                    int num_kb = (int)K / 16;
+                    {
+                        FILE* hf = fopen(int4_path, "wb");
+                        int hdr[5] = {(int)K, (int)N, 16, num_kb, 1};
+                        fwrite(hdr, 4, 5, hf);
+                        fclose(hf);
+                    }
+                    {
+                        FILE* hf = fopen(scale_path, "wb");
+                        int hdr[5] = {0, 0, 0, num_kb, (int)N};
+                        fwrite(hdr, 4, 5, hf);
+                        fclose(hf);
+                    }
+                }
+                
+                // Process N rows in chunks
+                const int ROW_CHUNK = 256;
+                for (int ch = 0; ch < (int)N; ch += ROW_CHUNK) {
+                    int ch_end = ch + ROW_CHUNK;
+                    if (ch_end > (int)N) ch_end = (int)N;
+                    int ch_rows = ch_end - ch;
+                    
+                    // Allocate FP32 buffer for this chunk
+                    uint64_t chunk_el = (uint64_t)K * ch_rows;
+                    std::vector<float> chunk_f32(chunk_el);
+                    
+                    // Dequant each row
+                    // GGUF stores row-major: data[k * N + n] but Q4_K uses blocks
+                    // Q4_K row stride in file
+                    uint64_t row_stride = ((K + 255) / 256) * 144;
+                    for (int r = 0; r < ch_rows; r++) {
+                        int src_row = ch + r;
+                        const uint8_t* row_src = src + (uint64_t)src_row * row_stride;
+                        dequant_q4_K(row_src, chunk_f32.data() + (uint64_t)r * K, K);
+                    }
+                    
+                    // Transpose: GGUF [K,N] -> kernel [N,K]
+                    // For chunk rows, we need [ch_rows, K] format
+                    // requant_int4 expects [N, K] where N is output dimension
+                    // Already have [ch_rows, K] from dequant
+                    
+                    // Quantize each row to INT4
+                    for (int r = 0; r < ch_rows; r++) {
+                        float* row = chunk_f32.data() + (uint64_t)r * K;
+                        
+                        // INT4 block-16 quant
+                        int num_kb = K / 16;
+                        std::vector<uint8_t> packed(K / 2);
+                        std::vector<float> scales(num_kb);
+                        
+                        for (int kb = 0; kb < num_kb; kb++) {
+                            float absmax = 0.0f;
+                            for (int i = 0; i < 16; i++)
+                                absmax = fmaxf(absmax, fabsf(row[kb * 16 + i]));
+                            float scale = fmaxf(absmax, 1e-10f) / 7.0f;
+                            if (!std::isfinite(scale)) scale = 1.0f;
+                            scales[kb] = scale;
+                            for (int i = 0; i < 16; i += 2) {
+                                int v0 = (int)roundf(row[kb * 16 + i] / scale);
+                                int v1 = (int)roundf(row[kb * 16 + i + 1] / scale);
+                                v0 = v0 < -7 ? -7 : (v0 > 7 ? 7 : v0);
+                                v1 = v1 < -7 ? -7 : (v1 > 7 ? 7 : v1);
+                                uint8_t packed_byte = ((uint8_t)(v0 + 8) & 0x0F) |
+                                    (((uint8_t)(v1 + 8) & 0x0F) << 4);
+                                packed[(uint64_t)kb * 8 + i / 2] = packed_byte;
+                            }
+                        }
+                        
+                        // Append to file
+                        {
+                            FILE* pf = fopen(int4_path, "ab");
+                            fwrite(packed.data(), 1, K / 2, pf);
+                            fclose(pf);
+                        }
+                        {
+                            FILE* sf = fopen(scale_path, "ab");
+                            fwrite(scales.data(), 4, num_kb, sf);
+                            fclose(sf);
+                        }
+                    }
+                    
+                    printf("    chunk %d-%d/%d\n", ch, ch_end, (int)N);
+                }
+                
+                double mb = ((double)N * K / 2 + (double)N * (K / 16) * 4) / (1024 * 1024);
+                printf("  %s: %dx%d INT4 %.1fMB (chunked)\n", bw_name, N, K, mb);
+                continue;
+            }
 
             // Dequantize Q4_K -> FP32
             std::vector<float> f32_buf(n_el);
@@ -507,6 +660,11 @@ int main(int argc, char** argv) {
 
             if (n_el < 1024) {
                 printf("    -> too small, skipping\n");
+                continue;
+            }
+            if (n_el > 100 * 1024 * 1024) {
+                printf("    -> too large (%llu elements), skipping INT4 conversion\n",
+                       (unsigned long long)n_el);
                 continue;
             }
 
@@ -582,12 +740,14 @@ int main(int argc, char** argv) {
                 fwrite(&num_added_u, 4, 1, f);
 
                 // Byte encoder: standard GPT-2 mapping (bytes → unicode codepoints)
+                // 68 non-printable bytes: 0-32 (33), 127 (1), 128-160 (33), 173 (1)
+                // → codepoints 256-323
                 for (int i = 0; i < 256; i++) {
                     uint32_t cp;
-                    if (i < 33) cp = 256 + i;
-                    else if (i == 127) cp = 259;
-                    else if (i >= 128 && i <= 160) cp = 288 + (i - 128);
-                    else if (i == 173) cp = 321;
+                    if (i < 33) cp = 256 + i;                          // 0-32 → U+0100-0120
+                    else if (i == 127) cp = 289;                        // 127 → U+0121
+                    else if (i >= 128 && i <= 160) cp = 290 + (i-128); // 128-160 → U+0122-0142
+                    else if (i == 173) cp = 323;                        // 173 → U+0143
                     else cp = (uint32_t)i;
                     fwrite(&cp, 4, 1, f);
                 }

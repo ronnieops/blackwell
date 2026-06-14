@@ -108,11 +108,11 @@ int main(int argc, char** argv) {
         if(strcmp(argv[i],"-k")==0&&i+1<argc) top_k=atoi(argv[++i]);
     }
 
-    const char* wdir = "/tmp/gguf_converted";
+    const char* wdir = "weights_int4_qwen3_1.7b";
     if (argc >= 4) wdir = argv[3];
     
     cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
-    printf("# Text Generation — Qwen3-1.7B INT4 (GGUF converted)\n");
+    printf("# Text Generation — Qwen3-1.7B INT4 \n");
     printf("  Weights: %s\n", wdir);
     printf("  Device: %s\n", P.name);
     printf("  Prompt: \"%s\"%s\n", prompt, chat_mode?" (chat)":"");

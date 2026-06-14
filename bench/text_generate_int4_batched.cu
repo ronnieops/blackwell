@@ -9,6 +9,7 @@
 //     -o bench/text_generate_int4_batched
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -47,7 +48,24 @@ static DevW4 upload_w4(const char* prefix) {
     return dw;
 }
 
-struct LW4 { DevW4 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
+// FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
+struct DevW4f16 { int K, N; uint8_t* d; __half* sc16; };
+static DevW4f16 upload_w4_f16sc(const char* prefix) {
+    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
+    FILE* f=fopen(p,"rb"); if(!f){printf("FAIL open %s\n",p);exit(1);}
+    int h[5]; fread(h,4,5,f);
+    DevW4f16 dw; dw.K=h[0]; dw.N=h[1];
+    size_t ds=(size_t)h[0]*h[1]/2;
+    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
+    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
+    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
+    size_t ss=(size_t)h[3]*h[4];
+    __half* ts=new __half[ss]; fread(ts,2,ss,f); fclose(f);
+    cudaMalloc(&dw.sc16,ss*2); cudaMemcpy(dw.sc16,ts,ss*2,cudaMemcpyHostToDevice); delete[] ts;
+    return dw;
+}
+
+struct LW4 { DevW4f16 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
 
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
     int h=blockIdx.x; if(h>=nh) return;
@@ -184,7 +202,7 @@ static void generate_batch(
     int top_k,
     float rep_pen,
     const std::vector<LW4>& W,
-    DevW4& lm_head_w,
+    DevW4f16& lm_head_w,
     const uint8_t* host_embed_d,
     const float* host_embed_sc,
     BpeTokenizer& tokenizer)
@@ -235,15 +253,15 @@ static void generate_batch(
                 S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
             
             // QKV projections (single batched GEMV each)
-            blackwell::kernels::gemv_int4_batched(
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_Q, S.d_x_i4, S.d_x_i4_sc,
-                W[l].q.d, W[l].q.sc, H, Q, M, S.st);
-            blackwell::kernels::gemv_int4_batched(
+                W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_K, S.d_x_i4, S.d_x_i4_sc,
-                W[l].k.d, W[l].k.sc, H, KV, M, S.st);
-            blackwell::kernels::gemv_int4_batched(
+                W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_V, S.d_x_i4, S.d_x_i4_sc,
-                W[l].v.d, W[l].v.sc, H, KV, M, S.st);
+                W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
             
             // Q/K head norms + RoPE (per-sequence — cheap ops, different rope_pos per seq)
             for (int m = 0; m < M; ++m) {
@@ -277,9 +295,9 @@ static void generate_batch(
             // Wo projection (batched)
             blackwell::kernels::quantize_int4_batched(
                 S.d_attn_i4, S.d_attn_i4_sc, S.d_attn, Q, M, S.st);
-            blackwell::kernels::gemv_int4_batched(
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
-                W[l].o.d, W[l].o.sc, Q, H, M, S.st);
+                W[l].o.d, W[l].o.sc16, Q, H, M, S.st);
             // Residual add (per-sequence — no batched vector_add)
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::vector_add_fp32(
@@ -295,12 +313,12 @@ static void generate_batch(
                 S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
             
             // MLP gate + up (batched)
-            blackwell::kernels::gemv_int4_batched(
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_gate, S.d_x_i4, S.d_x_i4_sc,
-                W[l].g.d, W[l].g.sc, H, I, M, S.st);
-            blackwell::kernels::gemv_int4_batched(
+                W[l].g.d, W[l].g.sc16, H, I, M, S.st);
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_up, S.d_x_i4, S.d_x_i4_sc,
-                W[l].u.d, W[l].u.sc, H, I, M, S.st);
+                W[l].u.d, W[l].u.sc16, H, I, M, S.st);
             
             // SwiGLU (per-sequence — no batched version)
             for (int m = 0; m < M; ++m) {
@@ -311,9 +329,9 @@ static void generate_batch(
                 S.d_mlp_i4, S.d_mlp_i4_sc, S.d_gate, I, M, S.st);
             
             // Down projection (batched)
-            blackwell::kernels::gemv_int4_batched(
+            blackwell::kernels::gemv_int4_batched_f16wsc(
                 S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
-                W[l].d.d, W[l].d.sc, I, H, M, S.st);
+                W[l].d.d, W[l].d.sc16, I, H, M, S.st);
             // Final residual add (per-sequence)
             for (int m = 0; m < M; ++m) {
                 blackwell::kernels::vector_add_fp32(
@@ -330,9 +348,9 @@ static void generate_batch(
                     S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
                 blackwell::kernels::quantize_int4_batched(
                     S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
-                blackwell::kernels::gemv_int4_batched(
+                blackwell::kernels::gemv_int4_batched_f16wsc(
                     S.d_logits, S.d_x_i4, S.d_x_i4_sc,
-                    lm_head_w.d, lm_head_w.sc, H, V, M, S.st);
+                    lm_head_w.d, lm_head_w.sc16, H, V, M, S.st);
                 // Per-sequence sampling (only for sequences at generation stage)
                 for (int m = 0; m < M; ++m) {
                     if (step >= gen_start[m] - 1) {
@@ -460,19 +478,19 @@ int main(int argc, char** argv) {
         cudaMalloc(&W[l].rn_post, H * 4); cudaMemcpy(W[l].rn_post, w, H * 4, cudaMemcpyHostToDevice); free(w);
         
         snprintf(p, 512, "%s/%d_self_attn.q_proj", wdir, l);
-        W[l].q = upload_w4(p);
+        W[l].q = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_self_attn.k_proj", wdir, l);
-        W[l].k = upload_w4(p);
+        W[l].k = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_self_attn.v_proj", wdir, l);
-        W[l].v = upload_w4(p);
+        W[l].v = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_self_attn.o_proj", wdir, l);
-        W[l].o = upload_w4(p);
+        W[l].o = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_mlp.gate_proj", wdir, l);
-        W[l].g = upload_w4(p);
+        W[l].g = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_mlp.up_proj", wdir, l);
-        W[l].u = upload_w4(p);
+        W[l].u = upload_w4_f16sc(p);
         snprintf(p, 512, "%s/%d_mlp.down_proj", wdir, l);
-        W[l].d = upload_w4(p);
+        W[l].d = upload_w4_f16sc(p);
         
         // Q/K head norms from qk_norms.f32: [l][2][hd] layout (same as single benchmark)
         // qn at offset l*2*hd, kn at offset l*2*hd + hd
@@ -484,7 +502,7 @@ int main(int argc, char** argv) {
     free(qk_h);  // Free qk_norms buffer
     
     char pw[512];
-    DevW4 embed = upload_w4((std::string(wdir) + "/embed_tokens").c_str());
+    DevW4f16 embed = upload_w4_f16sc((std::string(wdir) + "/embed_tokens").c_str());
     uint8_t* host_embed_d = new uint8_t[(size_t)embed.K * embed.N / 2];
     float* host_embed_sc = new float[(size_t)embed.N * (embed.K / 16)];
     {
@@ -493,17 +511,22 @@ int main(int argc, char** argv) {
         size_t ds = (size_t)h[0] * h[1] / 2; fread(host_embed_d, 1, ds, f); fclose(f);
         snprintf(pw, 512, "%s/embed_tokens.scale_t", wdir);
         f = fopen(pw, "rb"); fread(h, 4, 5, f); size_t ss = (size_t)h[3] * h[4];
-        fread(host_embed_sc, 4, ss, f); fclose(f);
+        {__half* tmp=new __half[ss];fread(tmp,2,ss,f);
+         for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);
+         delete[] tmp;}
+        fclose(f);
     }
     printf("Embed loaded: %d x %d (INT4)\n", embed.K, embed.N);
     
-    DevW4 lm_head_w = upload_w4((std::string(wdir) + "/lm_head").c_str());
-    // Check lm_head weights and scales
-    float* h_lm_sc = new float[16];
-    cudaMemcpy(h_lm_sc, lm_head_w.sc, 64, cudaMemcpyDeviceToHost);
+    DevW4f16 lm_head_w = upload_w4_f16sc((std::string(wdir) + "/lm_head").c_str());
+    // Check lm_head weights and scales (sc16 is __half; convert 16 entries for display)
+    __half* h_lm_sc16 = new __half[16];
+    cudaMemcpy(h_lm_sc16, lm_head_w.sc16, 32, cudaMemcpyDeviceToHost);
     printf("lm_head loaded: %d x %d (INT4), sc[0-3]=[%.4f, %.4f, %.4f, %.4f]\n", 
-           lm_head_w.K, lm_head_w.N, h_lm_sc[0], h_lm_sc[1], h_lm_sc[2], h_lm_sc[3]);
-    delete[] h_lm_sc;
+           lm_head_w.K, lm_head_w.N,
+           __half2float(h_lm_sc16[0]), __half2float(h_lm_sc16[1]),
+           __half2float(h_lm_sc16[2]), __half2float(h_lm_sc16[3]));
+    delete[] h_lm_sc16;
     
     float* w = (float*)malloc(H * 4);
     snprintf(pw, 512, "%s/final_norm.f32", wdir);

@@ -12,6 +12,7 @@
 //     -o server/inference_server_int4
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -50,7 +51,24 @@ static DevW4 upload_w4(const char* prefix) {
     return dw;
 }
 
-struct LW4 { DevW4 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
+// FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
+struct DevW4f16 { int K, N; uint8_t* d; __half* sc16; };
+static DevW4f16 upload_w4_f16sc(const char* prefix) {
+    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
+    FILE* f=fopen(p,"rb"); if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}
+    int h[5]; fread(h,4,5,f);
+    DevW4f16 dw; dw.K=h[0]; dw.N=h[1];
+    size_t ds=(size_t)h[0]*h[1]/2;
+    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
+    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
+    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
+    size_t ss=(size_t)h[3]*h[4];
+    __half* ts=new __half[ss]; fread(ts,2,ss,f); fclose(f);
+    cudaMalloc(&dw.sc16,ss*2); cudaMemcpy(dw.sc16,ts,ss*2,cudaMemcpyHostToDevice); delete[] ts;
+    return dw;
+}
+
+struct LW4 { DevW4f16 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
 
 // ── CUDA kernels (same as benchmark) ──
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
@@ -141,6 +159,7 @@ static float parse_repetition_penalty(const std::string& json, float def) {
 }
 
 // ── Global state (loaded once) ──
+static const int MAX_BATCH = 16;
 static float *d_x32, *d_xi_f, *d_res;
 static uint8_t *d_x_i4; static float *d_x_i4_sc;
 static float *d_Q,*d_K,*d_V,*d_attn;
@@ -149,10 +168,23 @@ static float *d_proj, *d_gate, *d_up;
 static uint8_t *d_mlp_i4; static float *d_mlp_i4_sc;
 static float *d_fn, *d_kc, *d_vc, *d_logits;
 static int *d_next_id, *d_recent;
+// Batched decode buffers (M=1-8)
+static float *d_x32_batch;   // [MAX_BATCH][H]
+static float *d_xi_f_batch;   // [MAX_BATCH][H]
+static float *d_Q_batch, *d_K_batch, *d_V_batch; // [MAX_BATCH][..]
+static float *d_attn_batch;  // [MAX_BATCH][Q]
+static float *d_proj_batch;  // [MAX_BATCH][H]
+static float *d_gate_batch, *d_up_batch; // [MAX_BATCH][I]
+static uint8_t *d_x_i4_batch, *d_attn_i4_batch, *d_mlp_i4_batch;
+static float *d_x_i4_sc_batch, *d_attn_i4_sc_batch, *d_mlp_i4_sc_batch;
+static float *d_res_batch;   // [MAX_BATCH][H]
+// Prefill buffers (M tokens in flight)
+static float *d_Q_batch_prefill, *d_K_batch_prefill, *d_V_batch_prefill;
+static float *d_attn_batch_prefill;
 static cudaStream_t st;
 
 static std::vector<LW4> W(NL);
-static DevW4 embed_w, lm_head_w;
+static DevW4f16 embed_w, lm_head_w;
 static uint8_t* host_embed_d;
 static float* host_embed_sc;
 static blackwell::BpeTokenizer tokenizer;
@@ -163,18 +195,18 @@ static void load_model() {
     fprintf(stderr, "Loading %d-layer INT4 model...\n", NL);
     char p[256];
     for (int l = 0; l < NL; ++l) {
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_self_attn.q_proj",l); W[l].q=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_self_attn.k_proj",l); W[l].k=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_self_attn.v_proj",l); W[l].v=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_self_attn.o_proj",l); W[l].o=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_mlp.gate_proj",l); W[l].g=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_mlp.up_proj",l);   W[l].u=upload_w4(p);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_mlp.down_proj",l); W[l].d=upload_w4(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l); W[l].q=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l); W[l].k=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l); W[l].v=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l); W[l].o=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l); W[l].g=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l);   W[l].u=upload_w4_f16sc(p);
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l); W[l].d=upload_w4_f16sc(p);
         if ((l+1)%7==0) fprintf(stderr, "  layer %d/%d\n", l+1, NL);
     }
     // QK norms
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");size_t nr=fread(qk_h,4,NL*2*hd,f);if(nr!=(size_t)NL*2*hd){fprintf(stderr, "Truncated qk_norms\n");exit(1);}fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -182,29 +214,30 @@ static void load_model() {
     // Per-layer RMSNorm
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_input_layernorm.f32",l);
-        {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
+        {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated layernorm %d\n",l);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int4_qwen3_8b/%d_post_attention_layernorm.f32",l);
-        {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
+        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
+        {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated post layernorm %d\n",l);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     // Final norm
     {float*w=(float*)malloc(H*4);
-     FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+     FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated final_norm\n");exit(1);}fclose(f);
      AL(d_fn,H*4); cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice); free(w);}
     // Embed + lm_head
-    embed_w=upload_w4("weights_int4_qwen3_8b/embed_tokens");
-    lm_head_w=upload_w4("weights_int4_qwen3_8b/lm_head");
+    embed_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/embed_tokens");
+    lm_head_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
     fprintf(stderr,"  embed: %dx%d, lm_head: %dx%d\n",embed_w.K,embed_w.N,lm_head_w.K,lm_head_w.N);
     // Host embed for CPU dequant
     host_embed_d=new uint8_t[(size_t)embed_w.K*embed_w.N/2];
     host_embed_sc=new float[embed_w.N*(embed_w.K/16)];
-    {FILE*f=fopen("weights_int4_qwen3_8b/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
-     size_t ds=(size_t)h[0]*h[1]/2;fread(host_embed_d,1,ds,f);fclose(f);
-     f=fopen("weights_int4_qwen3_8b/embed_tokens.scale_t","rb");fread(h,4,5,f);
-     size_t ss=(size_t)h[3]*h[4];fread(host_embed_sc,4,ss,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
+     size_t ds=(size_t)h[0]*h[1]/2;size_t nr=fread(host_embed_d,1,ds,f);if(nr!=ds){fprintf(stderr,"Truncated embed_tokens\n");exit(1);}fclose(f);
+     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");fread(h,4,5,f);
+     size_t ss=(size_t)h[3]*h[4];{__half* tmp=new __half[ss];size_t nr=fread(tmp,2,ss,f);if(nr!=ss){fprintf(stderr,"Truncated embed_tokens scales\n");exit(1);}
+      for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);delete[] tmp;}fclose(f);}
     fprintf(stderr,"All weights loaded.\n");
 }
 
@@ -218,6 +251,29 @@ static void alloc_buffers() {
     AL(d_kc,(size_t)NL*nkv*MAXSEQ*hd*4);
     AL(d_vc,(size_t)NL*nkv*MAXSEQ*hd*4);
     AL(d_logits,V*4); AL(d_next_id,4); AL(d_recent,64*4);
+    // Batched decode buffers
+    AL(d_x32_batch, (size_t)MAX_BATCH * H * 4);
+    AL(d_xi_f_batch, (size_t)MAX_BATCH * H * 4);
+    AL(d_Q_batch,   (size_t)MAX_BATCH * Q * 4);
+    AL(d_K_batch,   (size_t)MAX_BATCH * KV * 4);
+    AL(d_V_batch,   (size_t)MAX_BATCH * KV * 4);
+    AL(d_attn_batch,(size_t)MAX_BATCH * Q * 4);
+    AL(d_proj_batch,(size_t)MAX_BATCH * H * 4);
+    AL(d_gate_batch,(size_t)MAX_BATCH * I * 4);
+    AL(d_up_batch,  (size_t)MAX_BATCH * I * 4);
+    AL(d_x_i4_batch,(size_t)MAX_BATCH * H / 2);
+    AL(d_x_i4_sc_batch, (size_t)MAX_BATCH * (H/16) * 4);
+    AL(d_attn_i4_batch, (size_t)MAX_BATCH * Q / 2);
+    AL(d_attn_i4_sc_batch,(size_t)MAX_BATCH * (Q/16) * 4);
+    AL(d_mlp_i4_batch, (size_t)MAX_BATCH * I / 2);
+    AL(d_mlp_i4_sc_batch, (size_t)MAX_BATCH * (I/16) * 4);
+    AL(d_res_batch, (size_t)MAX_BATCH * H * 4);
+    // Prefill Q/K/V buffers (M tokens × Q/KV)
+    AL(d_Q_batch_prefill, (size_t)MAX_BATCH * Q * 4);
+    AL(d_K_batch_prefill, (size_t)MAX_BATCH * KV * 4);
+    AL(d_V_batch_prefill, (size_t)MAX_BATCH * KV * 4);
+    // Attention output buffer for prefill (M × Q)
+    AL(d_attn_batch_prefill, (size_t)MAX_BATCH * Q * 4);
     float iv7=1.f/7.f;
     { std::vector<float> tmp(H/16,iv7); cudaMemcpy(d_x_i4_sc,tmp.data(),(H/16)*4,cudaMemcpyHostToDevice); }
     { std::vector<float> tmp(Q/16,iv7); cudaMemcpy(d_attn_i4_sc,tmp.data(),(Q/16)*4,cudaMemcpyHostToDevice); }
@@ -225,86 +281,288 @@ static void alloc_buffers() {
 }
 
 // ── Generate: exact decode loop from benchmark ──
+// Run one token through all decoder layers (no lm_head/sampling).
+// Returns hidden state in d_x32.
+static void decode_one_token(uint32_t token_id, int step) {
+    std::vector<float> h_embed(H);
+    dequant_embed_row(h_embed.data(), token_id, host_embed_d, host_embed_sc, H);
+    die(cudaMemcpyAsync(d_x32, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed");
+
+    for (int l = 0; l < NL; ++l) {
+        die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
+        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
+        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, st), "q_proj");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, st), "k_proj");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, st), "v_proj");
+        head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
+        head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
+        apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step);
+        apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K, nkv, hd, step);
+        size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
+        die(blackwell::kernels::update_kv_cache(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, step, nkv, hd, MAXSEQ, st), "kv");
+        die(blackwell::kernels::attention_decode_batched_gqa(d_attn, d_Q, d_kc, d_vc, step, nqh, nkv, hd, MAXSEQ, 1,
+            (size_t)NL*nkv*MAXSEQ*hd, kv_off, st), "attn");
+        die(blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, st), "quant_attn");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, st), "o_proj");
+        die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
+        die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
+        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
+        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, st), "gate");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, st), "up");
+        blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
+        die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, st), "down");
+        die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "mlp_res");
+    }
+}
+
+// Prefill M prompt tokens through all layers via batched QKV + per-token attention.
+// Processes in chunks of MAX_BATCH. Each chunk's attention reads from the
+// decode cache (which has all prior positions from previous chunks).
+// KV cache is filled for all M positions. After prefill, d_x32 has
+// the hidden state of the last token (M-1).
+static void prefill_tokens_batched(const std::vector<uint32_t>& token_ids, int offset, int M) {
+    int last_chunk = M;
+    while (M > 0) {
+        int chunk = M;
+        if (chunk > MAX_BATCH) chunk = MAX_BATCH;
+        last_chunk = chunk;
+
+
+        // Embed tokens in this chunk
+        for (int m = 0; m < chunk; ++m) {
+            std::vector<float> h_embed(H);
+            dequant_embed_row(h_embed.data(), token_ids[offset + m], host_embed_d, host_embed_sc, H);
+            die(cudaMemcpyAsync(d_x32_batch + m * H, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed_m");
+        }
+
+        for (int l = 0; l < NL; ++l) {
+            // Save residual
+            die(cudaMemcpyAsync(d_res_batch, d_x32_batch, (size_t)chunk * H * 4, cudaMemcpyDeviceToDevice, st), "save_res");
+
+            // Pre-attention norm + quantize
+            die(blackwell::kernels::fused_rmsnorm_batched(d_xi_f_batch, d_x32_batch, W[l].rn_in, H, eps, chunk, st), "rmsnorm_in");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, chunk, st), "quant_in");
+
+            // QKV projections (batched)
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, H, Q, chunk, st), "q_proj");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].k.d, W[l].k.sc16, H, KV, chunk, st), "k_proj");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].v.d, W[l].v.sc16, H, KV, chunk, st), "v_proj");
+
+            // Q/K head norms + RoPE per position
+            for (int m = 0; m < chunk; ++m) {
+                int pos = offset + m;
+                head_norm_kernel<<<nqh,128,0,st>>>(d_Q_batch_prefill + m * Q, W[l].qn, nqh, hd, eps);
+                head_norm_kernel<<<nkv,128,0,st>>>(d_K_batch_prefill + m * KV, W[l].kn, nkv, hd, eps);
+                apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q_batch_prefill + m * Q, nqh, hd, pos);
+                apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K_batch_prefill + m * KV, nkv, hd, pos);
+            }
+
+            // Write KV cache for this chunk's positions (use _pos variant to avoid
+            // pinned-buffer race in tight loop)
+            size_t l_kv_off = (size_t)l * nkv * MAXSEQ * hd;
+            for (int m = 0; m < chunk; ++m) {
+                int pos = offset + m;
+                die(blackwell::kernels::update_kv_cache_pos(d_kc + l_kv_off, d_vc + l_kv_off,
+                    d_K_batch_prefill + m * KV, d_V_batch_prefill + m * KV,
+                    pos, nkv, hd, MAXSEQ, st), "kv");
+            }
+
+
+            // Per-token attention: each token attends to all prior positions in decode cache
+            for (int m = 0; m < chunk; ++m) {
+                int pos = offset + m;
+                die(blackwell::kernels::attention_decode_batched_gqa_pos(
+                    d_attn_batch_prefill + m * Q,
+                    d_Q_batch_prefill + m * Q,
+                    d_kc, d_vc, pos, nqh, nkv, hd, MAXSEQ, 1,
+                    (size_t)NL * nkv * MAXSEQ * hd, l_kv_off, st), "attn");
+            }
+
+            // Wo projection (batched)
+            die(blackwell::kernels::quantize_int4_batched(d_attn_i4_batch, d_attn_i4_sc_batch, d_attn_batch_prefill, Q, chunk, st), "quant_attn");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj_batch, (const uint8_t*)d_attn_i4_batch, d_attn_i4_sc_batch, W[l].o.d, W[l].o.sc16, Q, H, chunk, st), "o_proj");
+
+            // Residual add
+            for (int m = 0; m < chunk; ++m) {
+                die(blackwell::kernels::vector_add_fp32(d_x32_batch + m * H, d_proj_batch + m * H, d_res_batch + m * H, H, st), "attn_res");
+            }
+
+            // Save for MLP residual
+            die(cudaMemcpyAsync(d_res_batch, d_x32_batch, (size_t)chunk * H * 4, cudaMemcpyDeviceToDevice, st), "save_res2");
+
+            // Pre-MLP norm + quantize
+            die(blackwell::kernels::fused_rmsnorm_batched(d_xi_f_batch, d_x32_batch, W[l].rn_post, H, eps, chunk, st), "rmsnorm_post");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, chunk, st), "quant_mlp_in");
+
+            // MLP gate + up (batched)
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, H, I, chunk, st), "gate");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].u.d, W[l].u.sc16, H, I, chunk, st), "up");
+
+            // SwiGLU (per-token)
+            for (int m = 0; m < chunk; ++m) {
+                blackwell::kernels::apply_swiglu(d_gate_batch + m * I, d_gate_batch + m * I, d_up_batch + m * I, I, st);
+            }
+            die(blackwell::kernels::quantize_int4_batched(d_mlp_i4_batch, d_mlp_i4_sc_batch, d_gate_batch, I, chunk, st), "quant_mlp");
+
+            // Down projection (batched)
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj_batch, (const uint8_t*)d_mlp_i4_batch, d_mlp_i4_sc_batch, W[l].d.d, W[l].d.sc16, I, H, chunk, st), "down");
+
+            // MLP residual
+            for (int m = 0; m < chunk; ++m) {
+                die(blackwell::kernels::vector_add_fp32(d_x32_batch + m * H, d_proj_batch + m * H, d_res_batch + m * H, H, st), "mlp_res");
+            }
+
+        }
+
+        offset += chunk;
+        M -= chunk;
+    }
+
+    // Copy last token's hidden state to d_x32 for lm_head
+    // last_chunk tokens are at indices 0..last_chunk-1 in d_x32_batch
+    die(cudaMemcpyAsync(d_x32, d_x32_batch + (last_chunk - 1) * H, H * 4, cudaMemcpyDeviceToDevice, st), "last_hidden");
+    die(cudaStreamSynchronize(st), "sync");
+
+}
+
+// Batched decode: process M tokens through all layers in one pass.
+// M=1 must produce identical output to decode_one_token.
+// Outputs M hidden states in d_x32_batch[m*H..(m+1)*H].
+static void decode_one_token_batched(const uint32_t* token_ids, int step, int M) {
+    // Embed M tokens (H2D copy per token)
+    for (int m = 0; m < M; ++m) {
+        std::vector<float> h_embed(H);
+        dequant_embed_row(h_embed.data(), token_ids[m], host_embed_d, host_embed_sc, H);
+        die(cudaMemcpyAsync(d_x32_batch + m * H, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed_b");
+    }
+
+    for (int l = 0; l < NL; ++l) {
+        // Save residual for all M sequences (single large copy)
+        die(cudaMemcpyAsync(d_res_batch, d_x32_batch, (size_t)M * H * 4, cudaMemcpyDeviceToDevice, st), "save_res_b");
+
+        // Pre-attention norm + quantize (batched)
+        die(blackwell::kernels::fused_rmsnorm_batched(d_xi_f_batch, d_x32_batch, W[l].rn_in, H, eps, M, st), "rmsnorm_in_b");
+        die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, M, st), "quant_in_b");
+
+        // QKV projections (batched GEMV)
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, H, Q, M, st), "q_proj_b");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].k.d, W[l].k.sc16, H, KV, M, st), "k_proj_b");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].v.d, W[l].v.sc16, H, KV, M, st), "v_proj_b");
+
+        // Q/K head norms + RoPE (per-sequence — same step for all in speculative verify)
+        for (int m = 0; m < M; ++m) {
+            head_norm_kernel<<<nqh,128,0,st>>>(d_Q_batch + m * Q, W[l].qn, nqh, hd, eps);
+            head_norm_kernel<<<nkv,128,0,st>>>(d_K_batch + m * KV, W[l].kn, nkv, hd, eps);
+            apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q_batch + m * Q, nqh, hd, step);
+            apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K_batch + m * KV, nkv, hd, step);
+        }
+
+        // KV cache: each sequence writes to its own cache slot
+        size_t l_kv_off = (size_t)l * nkv * MAXSEQ * hd;
+        for (int m = 0; m < M; ++m) {
+            size_t kv_off = (size_t)m * NL * nkv * MAXSEQ * hd + l_kv_off;
+            die(blackwell::kernels::update_kv_cache(d_kc + kv_off, d_vc + kv_off, d_K_batch + m * KV, d_V_batch + m * KV, 0, step, nkv, hd, MAXSEQ, st), "kv_b");
+        }
+
+        // Attention (per-sequence — batched attention with M>1 may be non-deterministic)
+        for (int m = 0; m < M; ++m) {
+            size_t m_kv_off = (size_t)m * NL * nkv * MAXSEQ * hd;
+            die(blackwell::kernels::attention_decode_batched_gqa(d_attn_batch + m * Q, d_Q_batch + m * Q,
+                d_kc + m_kv_off, d_vc + m_kv_off, step, nqh, nkv, hd, MAXSEQ, 1,
+                (size_t)nkv * MAXSEQ * hd, l_kv_off, st), "attn_b");
+        }
+
+        // Wo projection (batched)
+        die(blackwell::kernels::quantize_int4_batched(d_attn_i4_batch, d_attn_i4_sc_batch, d_attn_batch, Q, M, st), "quant_attn_b");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj_batch, (const uint8_t*)d_attn_i4_batch, d_attn_i4_sc_batch, W[l].o.d, W[l].o.sc16, Q, H, M, st), "o_proj_b");
+
+        // Residual add (per-sequence)
+        for (int m = 0; m < M; ++m) {
+            die(blackwell::kernels::vector_add_fp32(d_x32_batch + m * H, d_proj_batch + m * H, d_res_batch + m * H, H, st), "attn_res_b");
+        }
+
+        // Save residual for MLP
+        die(cudaMemcpyAsync(d_res_batch, d_x32_batch, (size_t)M * H * 4, cudaMemcpyDeviceToDevice, st), "save_res2_b");
+
+        // Pre-MLP norm + quantize (batched)
+        die(blackwell::kernels::fused_rmsnorm_batched(d_xi_f_batch, d_x32_batch, W[l].rn_post, H, eps, M, st), "rmsnorm_post_b");
+        die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, M, st), "quant_mlp_in_b");
+
+        // MLP gate + up (batched)
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, H, I, M, st), "gate_b");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].u.d, W[l].u.sc16, H, I, M, st), "up_b");
+
+        // SwiGLU (per-sequence)
+        for (int m = 0; m < M; ++m) {
+            blackwell::kernels::apply_swiglu(d_gate_batch + m * I, d_gate_batch + m * I, d_up_batch + m * I, I, st);
+        }
+
+        // Quantize MLP output + down projection (batched)
+        die(blackwell::kernels::quantize_int4_batched(d_mlp_i4_batch, d_mlp_i4_sc_batch, d_gate_batch, I, M, st), "quant_mlp_b");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj_batch, (const uint8_t*)d_mlp_i4_batch, d_mlp_i4_sc_batch, W[l].d.d, W[l].d.sc16, I, H, M, st), "down_b");
+
+        // Final residual add (per-sequence)
+        for (int m = 0; m < M; ++m) {
+            die(blackwell::kernels::vector_add_fp32(d_x32_batch + m * H, d_proj_batch + m * H, d_res_batch + m * H, H, st), "mlp_res_b");
+        }
+    }
+}
+
 static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
                                        int max_new, float temperature, int top_k, float rep_pen,
                                        bool streaming = false) {
     std::vector<uint32_t> all_ids = input_ids;
     int gen_start = (int)input_ids.size();
     int total = gen_start + max_new;
-    std::vector<float> h_embed(H);
 
     cudaMemset(d_kc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
     cudaMemset(d_vc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
 
-    for (int step = 0; step < total; ++step) {
-        uint32_t tid = (step < gen_start) ? input_ids[step] : all_ids.back();
-        dequant_embed_row(h_embed.data(), tid, host_embed_d, host_embed_sc, H);
-        die(cudaMemcpyAsync(d_x32, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed");
-
-        for (int l = 0; l < NL; ++l) {
-            die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
-            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
-            die(blackwell::kernels::gemv_int4_batched(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc, H, Q, 1, st), "q_proj");
-            die(blackwell::kernels::gemv_int4_batched(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc, H, KV, 1, st), "k_proj");
-            die(blackwell::kernels::gemv_int4_batched(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc, H, KV, 1, st), "v_proj");
-            head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
-            die(cudaGetLastError(), "head_norm_Q");
-            head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
-            die(cudaGetLastError(), "head_norm_K");
-            apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step);
-            die(cudaGetLastError(), "rope_Q");
-            apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K, nkv, hd, step);
-            die(cudaGetLastError(), "rope_K");
-            size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
-            die(blackwell::kernels::update_kv_cache(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, step, nkv, hd, MAXSEQ, st), "kv");
-            die(blackwell::kernels::attention_decode_batched_gqa(d_attn, d_Q, d_kc, d_vc, step, nqh, nkv, hd, MAXSEQ, 1,
-                (size_t)NL*nkv*MAXSEQ*hd, kv_off, st), "attn");
-            die(blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, st), "quant_attn");
-            die(blackwell::kernels::gemv_int4_batched(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc, Q, H, 1, st), "o_proj");
-            die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
-            die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
-            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
-            die(blackwell::kernels::gemv_int4_batched(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc, H, I, 1, st), "gate");
-            die(blackwell::kernels::gemv_int4_batched(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc, H, I, 1, st), "up");
-            blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
-            die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
-            die(blackwell::kernels::gemv_int4_batched(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc, I, H, 1, st), "down");
-            die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "mlp_res");
-        }
-
-        if (step >= gen_start - 1) {
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
-            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_lm");
-            die(blackwell::kernels::gemv_int4_batched(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc, H, V, 1, st), "lm_head");
-
-            // Repetition penalty: penalize recently generated tokens
-            if (rep_pen > 1.0f && (int)all_ids.size() > gen_start) {
-                int num_recent = (int)all_ids.size() - gen_start;
-                if (num_recent > 64) num_recent = 64;
-                std::vector<int> h_recent(all_ids.end() - num_recent, all_ids.end());
-                die(cudaMemcpyAsync(d_recent, h_recent.data(), num_recent * sizeof(int), cudaMemcpyHostToDevice, st), "cpy_recent");
-                die(blackwell::kernels::apply_repetition_penalty(d_logits, d_recent, num_recent, rep_pen, V, st), "rep_pen");
-            }
-
-            int next_id;
-            die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k, d_next_id, 0xdeadbeefLL, step, st), "sample");
-            die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy");
-            all_ids.push_back(next_id);
-
-            // SSE streaming: emit per-token JSON
-            if (streaming) {
-                std::string tok_text = tokenizer.decode(next_id);
-                std::string escaped = json_escape(tok_text);
-                printf("data: {\"token\":%u,\"text\":\"%s\"}\n\n", next_id, escaped.c_str());
-                fflush(stdout);
-            }
-
-            if (next_id == 151643) break;
-        }
+    // ── Phase 1: Prefill — process prompt tokens ──
+    // Single-chunk batched prefill for short prompts (≤ MAX_BATCH).
+    // Long prompts use original per-token decode.
+    if (gen_start > 0) {
+        prefill_tokens_batched(input_ids, 0, gen_start);
     }
-    // Return only generated tokens
+
+    // ── Phase 2: Decode — generate new tokens one at a time ──
+    for (int step = gen_start; step < total; ++step) {
+        uint32_t tid = all_ids.back();
+        decode_one_token(tid, step);
+
+        // lm_head + sampling
+        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
+        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_lm");
+        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc16, H, V, 1, st), "lm_head");
+
+        // Repetition penalty
+        if (rep_pen > 1.0f && (int)all_ids.size() > gen_start) {
+            int num_recent = (int)all_ids.size() - gen_start;
+            if (num_recent > 64) num_recent = 64;
+            std::vector<int> h_recent(all_ids.end() - num_recent, all_ids.end());
+            die(cudaMemcpyAsync(d_recent, h_recent.data(), num_recent * sizeof(int), cudaMemcpyHostToDevice, st), "cpy_recent");
+            die(blackwell::kernels::apply_repetition_penalty(d_logits, d_recent, num_recent, rep_pen, V, st), "rep_pen");
+        }
+
+        int next_id;
+        die(blackwell::kernels::sample_gpu(d_logits, V, temperature, top_k, d_next_id, 0xdeadbeefLL, step, st), "sample");
+        die(cudaMemcpy(&next_id, d_next_id, 4, cudaMemcpyDeviceToHost), "copy");
+        all_ids.push_back(next_id);
+
+        // SSE streaming
+        if (streaming) {
+            std::string tok_text = tokenizer.decode(next_id);
+            std::string escaped = json_escape(tok_text);
+            printf("data: {\"token\":%u,\"text\":\"%s\"}\n\n", next_id, escaped.c_str());
+            fflush(stdout);
+        }
+
+        if (next_id == 151643) break;
+    }
+
     return std::vector<uint32_t>(all_ids.begin() + gen_start, all_ids.end());
 }
 
@@ -340,8 +598,14 @@ int main(int argc, char** argv) {
     load_model();
     alloc_buffers();
 
-    // Warm up: DISABLED - causes output divergence
-    fprintf(stderr, "[WARMUP] Skipped\n"); fflush(stdout);
+    // Warm up
+    fprintf(stderr, "[WARMUP] Running...\n"); fflush(stdout);
+    {
+        std::vector<uint32_t> warmup = tokenizer.encode("Hello");
+        generate(warmup, 1, 0.0f, 0, 1.0f);
+        cudaDeviceSynchronize();
+    }
+    fprintf(stderr, "[WARMUP] Done\n"); fflush(stdout);
 
     fprintf(stderr, "Ready.\n"); fflush(stdout);
 

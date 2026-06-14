@@ -1,29 +1,32 @@
-# Dockerfile — Blackwell INT4 8B Inference Server
-# High-throughput: 56 t/s (14× faster than INT8)
-# Weights mounted as volume at runtime (~5.3 GB on disk)
+# Dockerfile — Blackwell Multi-Model Inference Server
+# Supports: Qwen3-8B INT4 (56 t/s), Llama 3.2 1B, Llama 3.1 8B
+# Weights + tokenizers mounted as volumes at runtime
 #
 # Build:
 #   docker build -f Dockerfile.int4 -t blackwell-server:int4 .
 #
-# Run (requires nvidia-container-toolkit):
+# Run Qwen3-8B INT4:
 #   docker run --gpus all -p 8080:8080 \
-#     -v /mnt/data/dev/projects/blackwell/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
+#     -v /mnt/data/ai/models/qwen3-8b-int4:/app/weights_int4_qwen3_8b \
+#     -v /mnt/data/ai/models/qwen3-8b-int4/tokenizer_data.bin:/app/tokenizer_data.bin \
 #     blackwell-server:int4 8080 int4_8b
 #
-# Test:
-#   curl http://localhost:8080/v1/models
-#   curl -X POST http://localhost:8080/v1/completions \
-#     -H 'Content-Type: application/json' \
-#     -d '{"prompt":"The capital of France is","max_tokens":10,"repetition_penalty":1.3}'
+# Run Llama 3.2 1B:
+#   docker run --gpus all -p 8080:8080 \
+#     -v /mnt/data/ai/models/llama32-1b-int4-from-safetensors:/app/weights_llama32_1b \
+#     -v /mnt/data/ai/models/llama32-1b-int4-from-safetensors/tokenizer_data.bin:/app/tokenizer_data_llama.bin \
+#     blackwell-server:int4 8080 llama32-1b
 
 FROM ubuntu:24.04
 
-LABEL description="Blackwell INT4 8B — RTX 5060 Ti, 56 t/s"
-LABEL version="0.9.5"
+LABEL description="Blackwell Multi-Model — RTX 5060 Ti, Qwen3-8B + Llama"
+LABEL version="0.10.0"
 
-# v0.9.5 features:
-# - Same as v0.9.4 but rebuilt with latest kernels (179 symbols)
-# - Includes fused_swiglu_quant kernel
+# v0.10.0 features:
+# - Fixed tokenizer byte encoder (GGUF converter bug: bytes 127+ had duplicate codepoints)
+# - Regenerated weights with quantize_generic.py (not GGUF bridge — double quantization error)
+# - Rate limiting (60 req/s per endpoint)
+# - Graceful shutdown (SIGINT/SIGTERM)
 
 RUN apt-get update \
     -o Acquire::Check-Valid-Until=false \
@@ -39,9 +42,8 @@ RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
 
 WORKDIR /app
 
-# Binaries + tokenizer data (weights mounted from host at runtime)
+# Binaries (weights + tokenizers mounted from host at runtime)
 COPY server/http_subprocess server/inference_server_int4 server/inference_server_llama /app/server/
-COPY tokenizer_data.bin /app/
 
 RUN ldconfig || true
 
@@ -49,7 +51,5 @@ EXPOSE 8080
 ENV CUDA_VISIBLE_DEVICES=0
 
 ENTRYPOINT ["/app/server/http_subprocess"]
-# Default: port 8080, model int4_8b. Override by passing args: <port> <model>
-#   docker run ... blackwell-server:int4 8081 8b   # INT8 model
-#   docker run ... blackwell-server:int4 8082 int4_8b  # INT4 model
+# Models: int4_8b (Qwen3-8B), llama32-1b, llama31-8b
 CMD ["8080", "int4_8b"]

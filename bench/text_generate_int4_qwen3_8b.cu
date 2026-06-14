@@ -12,6 +12,7 @@
 //     -o bench/text_generate_int4
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -49,8 +50,25 @@ static DevW4 upload_w4(const char* prefix) {
     return dw;
 }
 
+// FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
+// Packed .int4_t bytes are identical to the FP32-scale format.
+struct DevW4f16 { int K, N; uint8_t* d; __half* sc16; };
+static DevW4f16 upload_w4_f16sc(const char* prefix) {
+    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
+    FILE* f=fopen(p,"rb"); int h[5]; fread(h,4,5,f);
+    DevW4f16 dw; dw.K=h[0]; dw.N=h[1];
+    size_t ds=(size_t)h[0]*h[1]/2;
+    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
+    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
+    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
+    size_t ss=(size_t)h[3]*h[4];  // scale count (header identical for FP32/FP16)
+    __half* ts=new __half[ss]; fread(ts,2,ss,f); fclose(f);  // 2 bytes/entry
+    cudaMalloc(&dw.sc16,ss*2); cudaMemcpy(dw.sc16,ts,ss*2,cudaMemcpyHostToDevice); delete[] ts;
+    return dw;
+}
+
 struct LW4 {
-    DevW4 q,k,v,o,g,u,d;
+    DevW4f16 q,k,v,o,g,u,d;
     float* qn; float* kn; float* rn_in; float* rn_post;
 };
 
@@ -168,18 +186,18 @@ int main(int argc, char** argv) {
     printf("Loading %d-layer INT4 model...\n",NL);fflush(stdout);
     std::vector<LW4> W(NL); char p_[256];
     for(int l=0;l<NL;++l){
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_self_attn.q_proj",l);W[l].q=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_self_attn.k_proj",l);W[l].k=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_self_attn.v_proj",l);W[l].v=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_self_attn.o_proj",l);W[l].o=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_mlp.gate_proj",l);W[l].g=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_mlp.up_proj",l);W[l].u=upload_w4(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_mlp.down_proj",l);W[l].d=upload_w4(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l);W[l].q=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l);W[l].k=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l);W[l].v=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l);W[l].o=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l);W[l].g=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l);W[l].u=upload_w4_f16sc(p_);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l);W[l].d=upload_w4_f16sc(p_);
         if((l+1)%7==0||l+1==NL)printf("  layer %d/%d\n",l+1,NL);
     }
 
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -187,32 +205,37 @@ int main(int argc, char** argv) {
 
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_input_layernorm.f32",l);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
         {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p_,256,"weights_int4_qwen3_8b/%d_post_attention_layernorm.f32",l);
+        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
         {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
 
     {float*w=(float*)malloc(H*4);
-    FILE*f=fopen("weights_int4_qwen3_8b/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+    FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
     cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice);free(w);}
 
-    DevW4 embed=upload_w4("weights_int4_qwen3_8b/embed_tokens");
+    DevW4f16 embed=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/embed_tokens");
     uint8_t* host_embed_d=new uint8_t[(size_t)embed.K*embed.N/2];
     float* host_embed_sc=new float[(size_t)embed.N*(embed.K/16)];
     {char p[256];
-    snprintf(p,256,"weights_int4_qwen3_8b/embed_tokens.int4_t");
+    snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t");
     FILE*f=fopen(p,"rb");int h[5];fread(h,4,5,f);
     size_t ds=(size_t)h[0]*h[1]/2;fread(host_embed_d,1,ds,f);fclose(f);
-    snprintf(p,256,"weights_int4_qwen3_8b/embed_tokens.scale_t");
+    // FP16 scale file: read as __half, convert to FP32 host array once
+    // (embed is host-side dequantized per token, not a GPU GEMV).
+    snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t");
     f=fopen(p,"rb");fread(h,4,5,f);size_t ss=(size_t)h[3]*h[4];
-    fread(host_embed_sc,4,ss,f);fclose(f);}
+    {__half* tmp=new __half[ss];fread(tmp,2,ss,f);
+     for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);
+     delete[] tmp;}
+    fclose(f);}
     printf("Embed tokens loaded: %d x %d (INT4)\n",embed.K,embed.N);
     // Load separate lm_head
-    DevW4 lm_head_w = upload_w4("weights_int4_qwen3_8b/lm_head");
+    DevW4f16 lm_head_w = upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
     printf("lm_head loaded: %d x %d (INT4)\n", lm_head_w.K, lm_head_w.N);
     printf("All weights loaded.\n\n");
 
@@ -245,16 +268,12 @@ int main(int argc, char** argv) {
             // Save residual before norm
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res");
 
-            // Pre-attention norm: norm(d_x32, rn_in) → d_xi_f
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_in,H,eps,st),"rmsnorm_in");
-
-            // Quantize normed input → INT4
-            die(blackwell::kernels::quantize_int4(d_x_i4,d_x_i4_sc,d_xi_f,H,st),"quant_in");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_in,H,eps,st),"rmsnorm_quant_in");
 
             // QKV projections (batched M=1)
-            die(blackwell::kernels::gemv_int4_warp(d_Q,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].q.d,W[l].q.sc,H,Q,st),"q_proj");
-            die(blackwell::kernels::gemv_int4_warp(d_K,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].k.d,W[l].k.sc,H,KV,st),"k_proj");
-            die(blackwell::kernels::gemv_int4_warp(d_V,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].v.d,W[l].v.sc,H,KV,st),"v_proj");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_Q,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].q.d,W[l].q.sc16,H,Q,st),"q_proj");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_K,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].k.d,W[l].k.sc16,H,KV,st),"k_proj");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_V,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].v.d,W[l].v.sc16,H,KV,st),"v_proj");
 
             // Q/K head norms + RoPE
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q,W[l].qn,nqh,hd,eps);
@@ -274,7 +293,7 @@ int main(int argc, char** argv) {
 
             // Wo projection
             die(blackwell::kernels::quantize_int4(d_attn_i4,d_attn_i4_sc,d_attn,Q,st),"quant_attn");
-            die(blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_attn_i4,d_attn_i4_sc,W[l].o.d,W[l].o.sc,Q,H,st),"o_proj");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_proj,(const uint8_t*)d_attn_i4,d_attn_i4_sc,W[l].o.d,W[l].o.sc16,Q,H,st),"o_proj");
 
             // Attention residual: d_x32 = d_proj + d_res (original input)
             // Note: use vector_add(out, a, b) = out = a + b
@@ -287,20 +306,18 @@ int main(int argc, char** argv) {
             // Save pre-MLP state for second residual
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res2");
 
-            // Pre-MLP norm
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,W[l].rn_post,H,eps,st),"rmsnorm_post");
-            die(blackwell::kernels::quantize_int4(d_x_i4,d_x_i4_sc,d_xi_f,H,st),"quant_mlp_in");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_post,H,eps,st),"rmsnorm_quant_post");
 
             // MLP gate + up
-            die(blackwell::kernels::gemv_int4_warp(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc,H,I,st),"gate");
-            die(blackwell::kernels::gemv_int4_warp(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc,H,I,st),"up");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc16,H,I,st),"gate");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc16,H,I,st),"up");
 
             // Fused SwiGLU + INT4 quant
             blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
             blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I, st);
 
             // Down projection
-            die(blackwell::kernels::gemv_int4_warp(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc,I,H,st),"down");
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc16,I,H,st),"down");
 
             // MLP residual: d_x32 = d_proj + d_res (pre-MLP state)
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");
@@ -309,15 +326,9 @@ int main(int argc, char** argv) {
 
         // Final norm + lm_head + GPU sampling
         if(step>=gen_start-1){
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f,d_x32,d_fn,H,eps,st),"fn");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,d_fn,H,eps,st),"fn_quant");
 
-            die(blackwell::kernels::quantize_int4(d_x_i4,d_x_i4_sc,d_xi_f,H,st),"quant_lm");
-
-            die(blackwell::kernels::gemv_int4_warp(d_logits,(const uint8_t*)d_x_i4,d_x_i4_sc,lm_head_w.d,lm_head_w.sc,H,V,st),"lm_head");
-            float l0,l264,l37018;
-            cudaMemcpy(&l0,d_logits,4,cudaMemcpyDeviceToHost);
-            cudaMemcpy(&l264,d_logits+264,4,cudaMemcpyDeviceToHost);
-            cudaMemcpy(&l37018,d_logits+37018,4,cudaMemcpyDeviceToHost);
+            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_logits,(const uint8_t*)d_x_i4,d_x_i4_sc,lm_head_w.d,lm_head_w.sc16,H,V,st),"lm_head");
             int next_id;
             die(blackwell::kernels::sample_gpu(d_logits,V,temperature,top_k,d_next_id,0xdeadbeefLL,step,st),"sample");
             die(cudaMemcpy(&next_id,d_next_id,4,cudaMemcpyDeviceToHost),"copy");
@@ -341,13 +352,13 @@ int main(int argc, char** argv) {
     printf("  Time: %.1f ms  Speed: %.1f ms/tok = %.0f t/s\n",ms,ms/gen,1000.0*gen/ms);
 
     for(auto&w:W){
-        cudaFree(w.q.d);cudaFree(w.q.sc);
-        cudaFree(w.k.d);cudaFree(w.k.sc);
-        cudaFree(w.v.d);cudaFree(w.v.sc);
-        cudaFree(w.o.d);cudaFree(w.o.sc);
-        cudaFree(w.g.d);cudaFree(w.g.sc);
-        cudaFree(w.u.d);cudaFree(w.u.sc);
-        cudaFree(w.d.d);cudaFree(w.d.sc);
+        cudaFree(w.q.d);cudaFree(w.q.sc16);
+        cudaFree(w.k.d);cudaFree(w.k.sc16);
+        cudaFree(w.v.d);cudaFree(w.v.sc16);
+        cudaFree(w.o.d);cudaFree(w.o.sc16);
+        cudaFree(w.g.d);cudaFree(w.g.sc16);
+        cudaFree(w.u.d);cudaFree(w.u.sc16);
+        cudaFree(w.d.d);cudaFree(w.d.sc16);
         cudaFree(w.qn);cudaFree(w.kn);
         cudaFree(w.rn_in);cudaFree(w.rn_post);
     }

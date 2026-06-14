@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
     float temperature = 0.0f;
     int top_k = 0;
     float rep_pen = 1.5f;
-    const char* wdir = "/mnt/data/ai/models/llama31-8b-int4";
+    const char* wdir = "/mnt/data/ai/models/llama31-8b-int4-from-safetensors";
     for(int i=1;i<argc;i++){
         if(argv[i][0]=='-'){
             if(strcmp(argv[i],"--chat")==0) chat_mode=true;
