@@ -29,7 +29,7 @@ import numpy as np
 HF_PATH = "/mnt/data/ai/hf/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "weights_int4_qwen3_8b_awq"
 N_CALIB = int(sys.argv[2]) if len(sys.argv) > 2 else 128  # calibration prompts
-ALPHA = 0.5        # AWQ scaling strength (0 = off, 0.5 = standard, 1.0 = strong)
+ALPHA = 0.6        # AWQ scaling strength (0 = off, 0.5 = standard, 1.0 = strong)
 BLOCK = 16         # quantization block size (must match kernel)
 
 # Calibration prompts — typical WikiText-2 style
@@ -406,7 +406,7 @@ def quantize_int4_sym_awq(W_f32, awq_scale, block=16):
 
 
 # ── Weight file I/O ───────────────────────────────────────────────────────
-def write_weight_int4_sym(prefix, packed, scales, K_in, N_out):
+def write_weight_int4_sym(prefix, packed, scales, K_in, N_out, fp16_scales=False):
     """Write INT4 symmetric weights in kernel-compatible format."""
     num_kb = K_in // BLOCK
     header = np.array([K_in, N_out, BLOCK, num_kb, 1], dtype=np.int32)
@@ -418,7 +418,10 @@ def write_weight_int4_sym(prefix, packed, scales, K_in, N_out):
     path_sc = f"{prefix}.scale_t"
     with open(path_sc, 'wb') as f:
         f.write(header_sc.tobytes())
-        f.write(scales.tobytes())
+        if fp16_scales:
+            f.write(scales.astype(np.float16).tobytes())
+        else:
+            f.write(scales.tobytes())
     mb = (packed.nbytes + scales.nbytes) / (1024*1024)
     print(f"  AWQ INT4: {prefix.split('/')[-1]}: {N_out}×{K_in} {mb:.1f}MB")
 
@@ -497,7 +500,7 @@ def main():
 
             # Write
             prefix = f"{OUT_DIR}/{l}_{wn}"
-            write_weight_int4_sym(prefix, packed, scales, K_in, N_out)
+            write_weight_int4_sym(prefix, packed, scales, K_in, N_out, fp16_scales=True)
 
         if l % 8 == 0:
             print(f"  Layer {l}/{NL}")
@@ -508,7 +511,7 @@ def main():
     act_mag = act_stats.get("embed_tokens", None)
     awq_sc = compute_awq_scales(W_emb, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
     packed, scales = quantize_int4_sym_awq(W_emb, awq_sc, BLOCK)
-    write_weight_int4_sym(f"{OUT_DIR}/embed_tokens", packed, scales, K_in, N_out)
+    write_weight_int4_sym(f"{OUT_DIR}/embed_tokens", packed, scales, K_in, N_out, fp16_scales=True)
     print(f"  embed_tokens: {N_out}×{K_in}")
 
     # 6. LM head
@@ -521,7 +524,7 @@ def main():
         act_mag = act_stats.get("lm_head", None)
         awq_sc = compute_awq_scales(W_lm, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
         packed, scales = quantize_int4_sym_awq(W_lm, awq_sc, BLOCK)
-        write_weight_int4_sym(f"{OUT_DIR}/lm_head", packed, scales, K_in, N_out)
+        write_weight_int4_sym(f"{OUT_DIR}/lm_head", packed, scales, K_in, N_out, fp16_scales=True)
         print(f"  lm_head: {N_out}×{K_in}")
     else:
         # Copy from existing weights

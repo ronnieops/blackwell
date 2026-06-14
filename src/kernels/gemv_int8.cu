@@ -1063,7 +1063,7 @@ cudaError_t gemv_int4_warp_f16wsc(
 // ===========================================================================
 namespace {
 
-constexpr int kINT4Block = 32;  // threads per block (1 warp)
+constexpr int kINT4Block = 32;  // threads per block (1 warp, optimal)
 
 // Batched INT4 GEMV: M sequences × same weight matrix in one kernel launch.
 // Grid: N blocks, 32 threads/block (1 warp). Each warp computes 1 output row
