@@ -23,12 +23,13 @@ INT8/INT4 decode throughput vs llama.cpp Q4_K_M.
 
 **Prior M=1 analysis (v0.11)**: llama.cpp uses tensor cores for GEMV (our dp4a SIMD is slower for skinny M=1), 4.5-bit quantization (vs our 4-bit), and mature CUDA Graph integration. dp4a INT4 inner loop (v0.12) gives +74% on batched M=8 but ~0% on M=1 (M=1 is memory-bound, not compute-bound).
 
-**Servers (v0.12.0 — INT4 FP16 scales)**
+**Servers (v0.12.2 — batched serving M>1)**
 | Model | Server | t/s | ms/tok | Quality |
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
 | **8B INT4 HTTP (FP16 sc)** | `http_subprocess int4_8b` | **~74** | ~13.5 | PPL 24.39 (was 23.52) ✅ |
-| **8B INT4 batched HTTP (FP16 sc)** | `http_subprocess int4_8b_batched` | **~74** | ~13.5 | PPL 24.39 ✅ |
+| **8B INT4 batched HTTP (FP16 sc, M=1)** | `http_subprocess int4_8b_batched` | **~65** | ~15.4 | PPL 24.39 ✅ |
+| **8B INT4 batched HTTP (8 concurrent)** | `http_subprocess int4_8b_batched` | **~183** | ~5.5 | PPL 24.39 ✅ **2.86× real-world** |
 | **Gemma 4 12B INT4** | `http_subprocess gemma` | **~24** | ~42 | Coherent (requires Python tokenizer wrapper) ⚠️ |
 
 **INT4 server divergence (v0.9.0 → v0.10.x)**: `inference_server_int4.cu` migrated from `gemv_int4_warp`
@@ -53,6 +54,7 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 **INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
 
 **Version history**:
+- v0.12.2: Server M>1 batched GEMV. Rewrote inference_server_int4_batched.cu generate path to use gemv_int4_batched_f16wsc(M>1). HTTP continuous batching (BatchDispatcher) now delivers real benefit. 8 concurrent requests: 64→183 t/s collective (2.86×). Single request 65 t/s (no regression).
 - v0.12.1: Fixed multi-block RMSNorm bug in fusion kernels. Wired all 4 fusion sites (3 RMSNorm + 1 SwiGLU). M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better than baseline 23.52!). New unit test bench/test_fused_int4.cu (bit-identical at N=4096/12288).
 - v0.12.0: INT4 8B FP16 weight scales. PPL 23.52→24.39 (+0.87). M=1 56→74 t/s (+32%). M=8 207→205, M=16 217→220. New kernels `gemv_int4_warp_f16wsc`/`gemv_int4_batched_f16wsc` (templated on WScaleT). New weight dir `weights_int4_qwen3_8b_fp16sc/` (4.8 GB, scales FP16). Conversion script `scripts/convert_scales_fp16.py`. dp4a INT4 inner loop (prior phase).
 - v0.11.0: Multi-chunk prefill (any prompt length). Fixed pinned buffer seq_pos race. Server hardening (rate limit all endpoints, restart, payload limit, max_tokens clamp, security fixes).
@@ -484,7 +486,15 @@ Each layer uses per-layer RMSNorm weights (`{L}_input_layernorm.f32`, `{L}_post_
 
 **Server hardening (v0.10.x)**: Rate limiting (5 req/s, burst 10, all endpoints), subprocess auto-restart on crash (`ensure_subprocess_alive()`), payload size limit (1MB), `max_tokens` clamp [1,2048], snprintf overflow protection, `escape_json` control-char handling, `mkstemp` temp files, `RateLimiter` mutex.
 
-**Batch endpoint**: All prompts processed in one batched call via `generate_batch()`.
+**Continuous batching (v0.12.2)**: `BATCH_SIZE=8 BATCH_WAIT_MS=2 ./server/http_subprocess batched`
+- `BatchDispatcher` class collects concurrent `/v1/completions` requests (up to BATCH_SIZE)
+- Dispatches as single `/v1/batch` call → server processes M>1 batched GEMV
+- Results distributed via promise/future to waiting HTTP threads
+- Streaming bypasses batching. Param-mismatched requests grouped.
+- Env-configurable: `BATCH_SIZE` (default 8), `BATCH_WAIT_MS` (default 2)
+- **Throughput**: 8 concurrent requests → 183 t/s collective (2.86× vs sequential)
+
+**Batch endpoint**: All prompts processed in one batched call via `generate_batch_multi()` (M>1 GEMV).
 - Max 8 prompts per batch. Parses `{"tokens":[[...],[...]],"text":[...]}`, decodes tokens locally.
 - Speedup scales with concurrency: M=8 → 0.52s/req vs 0.70s single (26% faster)
 - Token IDs decoded with `LocalTokenizer` (BpeTokenizer loaded from `tokenizer_data.bin`)
