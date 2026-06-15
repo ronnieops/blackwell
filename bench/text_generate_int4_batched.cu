@@ -471,15 +471,27 @@ static void generate_batch(
                     S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
                 
                 // QKV projections (single batched GEMV each)
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_Q, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_K, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_V, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
+                if (M == 1) {
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_Q, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                        W[l].q.d, W[l].q.sc16, H, Q, S.st);
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_K, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                        W[l].k.d, W[l].k.sc16, H, KV, S.st);
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_V, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                        W[l].v.d, W[l].v.sc16, H, KV, S.st);
+                } else {
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_Q, S.d_x_i4, S.d_x_i4_sc,
+                        W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_K, S.d_x_i4, S.d_x_i4_sc,
+                        W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_V, S.d_x_i4, S.d_x_i4_sc,
+                        W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
+                }
                 
                 // Q/K head norms + RoPE (per-sequence)
                 for (int m = 0; m < M; ++m) {
@@ -513,9 +525,15 @@ static void generate_batch(
                 // Wo projection (batched)
                 blackwell::kernels::quantize_int4_batched(
                     S.d_attn_i4, S.d_attn_i4_sc, S.d_attn, Q, M, S.st);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
-                    W[l].o.d, W[l].o.sc16, Q, H, M, S.st);
+                if (M == 1) {
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_proj, (const uint8_t*)S.d_attn_i4, S.d_attn_i4_sc,
+                        W[l].o.d, W[l].o.sc16, Q, H, S.st);
+                } else {
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
+                        W[l].o.d, W[l].o.sc16, Q, H, M, S.st);
+                }
                 // Residual add (per-sequence)
                 for (int m = 0; m < M; ++m) {
                     blackwell::kernels::vector_add_fp32(
@@ -531,12 +549,21 @@ static void generate_batch(
                     S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
                 
                 // MLP gate + up (batched)
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_gate, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].g.d, W[l].g.sc16, H, I, M, S.st);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_up, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].u.d, W[l].u.sc16, H, I, M, S.st);
+                if (M == 1) {
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_gate, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                        W[l].g.d, W[l].g.sc16, H, I, S.st);
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_up, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                        W[l].u.d, W[l].u.sc16, H, I, S.st);
+                } else {
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_gate, S.d_x_i4, S.d_x_i4_sc,
+                        W[l].g.d, W[l].g.sc16, H, I, M, S.st);
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_up, S.d_x_i4, S.d_x_i4_sc,
+                        W[l].u.d, W[l].u.sc16, H, I, M, S.st);
+                }
                 
                 // SwiGLU (per-sequence)
                 for (int m = 0; m < M; ++m) {
@@ -547,9 +574,15 @@ static void generate_batch(
                     S.d_mlp_i4, S.d_mlp_i4_sc, S.d_gate, I, M, S.st);
                 
                 // Down projection (batched)
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
-                    W[l].d.d, W[l].d.sc16, I, H, M, S.st);
+                if (M == 1) {
+                    blackwell::kernels::gemv_int4_warp_f16wsc(
+                        S.d_proj, (const uint8_t*)S.d_mlp_i4, S.d_mlp_i4_sc,
+                        W[l].d.d, W[l].d.sc16, I, H, S.st);
+                } else {
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
+                        W[l].d.d, W[l].d.sc16, I, H, M, S.st);
+                }
                 // Final residual add (per-sequence)
                 for (int m = 0; m < M; ++m) {
                     blackwell::kernels::vector_add_fp32(
@@ -566,9 +599,15 @@ static void generate_batch(
                         S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
                     blackwell::kernels::quantize_int4_batched(
                         S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_logits, S.d_x_i4, S.d_x_i4_sc,
-                        lm_head_w.d, lm_head_w.sc16, H, V, M, S.st);
+                    if (M == 1) {
+                        blackwell::kernels::gemv_int4_warp_f16wsc(
+                            S.d_logits, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                            lm_head_w.d, lm_head_w.sc16, H, V, S.st);
+                    } else {
+                        blackwell::kernels::gemv_int4_batched_f16wsc(
+                            S.d_logits, S.d_x_i4, S.d_x_i4_sc,
+                            lm_head_w.d, lm_head_w.sc16, H, V, M, S.st);
+                    }
                 }
             }
         }
