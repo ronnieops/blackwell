@@ -276,9 +276,7 @@ static std::vector<uint32_t> generate_one(
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rn_in");
             die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "q_in");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, st), "q_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, st), "k_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, st), "v_proj");
+            die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q, d_K, d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, 1, st), "qkv");
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps); die(cudaGetLastError(),"hn_q");
             head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps); die(cudaGetLastError(),"hn_k");
             apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step); die(cudaGetLastError(),"rp_q");
@@ -292,8 +290,7 @@ static std::vector<uint32_t> generate_one(
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rn_post");
             die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "q_mlp");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, st), "gate");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, st), "up");
+            die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate, d_up, d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, 1, st), "gate_up");
             blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
             die(blackwell::kernels::quantize_int4(d_mlp_i4, d_mlp_i4_sc, d_gate, I, st), "q_mlp2");
             die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, st), "down");

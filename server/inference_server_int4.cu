@@ -333,9 +333,7 @@ static void decode_one_token(uint32_t token_id, int step) {
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
             die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, st), "q_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, st), "k_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, st), "v_proj");
+            die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q, d_K, d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, 1, st), "qkv");
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
             head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
             apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step);
@@ -350,8 +348,7 @@ static void decode_one_token(uint32_t token_id, int step) {
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
             die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
             die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, st), "gate");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, st), "up");
+            die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate, d_up, d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, 1, st), "gate_up");
             blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
             die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
             die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, st), "down");
@@ -380,9 +377,7 @@ static void capture_decode_graph() {
         cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
         blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, gs);
         blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
-        blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, gs);
-        blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, gs);
-        blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, gs);
+        blackwell::kernels::fused_qkv_int4_f16wsc(d_Q, d_K, d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, 1, gs);
         head_norm_kernel<<<nqh,128,0,gs>>>(d_Q, W[l].qn, nqh, hd, eps);
         head_norm_kernel<<<nkv,128,0,gs>>>(d_K, W[l].kn, nkv, hd, eps);
         blackwell::kernels::fused_rope_decode(d_Q, d_cos_cache, d_sin_cache, d_seq_pos, nqh, hd, MAXSEQ, gs);
@@ -396,8 +391,7 @@ static void capture_decode_graph() {
         cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
         blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, gs);
         blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
-        blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, gs);
-        blackwell::kernels::gemv_int4_batched_f16wsc(d_up, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, gs);
+        blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate, d_up, d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, 1, gs);
         blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, gs);
         blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, gs);
         blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, gs);
@@ -456,9 +450,7 @@ static void prefill_tokens_batched(const std::vector<uint32_t>& token_ids, int o
             die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, chunk, st), "quant_in");
 
             // QKV projections (batched)
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, H, Q, chunk, st), "q_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].k.d, W[l].k.sc16, H, KV, chunk, st), "k_proj");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].v.d, W[l].v.sc16, H, KV, chunk, st), "v_proj");
+            die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q_batch_prefill, d_K_batch_prefill, d_V_batch_prefill, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, chunk, st), "qkv");
 
             // Q/K head norms + RoPE per position
             for (int m = 0; m < chunk; ++m) {
@@ -507,8 +499,7 @@ static void prefill_tokens_batched(const std::vector<uint32_t>& token_ids, int o
             die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, chunk, st), "quant_mlp_in");
 
             // MLP gate + up (batched)
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, H, I, chunk, st), "gate");
-            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].u.d, W[l].u.sc16, H, I, chunk, st), "up");
+            die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate_batch, d_up_batch, d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, chunk, st), "gate_up");
 
             // SwiGLU (per-token)
             for (int m = 0; m < chunk; ++m) {
@@ -557,9 +548,7 @@ static void decode_one_token_batched(const uint32_t* token_ids, int step, int M)
         die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, M, st), "quant_in_b");
 
         // QKV projections (batched GEMV)
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, H, Q, M, st), "q_proj_b");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].k.d, W[l].k.sc16, H, KV, M, st), "k_proj_b");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].v.d, W[l].v.sc16, H, KV, M, st), "v_proj_b");
+        die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q_batch, d_K_batch, d_V_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, M, st), "qkv_b");
 
         // Q/K head norms + RoPE (per-sequence — same step for all in speculative verify)
         for (int m = 0; m < M; ++m) {
@@ -601,8 +590,7 @@ static void decode_one_token_batched(const uint32_t* token_ids, int step, int M)
         die(blackwell::kernels::quantize_int4_batched(d_x_i4_batch, d_x_i4_sc_batch, d_xi_f_batch, H, M, st), "quant_mlp_in_b");
 
         // MLP gate + up (batched)
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, H, I, M, st), "gate_b");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up_batch, (const uint8_t*)d_x_i4_batch, d_x_i4_sc_batch, W[l].u.d, W[l].u.sc16, H, I, M, st), "up_b");
+        die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate_batch, d_up_batch, d_x_i4_batch, d_x_i4_sc_batch, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, M, st), "gate_up_b");
 
         // SwiGLU (per-sequence)
         for (int m = 0; m < M; ++m) {

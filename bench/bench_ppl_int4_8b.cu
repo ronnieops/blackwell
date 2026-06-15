@@ -140,6 +140,9 @@ int main(int argc, char** argv) {
     cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
     fprintf(stderr,"# INT4 8B PPL — %s\n", P.name);
 
+    const char* WDIR = (argc > 1) ? argv[1] : "weights_int4_qwen3_8b_fp16sc";
+    fprintf(stderr,"# Weight dir: %s\n", WDIR);
+
     blackwell::BpeTokenizer tok;
     if(tok.load("tokenizer_data.bin")!=0){ fprintf(stderr,"FAIL: no tokenizer_data.bin\n"); return 1; }
 
@@ -177,40 +180,41 @@ int main(int argc, char** argv) {
     std::vector<LW4> W(NL);
     char p[256];
     for(int l=0;l<NL;++l){
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l); W[l].q=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l); W[l].k=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l); W[l].v=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l); W[l].o=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l); W[l].g=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l); W[l].u=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l); W[l].d=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.q_proj",WDIR,l); W[l].q=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.k_proj",WDIR,l); W[l].k=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.v_proj",WDIR,l); W[l].v=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.o_proj",WDIR,l); W[l].o=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.gate_proj",WDIR,l); W[l].g=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.up_proj",WDIR,l); W[l].u=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.down_proj",WDIR,l); W[l].d=upload_w4_f16sc(p);
     }
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {char p2[300]; snprintf(p2,300,"%s/qk_norms.f32",WDIR); FILE*f=fopen(p2,"rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
     }free(qk_h);
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
+        snprintf(p,256,"%s/%d_input_layernorm.f32",WDIR,l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
+        snprintf(p,256,"%s/%d_post_attention_layernorm.f32",WDIR,l);
         {FILE*f=fopen(p,"rb");(void)fread(w,4,H,f);fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     {float*w=(float*)malloc(H*4);
-    FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+    {char p2[300]; snprintf(p2,300,"%s/final_norm.f32",WDIR); FILE*f=fopen(p2,"rb");(void)fread(w,4,H,f);fclose(f);}
     cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice);free(w);}
 
-    DevW4f16 lm_head_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
+    DevW4f16 lm_head_w;
+    {char p2[300]; snprintf(p2,300,"%s/lm_head",WDIR); lm_head_w=upload_w4_f16sc(p2);}
     uint8_t* host_embed_d=new uint8_t[(size_t)H*V/2];
     float* host_embed_sc=new float[V*(H/16)];
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
+    {char p2[300]; snprintf(p2,300,"%s/embed_tokens.int4_t",WDIR); FILE*f=fopen(p2,"rb");int h[5];fread(h,4,5,f);
      fread(host_embed_d,1,(size_t)h[0]*h[1]/2,f);fclose(f);
-     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");fread(h,4,5,f);
+     {char p2[300]; snprintf(p2,300,"%s/embed_tokens.scale_t",WDIR); FILE*f=fopen(p2,"rb");fread(h,4,5,f);}
      {__half* tmp=new __half[(size_t)h[3]*h[4]];fread(tmp,2,(size_t)h[3]*h[4],f);
       for(size_t i=0;i<(size_t)h[3]*h[4];++i) host_embed_sc[i]=__half2float(tmp[i]);
       delete[] tmp;}

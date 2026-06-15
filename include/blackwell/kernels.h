@@ -896,7 +896,79 @@ cudaError_t fused_swiglu_quant_int4(
     int N,
     cudaStream_t stream = 0);
 
-// Asymmetric INT4 quantization with per-block zero point
+// Fused gate+up INT4 GEMV — replaces two separate gemv_int4_batched_f16wsc calls.
+// gate_out [M][N], up_out [M][N]: two INT4×FP32 projections from same activation.
+// Loads activation once per K-block, computes both outputs. 1 kernel launch vs 2.
+// WScaleT: __half (FP16 scales, half traffic) or float (FP32 scales).
+cudaError_t fused_gate_up_int4_f16wsc(
+    float*          gate_out,
+    float*          up_out,
+    const void*     x_packed,     // [M][K/2] packed INT4 activations
+    const float*    x_scale,     // [M][K/16] FP32 activation scales
+    const void*     W_g_packed,  // [N][K/2] packed INT4 gate weights
+    const void*     W_g_scale,   // __half* [N][K/16] gate weight scales
+    const void*     W_u_packed,  // [N][K/2] packed INT4 up weights
+    const void*     W_u_scale,   // __half* [N][K/16] up weight scales
+    int             K,
+    int             N,            // = I (hidden dim)
+    int             M,            // batch size 1..16
+    cudaStream_t    stream = 0);
+
+// FP32-scale variant of fused_gate_up_int4 (for non-FP16-scale weight dirs).
+cudaError_t fused_gate_up_int4(
+    float*          gate_out,
+    float*          up_out,
+    const uint8_t*  x_packed,
+    const float*    x_scale,
+    const uint8_t*  W_g_packed,
+    const float*    W_g_scale,
+    const uint8_t*  W_u_packed,
+    const float*    W_u_scale,
+    int             K,
+    int             N,
+    int             M,
+    cudaStream_t    stream = 0);
+
+// Fused QKV INT4 GEMV: 3 projections (Q, K, V) from same activation in 1 kernel.
+// Q_out [M][Q_dim], K_out [M][KV_dim], V_out [M][KV_dim].
+// Grid: max(Q_dim, KV_dim) blocks. Blocks 0..KV_dim-1 compute Q+K+V (x loaded once);
+// blocks KV_dim..Q_dim-1 compute Q only. 1 kernel launch vs 3.
+cudaError_t fused_qkv_int4_f16wsc(
+    float*          Q_out,
+    float*          K_out,
+    float*          V_out,
+    const void*     x_packed,     // [M][K/2] packed INT4 activations
+    const float*    x_scale,     // [M][K/16] FP32 activation scales
+    const void*     W_q_packed,  // [Q_dim][K/2] packed INT4 Q weights
+    const void*     W_q_scale,   // __half* [Q_dim][K/16] Q weight scales
+    const void*     W_k_packed,  // [KV_dim][K/2] packed INT4 K weights
+    const void*     W_k_scale,   // __half* [KV_dim][K/16] K weight scales
+    const void*     W_v_packed,  // [KV_dim][K/2] packed INT4 V weights
+    const void*     W_v_scale,   // __half* [KV_dim][K/16] V weight scales
+    int             K,
+    int             Q_dim,        // query output dim (4096)
+    int             KV_dim,       // key/value output dim (1024)
+    int             M,            // batch size 1..16
+    cudaStream_t    stream = 0);
+
+// FP32-scale variant of fused_qkv_int4.
+cudaError_t fused_qkv_int4(
+    float*          Q_out,
+    float*          K_out,
+    float*          V_out,
+    const uint8_t*  x_packed,
+    const float*    x_scale,
+    const uint8_t*  W_q_packed,
+    const float*    W_q_scale,
+    const uint8_t*  W_k_packed,
+    const float*    W_k_scale,
+    const uint8_t*  W_v_packed,
+    const float*    W_v_scale,
+    int             K,
+    int             Q_dim,
+    int             KV_dim,
+    int             M,
+    cudaStream_t    stream = 0);
 // For 16-element block: scale=(max-min)/15, zero=round(-min/scale)
 // Output scale format: [2*K/16] floats, even=scale, odd=zero
 cudaError_t quantize_int4_asym(

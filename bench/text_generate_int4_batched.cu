@@ -288,29 +288,14 @@ static void generate_batch(
             blackwell::kernels::quantize_int4_batched(
                 S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
             
-            // QKV projections
-            if (M == 1) {
-                // M=1: use warp kernel (faster than batched template with M=1)
-                blackwell::kernels::gemv_int4_warp_f16wsc(
-                    S.d_Q, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                    W[l].q.d, W[l].q.sc16, H, Q, gs);
-                blackwell::kernels::gemv_int4_warp_f16wsc(
-                    S.d_K, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                    W[l].k.d, W[l].k.sc16, H, KV, gs);
-                blackwell::kernels::gemv_int4_warp_f16wsc(
-                    S.d_V, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                    W[l].v.d, W[l].v.sc16, H, KV, gs);
-            } else {
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_Q, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].q.d, W[l].q.sc16, H, Q, M, gs);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_K, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].k.d, W[l].k.sc16, H, KV, M, gs);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_V, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].v.d, W[l].v.sc16, H, KV, M, gs);
-            }
+            // QKV projections (fused: 1 kernel launch vs 3)
+            blackwell::kernels::fused_qkv_int4_f16wsc(
+                S.d_Q, S.d_K, S.d_V,
+                (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                W[l].q.d, W[l].q.sc16,
+                W[l].k.d, W[l].k.sc16,
+                W[l].v.d, W[l].v.sc16,
+                H, Q, KV, M, gs);
             
             // Q/K head norms + RoPE (graph-safe: device seq_pos)
             head_norm_kernel<<<nqh, 128, 0, gs>>>(S.d_Q, W[l].qn, nqh, hd, eps);
@@ -355,22 +340,11 @@ static void generate_batch(
             blackwell::kernels::quantize_int4_batched(
                 S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
             
-            // MLP gate + up (batched)
-            if (M == 1) {
-                blackwell::kernels::gemv_int4_warp_f16wsc(
-                    S.d_gate, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                    W[l].g.d, W[l].g.sc16, H, I, gs);
-                blackwell::kernels::gemv_int4_warp_f16wsc(
-                    S.d_up, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                    W[l].u.d, W[l].u.sc16, H, I, gs);
-            } else {
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_gate, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].g.d, W[l].g.sc16, H, I, M, gs);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_up, S.d_x_i4, S.d_x_i4_sc,
-                    W[l].u.d, W[l].u.sc16, H, I, M, gs);
-            }
+            // MLP gate + up (batched, fused)
+            blackwell::kernels::fused_gate_up_int4_f16wsc(
+                S.d_gate, S.d_up, S.d_x_i4, S.d_x_i4_sc,
+                W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16,
+                H, I, M, gs);
             
             // SwiGLU
             blackwell::kernels::apply_swiglu(S.d_gate, S.d_gate, S.d_up, I, gs);
@@ -470,28 +444,14 @@ static void generate_batch(
                 blackwell::kernels::quantize_int4_batched(
                     S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
                 
-                // QKV projections (single batched GEMV each)
-                if (M == 1) {
-                    blackwell::kernels::gemv_int4_warp_f16wsc(
-                        S.d_Q, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                        W[l].q.d, W[l].q.sc16, H, Q, S.st);
-                    blackwell::kernels::gemv_int4_warp_f16wsc(
-                        S.d_K, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                        W[l].k.d, W[l].k.sc16, H, KV, S.st);
-                    blackwell::kernels::gemv_int4_warp_f16wsc(
-                        S.d_V, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                        W[l].v.d, W[l].v.sc16, H, KV, S.st);
-                } else {
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_Q, S.d_x_i4, S.d_x_i4_sc,
-                        W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_K, S.d_x_i4, S.d_x_i4_sc,
-                        W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_V, S.d_x_i4, S.d_x_i4_sc,
-                        W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
-                }
+                // QKV projections (fused: 1 kernel launch vs 3)
+                blackwell::kernels::fused_qkv_int4_f16wsc(
+                    S.d_Q, S.d_K, S.d_V,
+                    (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].q.d, W[l].q.sc16,
+                    W[l].k.d, W[l].k.sc16,
+                    W[l].v.d, W[l].v.sc16,
+                    H, Q, KV, M, S.st);
                 
                 // Q/K head norms + RoPE (per-sequence)
                 for (int m = 0; m < M; ++m) {
@@ -548,22 +508,11 @@ static void generate_batch(
                 blackwell::kernels::quantize_int4_batched(
                     S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
                 
-                // MLP gate + up (batched)
-                if (M == 1) {
-                    blackwell::kernels::gemv_int4_warp_f16wsc(
-                        S.d_gate, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                        W[l].g.d, W[l].g.sc16, H, I, S.st);
-                    blackwell::kernels::gemv_int4_warp_f16wsc(
-                        S.d_up, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
-                        W[l].u.d, W[l].u.sc16, H, I, S.st);
-                } else {
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_gate, S.d_x_i4, S.d_x_i4_sc,
-                        W[l].g.d, W[l].g.sc16, H, I, M, S.st);
-                    blackwell::kernels::gemv_int4_batched_f16wsc(
-                        S.d_up, S.d_x_i4, S.d_x_i4_sc,
-                        W[l].u.d, W[l].u.sc16, H, I, M, S.st);
-                }
+                // MLP gate + up (batched, fused)
+                blackwell::kernels::fused_gate_up_int4_f16wsc(
+                    S.d_gate, S.d_up, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16,
+                    H, I, M, S.st);
                 
                 // SwiGLU (per-sequence)
                 for (int m = 0; m < M; ++m) {

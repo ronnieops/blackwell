@@ -84,6 +84,8 @@ set(KERNEL_SOURCES
     src/kernels/fused_pack_gemv.cu
     src/kernels/fused_swiglu_gemv.cu
     src/kernels/fused_int4_ops.cu
+    src/kernels/fused_gate_up_int4.cu
+    src/kernels/fused_qkv_int4.cu
     src/kernels/persistent_attn_block.cu
 )
 
