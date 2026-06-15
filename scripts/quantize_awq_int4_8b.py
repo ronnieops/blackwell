@@ -325,7 +325,7 @@ def compute_awq_scales(W_f32, act_mag, alpha=0.5):
     """Compute per-channel AWQ protection scales.
 
     Channels with activation >> average get scaled up:
-      s = (max_act / act_mag)^alpha  clipped to [0.5, 2.0]
+      s = (act_mag / mean_act)^alpha  clipped to [0.5, 2.0]
 
     This reduces quantization error on salient channels.
     """
@@ -338,8 +338,84 @@ def compute_awq_scales(W_f32, act_mag, alpha=0.5):
         return np.ones(N, dtype=np.float32)
 
     # s = (act_mag / mean_act)^alpha — scale up high-activation channels
-    s = np.clip((act_mag / mean_act) ** alpha, 0.5, 2.0)
-    return s.astype(np.float32)
+    # Use FP64 for precision, then FP32 for output
+    act_mag_f64 = act_mag.astype(np.float64)
+    mean_act_f64 = float(mean_act)
+    s_f64 = np.clip((act_mag_f64 / mean_act_f64) ** alpha, 0.5, 2.0)
+    return s_f64.astype(np.float32)
+
+
+def pseudo_quantize_int4_sym(W_f32, block=16):
+    """Simulate INT4 symmetric block quantization.
+
+    Returns: quantized W (FP32, simulating INT4 round-trip error).
+    Used by per-layer alpha search to evaluate quantization MSE.
+    """
+    N, K = W_f32.shape
+    assert K % block == 0
+    num_blks = K // block
+    W_blk = W_f32.reshape(N, num_blks, block)
+    blk_abs = np.max(np.abs(W_blk), axis=2)
+    blk_abs = np.maximum(blk_abs, 1e-10)
+    # Quantize
+    q = np.round(W_blk / (blk_abs / 7.0)[:, :, np.newaxis])
+    q = np.clip(q, -7, 7)
+    # Dequantize (round-trip)
+    W_q = q * (blk_abs / 7.0)[:, :, np.newaxis]
+    return W_q.reshape(N, K)
+
+
+def search_best_alpha(W_f32, act_mag, x_max_pow=None, n_grid=20):
+    """Grid search over alpha ratios to find the one with lowest quantization MSE.
+
+    Ported from AWQ _search_module_scale() (auto_scale.py).
+    For each ratio: compute scales, apply to weights, pseudo-quantize, measure MSE.
+    Selects ratio with lowest MSE.
+    """
+    N, K = W_f32.shape
+    if act_mag is None or len(act_mag) != N:
+        return 0.0, compute_awq_scales(W_f32, act_mag, 0.0)
+
+    x_max = act_mag.astype(np.float64)
+    mean_act = float(x_max.mean())
+    if mean_act < 1e-10:
+        return 0.0, compute_awq_scales(W_f32, act_mag, 0.0)
+
+    # Pre-compute x_max.pow(ratio) for candidate ratios
+    best_ratio = 0.0
+    best_mse = float('inf')
+    best_scales = None
+
+    for ri in range(n_grid):
+        ratio = ri / n_grid  # 0.0, 0.05, 0.1, ..., 0.95
+
+        # Compute scales: x_max^ratio, normalize
+        scales_f64 = np.power(x_max / mean_act, ratio)  # [N]
+        scales_f64 = np.clip(scales_f64, 1e-4, None)
+        # Normalize by sqrt(max*min) — AWQ style
+        scales_f64 = scales_f64 / np.sqrt(scales_f64.max() * scales_f64.min())
+        scales = scales_f64.astype(np.float32)[:, np.newaxis]  # [N, 1]
+
+        # Apply to weights: W' = W / s
+        W_scaled = W_f32.astype(np.float64) / scales
+
+        # Pseudo-quantize
+        W_q = pseudo_quantize_int4_sym(W_scaled.astype(np.float32), 16)
+
+        # Undo scale: compare to original W
+        W_recon = W_q.astype(np.float64) * scales
+
+        # MSE (per-element)
+        mse = np.mean((W_f32.astype(np.float64) - W_recon) ** 2)
+
+        if mse < best_mse:
+            best_mse = mse
+            best_ratio = ratio
+            best_scales = scales_f64.astype(np.float32)
+
+    # Clip scales to [0.5, 2.0] for stability
+    s = np.clip(best_scales, 0.5, 2.0)
+    return best_ratio, s
 
 
 # ── INT4 symmetric quantization (with AWQ scales) ─────────────────────────
@@ -471,11 +547,15 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"\nOutput: {OUT_DIR}/")
 
-    # 4. Process each layer's weights
+    # 4. Process each layer's weights with per-layer alpha search
+    #    Each (layer, submodule) gets its own best alpha via MSE grid search
     WEIGHT_NAMES = [
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
         "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
     ]
+
+    alpha_use_global = ALPHA  # fallback if no act stats
+    alpha_log = []  # track best alphas per layer
 
     for l in range(NL):
         for wn in WEIGHT_NAMES:
@@ -490,28 +570,41 @@ def main():
             # Get activation stats for this weight
             k = f"{l}_{wn}"
             act_mag = act_stats.get(k, None)
-            if act_mag is not None:
-                awq_sc = compute_awq_scales(W, act_mag, ALPHA)
+
+            # Per-layer alpha search: find best alpha for this (layer, submodule)
+            if act_mag is not None and N_CALIB > 0:
+                best_ratio, awq_sc = search_best_alpha(W, act_mag, n_grid=20)
             else:
-                awq_sc = np.ones(N_out, dtype=np.float32)
+                best_ratio = alpha_use_global
+                awq_sc = compute_awq_scales(W, act_mag, alpha_use_global)
 
             # Quantize with AWQ
             packed, scales = quantize_int4_sym_awq(W, awq_sc, BLOCK)
 
             # Write
             prefix = f"{OUT_DIR}/{l}_{wn}"
-            write_weight_int4_sym(prefix, packed, scales, K_in, N_out, fp16_scales=True)
+            write_weight_int4_sym(prefix, packed, scales, K_in, N_out, fp16_scales=False)
+            alpha_log.append((l, wn, best_ratio))
 
         if l % 8 == 0:
             print(f"  Layer {l}/{NL}")
+
+    # Print alpha distribution summary
+    ratios = [a[2] for a in alpha_log]
+    print(f"\nAlpha distribution across {len(ratios)} (layer, submodule) pairs:")
+    print(f"  mean={np.mean(ratios):.3f}, min={np.min(ratios):.3f}, max={np.max(ratios):.3f}")
 
     # 5. Embed tokens
     W_emb = read_tensor(tensor_map, shard_paths, "model.embed_tokens.weight").astype(np.float32)
     N_out, K_in = W_emb.shape
     act_mag = act_stats.get("embed_tokens", None)
-    awq_sc = compute_awq_scales(W_emb, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
+    if act_mag is not None and N_CALIB > 0:
+        emb_ratio, awq_sc = search_best_alpha(W_emb, act_mag, n_grid=20)
+        print(f"  embed_tokens: best alpha={emb_ratio:.3f}")
+    else:
+        awq_sc = compute_awq_scales(W_emb, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
     packed, scales = quantize_int4_sym_awq(W_emb, awq_sc, BLOCK)
-    write_weight_int4_sym(f"{OUT_DIR}/embed_tokens", packed, scales, K_in, N_out, fp16_scales=True)
+    write_weight_int4_sym(f"{OUT_DIR}/embed_tokens", packed, scales, K_in, N_out, fp16_scales=False)
     print(f"  embed_tokens: {N_out}×{K_in}")
 
     # 6. LM head
@@ -522,9 +615,13 @@ def main():
         W_lm = read_tensor(tensor_map, shard_paths, lm_tname).astype(np.float32)
         N_out, K_in = W_lm.shape
         act_mag = act_stats.get("lm_head", None)
-        awq_sc = compute_awq_scales(W_lm, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
+        if act_mag is not None and N_CALIB > 0:
+            lm_ratio, awq_sc = search_best_alpha(W_lm, act_mag, n_grid=20)
+            print(f"  lm_head: best alpha={lm_ratio:.3f}")
+        else:
+            awq_sc = compute_awq_scales(W_lm, act_mag, ALPHA) if act_mag is not None else np.ones(N_out)
         packed, scales = quantize_int4_sym_awq(W_lm, awq_sc, BLOCK)
-        write_weight_int4_sym(f"{OUT_DIR}/lm_head", packed, scales, K_in, N_out, fp16_scales=True)
+        write_weight_int4_sym(f"{OUT_DIR}/lm_head", packed, scales, K_in, N_out, fp16_scales=False)
         print(f"  lm_head: {N_out}×{K_in}")
     else:
         # Copy from existing weights
@@ -546,9 +643,16 @@ def main():
 
     print(f"\nDone. AWQ-calibrated INT4 weights in {OUT_DIR}/")
     print(f"  N_calib={N_CALIB}, alpha={ALPHA}")
+
+    # 8. Optionally convert to FP16 scales
+    DST_FP16 = OUT_DIR + "_fp16sc"
+    print(f"\nTo convert to FP16 scales (for throughput):")
+    print(f"  python3 scripts/convert_scales_fp16.py {OUT_DIR} {DST_FP16}")
+
     print(f"\nTo benchmark:")
     print(f"  ./bench/text_generate_int4_8b {OUT_DIR} 30")
     print(f"  ./bench/text_generate_int4_batched \"prompt\" 8 10 {OUT_DIR}")
+    print(f"  ./bench/bench_ppl_int4_8b {OUT_DIR}")
 
 
 if __name__ == "__main__":

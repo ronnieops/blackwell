@@ -14,8 +14,8 @@ introduces ~0.05% relative error per scale. Re-verify PPL after conversion
 import os, sys, struct, shutil
 import numpy as np
 
-SRC = "weights_int4_qwen3_8b"
-DST = "weights_int4_qwen3_8b_fp16sc"
+SRC = sys.argv[1] if len(sys.argv) > 1 else "weights_int4_qwen3_8b"
+DST = sys.argv[2] if len(sys.argv) > 2 else SRC + "_fp16sc"
 
 def main():
     if not os.path.isdir(SRC):

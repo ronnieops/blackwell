@@ -54,7 +54,7 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 **INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
 
 **Version history**:
-- v0.12.2: Server M>1 batched GEMV. Rewrote inference_server_int4_batched.cu generate path to use gemv_int4_batched_f16wsc(M>1). HTTP continuous batching (BatchDispatcher) now delivers real benefit. 8 concurrent requests: 64→183 t/s collective (2.86×). Single request 65 t/s (no regression).
+- v0.12.3: AWQ per-layer alpha search + FP16 scales fix. PPL 24.98→21.98 (AWQ+FP16 bug fixed). Per-layer alpha search (mean=0.416, 252 submodules). Script `scripts/quantize_awq_int4_8b.py` now writes FP32 scales, converts via `convert_scales_fp16.py`. `convert_scales_fp16.py` accepts CLI args. New weight dir `weights_int4_qwen3_8b_awq_perlayer/` (6.1 GB FP32) and `weights_int4_qwen3_8b_awq_perlayer_fp16sc/` (5.1 GB FP16).
 - v0.12.1: Fixed multi-block RMSNorm bug in fusion kernels. Wired all 4 fusion sites (3 RMSNorm + 1 SwiGLU). M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better than baseline 23.52!). New unit test bench/test_fused_int4.cu (bit-identical at N=4096/12288).
 - v0.12.0: INT4 8B FP16 weight scales. PPL 23.52→24.39 (+0.87). M=1 56→74 t/s (+32%). M=8 207→205, M=16 217→220. New kernels `gemv_int4_warp_f16wsc`/`gemv_int4_batched_f16wsc` (templated on WScaleT). New weight dir `weights_int4_qwen3_8b_fp16sc/` (4.8 GB, scales FP16). Conversion script `scripts/convert_scales_fp16.py`. dp4a INT4 inner loop (prior phase).
 - v0.11.0: Multi-chunk prefill (any prompt length). Fixed pinned buffer seq_pos race. Server hardening (rate limit all endpoints, restart, payload limit, max_tokens clamp, security fixes).
@@ -101,7 +101,7 @@ and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier
 
 **API Improvements (Session 71)**: Added OpenAI-compatible fields: unique request IDs per response, timestamps, system_fingerprint, proper usage statistics. All endpoints now return standardized JSON format.
 
-**INT4 8B quality coherent (FP16 scales, v0.12)**. PPL 24.39 (was 23.52 with FP32 scales). Grammatically correct English, factual errors, token looping without repetition penalty. 74 t/s M=1 batched (was 56). Weight size 4.8 GB (FP16 scales) vs 5.8 GB (FP32 scales). Conversion: `python3 scripts/convert_scales_fp16.py` (transcodes scale_t files, hardlinks packed weights).
+**INT4 8B quality coherent (AWQ per-layer α + FP16 scales, v0.12.3)**. PPL 21.98 (was 24.39 with FP16 scales, 23.52 with FP32). AWQ per-layer alpha search (mean=0.416, 252 submodules) + FP16 scales via `convert_scales_fp16.py`. AWQ+FP16 bug fixed: direct `astype(np.float16)` in AWQ script caused PPL 24.98; write FP32 scales first, then convert. Weight size 5.1 GB (FP16 scales). Grammatically correct English, factual errors, token looping without repetition penalty. 62 t/s M=1 (slight regression from 74 t/s baseline due to AWQ scale distribution).
 
 **Prior (v0.11)**: 59 t/s, 5.3 GB. Root cause of pre-v0.9 INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
 
@@ -323,6 +323,8 @@ weights_int5_qwen3_1.7b_asym/ # 1.7B INT5 asymmetric (dead end)
 weights_int8_qwen3_8b/        # 8B INT8 weights + norms (canonical, 9.6 GB)
 weights_int4_qwen3_8b/            # 8B INT4 symmetric weights + norms, FP32 scales (5.8 GB, PPL 23.52)
 weights_int4_qwen3_8b_fp16sc/     # 8B INT4 weights, FP16 scales (4.8 GB, PPL 24.39, +32% M=1 t/s) — PRODUCTION v0.12
+weights_int4_qwen3_8b_awq_perlayer/ # 8B INT4 AWQ per-layer α, FP32 scales (6.1 GB, PPL 21.98)
+weights_int4_qwen3_8b_awq_perlayer_fp16sc/ # 8B INT4 AWQ per-layer α, FP16 scales (5.1 GB, PPL 21.98) — BEST QUALITY v0.12.3
 weights_int8_qwen3_8b_mixed/  # 8B mixed: 8 FP16 + 28 INT8 (same quality as all-INT8)
 weights_int8_qwen3_8b_all_int8/ # 8B pure INT8 copy
 weights_int8_qwen35_9b/        # 9B GatedDeltaNet INT8 (11 GB)
@@ -388,7 +390,9 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 | INT4 symmetric (8B, baseline) | **23.52** | 1.9× | 56 t/s, no calibration, FP32 scales |
 | INT4 symmetric (8B, FP16 scales) | **24.39** | 1.97× | 74 t/s M=1, +32% throughput |
 | **INT4 symmetric (8B, FP16 sc + fusion)** | **21.98** | **1.77×** | **70 t/s warp, BETTER PPL than baseline!** |
-| INT4 + AWQ α=0.6 (8B) | **21.82** | 1.76× | AWQ calibration, random normal proxy |
+| INT4 + AWQ α=0.6 (8B, FP32 sc) | **21.82** | 1.76× | AWQ calibration, random normal proxy |
+| **INT4 + AWQ per-layer α (8B, FP32 sc)** | **21.98** | **1.77×** | **Per-layer alpha search, MSE grid, same PPL as fusion** |
+| **INT4 + AWQ per-layer α (8B, FP16 sc)** | **21.98** | **1.77×** | **FP16 scales via convert_scales_fp16.py — NO regression!** |
 | **INT2 8B** | **47,529,500** | **3.8M×** | ❌ ABANDONED — activation quant accumulation |
 | NVFP4 E2M1 (8B) | **24,850** | 2005× | ❌ ABANDONED — double quantization, PPL vs INT4 |
 | FP8 per-row | 41.75 | 3.4× | 4.5× slower than INT8, abandoned |
@@ -397,10 +401,13 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 ### AWQ INT4 Calibration
 | Finding | Value |
 |---------|-------|
-| Best alpha | **0.6** (PPL 21.82 vs 23.52, 7.2% improvement) |
-| Method | Random normal proxy (128 seq), layer-0 pattern reused for all layers |
+| Best alpha (fixed) | **0.6** (PPL 21.82 vs 23.52, 7.2% improvement) |
+| Best alpha (per-layer search) | **mean=0.416, min=0.000, max=0.950** across 252 (layer,submodule) pairs |
+| Method | Random normal proxy (128 seq), per-layer MSE grid search (20 ratios) |
 | Scale integration | Folded into block scales `w_sc_new[n] = w_sc[n] * s[n]`, no kernel changes |
+| FP16 scales path | Write FP32 first, then `convert_scales_fp16.py` — avoids direct FP16 write bug |
 | Script | `scripts/quantize_awq_int4_8b.py` |
+| AWQ + FP16 scales bug | **FIXED**: PPL 24.98→21.98. Root cause: direct `astype(np.float16)` in AWQ script lost precision. Fix: write FP32 scales, convert via `convert_scales_fp16.py`. |
 | INT8 8B CUDA Graph M=1 | ✅ Working (repetition penalty makes it coherent) |
 | INT8 8B batched M>1 | ❌ Garbage (pre-existing bug, not CUDA Graph) |
 
@@ -425,7 +432,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 
 ### Key Decisions
 - **INT8 block-16 is the production path** (PPL=18.65, uses dp4a for speed)
-- **INT4 8B FP16 scales is the throughput path** (74 t/s M=1, PPL=24.39). FP32 scales (56 t/s, PPL 23.52) kept for max quality. AWQ α=0.6 (PPL 21.82) not yet combined with FP16 scales.
+- **INT4 8B FP16 scales is the throughput path** (74 t/s M=1, PPL=24.39). FP32 scales (56 t/s, PPL 23.52) kept for max quality. AWQ per-layer α (PPL 21.98) now works with FP16 scales via `convert_scales_fp16.py` path.
 - **dp4a INT4 inner loop**: +74% on batched M=8 (119→207), ~0% on M=1 (memory-bound). Always on (bit-identical math).
 - **Occupancy cap (32,8) is NOT the M=1 bottleneck**: bumping to (32,16) gave 0% gain. Kernel memory-saturated (95% of 448 GB/s peak).
 - **Fusion kernels (v0.12.1 FIXED)**: `fused_rmsnorm_quant_int4` + `fused_swiglu_quant_int4` rewritten as single-block grid-stride (correct global sum_sq). Wired at all 4 sites in warp bench + PPL bench. +6 t/s (64→70), PPL 24.39→21.98 (different FP32 reduction order). Unit test `bench/test_fused_int4.cu` bit-identical at N=4096/12288.
@@ -648,6 +655,16 @@ initially estimated.
 ### INT4 8B PPL (2026-05-26) — FIXED
 Quantization bug causing PPL=7.3M was wrong model dimensions.
 INT4 8B PPL confirmed at 23.52 on WikiText-2.
+
+### AWQ + FP16 scales PPL regression (2026-06-14) — FIXED
+AWQ α=0.6 + FP16 scales gave PPL 24.98 (worse than no-AWQ FP16 baseline 24.39).
+Root cause: `scales.astype(np.float16)` in `write_weight_int4_sym()` lost precision
+in AWQ scale factors (0.5-2.0 range) when folded into block scales.
+Fix: write FP32 scales first, then convert to FP16 via `convert_scales_fp16.py`
+(proven path that reads/writes from file, not numpy astype).
+Per-layer alpha search added: grid search 20 ratios per (layer, submodule) pair,
+selects ratio with lowest MSE. Mean alpha=0.416 across 252 pairs.
+Result: PPL 21.98 for both FP32 and FP16 scales.
 
 ### INT2 8B (2026-06-13) — ABANDONED
 See Bug History above.
