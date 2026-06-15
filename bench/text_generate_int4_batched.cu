@@ -2,6 +2,9 @@
 // Processes M sequences in parallel for higher throughput.
 // M=1: ~56 t/s, M=4: ~100+ t/s, M=8: ~150+ t/s (projected)
 //
+// CUDA Graph mode (--graph): captures full 36-layer decode for M=1.
+// Uses device-side seq_pos, graph-safe kernels. ~15% faster than per-kernel.
+//
 // Build:
 //   CUDACXX=/usr/local/cuda-13.3/bin/nvcc nvcc -O3 -std=c++17 \
 //     -gencode=arch=compute_120a,code=sm_120a \
@@ -124,8 +127,25 @@ struct ServerState {
     float *d_kc, *d_vc;     // KV cache [M][NL][ms][nkv][hd] - separate per sequence
     float *d_fn;            // final norm [H]
     float *d_fn_sc;         // final norm scales [H/16]
+    // CUDA Graph support
+    int* d_seq_pos;         // device-side seq_pos (graph-safe)
+    int* h_seq_pos_pinned;  // pinned host copy for async update
+    float* d_cos_cache;     // RoPE cos cache [MAXSEQ][hd/2]
+    float* d_sin_cache;     // RoPE sin cache [MAXSEQ][hd/2]
     cudaStream_t st;
 };
+
+static void build_rope_cache(float* cos_cache, float* sin_cache, int max_seq, int head_dim) {
+    int pairs = head_dim / 2;
+    float rope_theta = 1000000.0f;
+    for (int pos = 0; pos < max_seq; ++pos) {
+        for (int d = 0; d < pairs; ++d) {
+            float theta = (float)pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);
+            cos_cache[pos * pairs + d] = cosf(theta);
+            sin_cache[pos * pairs + d] = sinf(theta);
+        }
+    }
+}
 
 static void alloc_buffers(ServerState& S, int M) {
     S.M = M;
@@ -158,6 +178,19 @@ static void alloc_buffers(ServerState& S, int M) {
     AL(S.d_vc, kv_cache);
     AL(S.d_fn, H * 4);
     AL(S.d_fn_sc, H / 16 * 4);
+    // CUDA Graph buffers
+    AL(S.d_seq_pos, sizeof(int));
+    cudaHostAlloc(&S.h_seq_pos_pinned, sizeof(int), cudaHostAllocDefault);
+    int rope_pairs = hd / 2;
+    AL(S.d_cos_cache, (size_t)MAXSEQ * rope_pairs * 4);
+    AL(S.d_sin_cache, (size_t)MAXSEQ * rope_pairs * 4);
+    {
+        std::vector<float> cos_h(MAXSEQ * rope_pairs);
+        std::vector<float> sin_h(MAXSEQ * rope_pairs);
+        build_rope_cache(cos_h.data(), sin_h.data(), MAXSEQ, hd);
+        cudaMemcpy(S.d_cos_cache, cos_h.data(), (size_t)MAXSEQ * rope_pairs * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(S.d_sin_cache, sin_h.data(), (size_t)MAXSEQ * rope_pairs * 4, cudaMemcpyHostToDevice);
+    }
     #undef AL
     
     // Init scales
@@ -191,6 +224,9 @@ static void free_buffers(ServerState& S) {
     if (S.h_recent) { delete[] S.h_recent; S.h_recent = nullptr; }
     FR(S.d_kc); FR(S.d_vc);
     FR(S.d_fn); FR(S.d_fn_sc);
+    FR(S.d_seq_pos);
+    if (S.h_seq_pos_pinned) { cudaFreeHost(S.h_seq_pos_pinned); S.h_seq_pos_pinned = nullptr; }
+    FR(S.d_cos_cache); FR(S.d_sin_cache);
     #undef FR
 }
 
@@ -205,7 +241,8 @@ static void generate_batch(
     DevW4f16& lm_head_w,
     const uint8_t* host_embed_d,
     const float* host_embed_sc,
-    BpeTokenizer& tokenizer)
+    BpeTokenizer& tokenizer,
+    bool use_graph = false)
 {
     int M = prompts.size();
     std::vector<std::vector<uint32_t>> all_ids(M);
@@ -224,6 +261,177 @@ static void generate_batch(
     
     auto t_start = std::chrono::high_resolution_clock::now();
     
+    // ── CUDA Graph capture (M=1 only) ─────────────────────────────────
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    
+    if (use_graph && M == 1) {
+        // Build graph: capture full 36-layer decode with device-side seq_pos
+        cudaStream_t gs;
+        cudaStreamCreate(&gs);
+        
+        int capture_pos = 0;
+        cudaMemcpy(S.d_seq_pos, &capture_pos, sizeof(int), cudaMemcpyHostToDevice);
+        
+        cudaStreamBeginCapture(gs, cudaStreamCaptureModeGlobal);
+        
+        for (int l = 0; l < NL; ++l) {
+            size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
+            
+            // Save residual
+            cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
+                           cudaMemcpyDeviceToDevice, gs);
+            
+            // Pre-attention norm + quantize (batched)
+            blackwell::kernels::fused_rmsnorm_batched(
+                S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, gs);
+            blackwell::kernels::quantize_int4_batched(
+                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            
+            // QKV projections
+            if (M == 1) {
+                // M=1: use warp kernel (faster than batched template with M=1)
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_Q, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].q.d, W[l].q.sc16, H, Q, gs);
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_K, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].k.d, W[l].k.sc16, H, KV, gs);
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_V, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].v.d, W[l].v.sc16, H, KV, gs);
+            } else {
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_Q, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].q.d, W[l].q.sc16, H, Q, M, gs);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_K, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].k.d, W[l].k.sc16, H, KV, M, gs);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_V, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].v.d, W[l].v.sc16, H, KV, M, gs);
+            }
+            
+            // Q/K head norms + RoPE (graph-safe: device seq_pos)
+            head_norm_kernel<<<nqh, 128, 0, gs>>>(S.d_Q, W[l].qn, nqh, hd, eps);
+            head_norm_kernel<<<nkv, 128, 0, gs>>>(S.d_K, W[l].kn, nkv, hd, eps);
+            blackwell::kernels::fused_rope_decode(
+                S.d_Q, S.d_cos_cache, S.d_sin_cache, S.d_seq_pos, nqh, hd, MAXSEQ, gs);
+            blackwell::kernels::fused_rope_decode(
+                S.d_K, S.d_cos_cache, S.d_sin_cache, S.d_seq_pos, nkv, hd, MAXSEQ, gs);
+            
+            // KV cache update (graph-safe: device seq_pos)
+            blackwell::kernels::update_kv_cache_device(
+                S.d_kc + kv_off, S.d_vc + kv_off,
+                S.d_K, S.d_V, 0, S.d_seq_pos,
+                nkv, hd, MAXSEQ, gs);
+            
+            // Attention (graph-safe: device seq_pos)
+            blackwell::kernels::attention_decode_batched_gqa_device(
+                S.d_attn, S.d_Q,
+                S.d_kc, S.d_vc, S.d_seq_pos,
+                nqh, nkv, hd, MAXSEQ, M,
+                (size_t)NL * nkv * MAXSEQ * hd, kv_off, gs);
+            
+            // Wo projection (batched)
+            if (M == 1) {
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_proj, (const uint8_t*)S.d_attn_i4, S.d_attn_i4_sc,
+                    W[l].o.d, W[l].o.sc16, Q, H, gs);
+            } else {
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
+                    W[l].o.d, W[l].o.sc16, Q, H, M, gs);
+            }
+            // Residual add
+            blackwell::kernels::vector_add_fp32(
+                S.d_x32, S.d_proj, S.d_residual, H, gs);
+            cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
+                           cudaMemcpyDeviceToDevice, gs);
+            
+            // Pre-MLP norm + quantize (batched)
+            blackwell::kernels::fused_rmsnorm_batched(
+                S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, gs);
+            blackwell::kernels::quantize_int4_batched(
+                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            
+            // MLP gate + up (batched)
+            if (M == 1) {
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_gate, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].g.d, W[l].g.sc16, H, I, gs);
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_up, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                    W[l].u.d, W[l].u.sc16, H, I, gs);
+            } else {
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_gate, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].g.d, W[l].g.sc16, H, I, M, gs);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_up, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].u.d, W[l].u.sc16, H, I, M, gs);
+            }
+            
+            // SwiGLU
+            blackwell::kernels::apply_swiglu(S.d_gate, S.d_gate, S.d_up, I, gs);
+            // Quantize MLP output (batched)
+            blackwell::kernels::quantize_int4_batched(
+                S.d_mlp_i4, S.d_mlp_i4_sc, S.d_gate, I, M, gs);
+            
+            // Down projection (batched)
+            if (M == 1) {
+                blackwell::kernels::gemv_int4_warp_f16wsc(
+                    S.d_proj, (const uint8_t*)S.d_mlp_i4, S.d_mlp_i4_sc,
+                    W[l].d.d, W[l].d.sc16, I, H, gs);
+            } else {
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
+                    W[l].d.d, W[l].d.sc16, I, H, M, gs);
+            }
+            // Final residual add
+            blackwell::kernels::vector_add_fp32(
+                S.d_x32, S.d_proj, S.d_residual, H, gs);
+        }
+        
+        // Final norm + lm_head
+        blackwell::kernels::fused_rmsnorm_batched(
+            S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, gs);
+        // Final norm + lm_head
+        blackwell::kernels::fused_rmsnorm_batched(
+            S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, gs);
+        blackwell::kernels::quantize_int4_batched(
+            S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+        if (M == 1) {
+            blackwell::kernels::gemv_int4_warp_f16wsc(
+                S.d_logits, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,
+                lm_head_w.d, lm_head_w.sc16, H, V, gs);
+        } else {
+            blackwell::kernels::gemv_int4_batched_f16wsc(
+                S.d_logits, S.d_x_i4, S.d_x_i4_sc,
+                lm_head_w.d, lm_head_w.sc16, H, V, M, gs);
+        }
+        
+        cudaError_t cerr = cudaStreamEndCapture(gs, &graph);
+        if (cerr != cudaSuccess) {
+            printf("FAIL graph capture: %s\n", cudaGetErrorString(cerr));
+            cudaStreamDestroy(gs);
+            use_graph = false;
+        } else {
+            size_t num_nodes = 0;
+            cudaGraphGetNodes(graph, NULL, &num_nodes);
+            printf("  CUDA Graph: %zu nodes captured\n", num_nodes);
+            
+            cerr = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+            if (cerr != cudaSuccess) {
+                printf("FAIL graph instantiate: %s\n", cudaGetErrorString(cerr));
+                cudaGraphDestroy(graph);
+                graph = nullptr;
+                use_graph = false;
+            }
+            cudaStreamDestroy(gs);
+        }
+    }
+    
     // Decode loop - process all sequences step by step
     int max_steps = max_new + *std::max_element(gen_start.begin(), gen_start.end());
     
@@ -240,121 +448,137 @@ static void generate_batch(
                            cudaMemcpyHostToDevice, S.st);
         }
         
-        // 36-layer decode (batched kernels where possible)
-        for (int l = 0; l < NL; ++l) {
-            // Save residual for all sequences (single large copy)
-            cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
-                           cudaMemcpyDeviceToDevice, S.st);
+        if (use_graph && M == 1) {
+            // ── CUDA Graph replay ──────────────────────────────────────
+            // Update seq_pos: write to pinned memory, async copy to device
+            *S.h_seq_pos_pinned = step;
+            cudaMemcpyAsync(S.d_seq_pos, S.h_seq_pos_pinned, sizeof(int), cudaMemcpyHostToDevice, S.st);
             
-            // Pre-attention norm + quantize (batched)
-            blackwell::kernels::fused_rmsnorm_batched(
-                S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, S.st);
-            blackwell::kernels::quantize_int4_batched(
-                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
-            
-            // QKV projections (single batched GEMV each)
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_Q, S.d_x_i4, S.d_x_i4_sc,
-                W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_K, S.d_x_i4, S.d_x_i4_sc,
-                W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_V, S.d_x_i4, S.d_x_i4_sc,
-                W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
-            
-            // Q/K head norms + RoPE (per-sequence — cheap ops, different rope_pos per seq)
-            for (int m = 0; m < M; ++m) {
-                int rope_pos = (step >= gen_start[m] - 1) ? gen_start[m] - 1 + seq_pos[m] : step;
-                head_norm_kernel<<<nqh, 128, 0, S.st>>>(S.d_Q + m * Q, W[l].qn, nqh, hd, eps);
-                head_norm_kernel<<<nkv, 128, 0, S.st>>>(S.d_K + m * KV, W[l].kn, nkv, hd, eps);
-                apply_rope_kernel<<<nqh, hd/2, 0, S.st>>>(S.d_Q + m * Q, nqh, hd, rope_pos);
-                apply_rope_kernel<<<nkv, hd/2, 0, S.st>>>(S.d_K + m * KV, nkv, hd, rope_pos);
-            }
-            
-            // KV cache update (per-sequence — kernel only supports batch_idx=0)
-            size_t l_kv_off = (size_t)l * nkv * MAXSEQ * hd;
-            for (int m = 0; m < M; ++m) {
-                size_t kv_off = (size_t)m * NL * nkv * MAXSEQ * hd + l_kv_off;
-                blackwell::kernels::update_kv_cache(
-                    S.d_kc + kv_off, S.d_vc + kv_off,
-                    S.d_K + m * KV, S.d_V + m * KV,
-                    0, step, nkv, hd, MAXSEQ, S.st);
+            // Launch graph (full 36-layer decode)
+            cudaGraphLaunch(graph_exec, S.st);
+            cudaStreamSynchronize(S.st);
+        } else {
+            // ── Per-kernel path (original) ─────────────────────────────
+            for (int l = 0; l < NL; ++l) {
+                // Save residual for all sequences (single large copy)
+                cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
+                               cudaMemcpyDeviceToDevice, S.st);
+                
+                // Pre-attention norm + quantize (batched)
+                blackwell::kernels::fused_rmsnorm_batched(
+                    S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, S.st);
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                
+                // QKV projections (single batched GEMV each)
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_Q, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].q.d, W[l].q.sc16, H, Q, M, S.st);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_K, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].k.d, W[l].k.sc16, H, KV, M, S.st);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_V, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].v.d, W[l].v.sc16, H, KV, M, S.st);
+                
+                // Q/K head norms + RoPE (per-sequence)
+                for (int m = 0; m < M; ++m) {
+                    int rope_pos = (step >= gen_start[m] - 1) ? gen_start[m] - 1 + seq_pos[m] : step;
+                    head_norm_kernel<<<nqh, 128, 0, S.st>>>(S.d_Q + m * Q, W[l].qn, nqh, hd, eps);
+                    head_norm_kernel<<<nkv, 128, 0, S.st>>>(S.d_K + m * KV, W[l].kn, nkv, hd, eps);
+                    apply_rope_kernel<<<nqh, hd/2, 0, S.st>>>(S.d_Q + m * Q, nqh, hd, rope_pos);
+                    apply_rope_kernel<<<nkv, hd/2, 0, S.st>>>(S.d_K + m * KV, nkv, hd, rope_pos);
                 }
-            
-            // Attention — per-sequence (batched M>2 non-deterministic)
-            for (int m = 0; m < M; ++m) {
-                size_t m_kv_off = (size_t)m * NL * nkv * MAXSEQ * hd;
-                blackwell::kernels::attention_decode_batched_gqa(
-                    S.d_attn + m * Q, S.d_Q + m * Q,
-                    S.d_kc + m_kv_off, S.d_vc + m_kv_off,
-                    step, nqh, nkv, hd, MAXSEQ, 1,
-                    (size_t)nkv * MAXSEQ * hd, l_kv_off, S.st);
+                
+                // KV cache update (per-sequence)
+                size_t l_kv_off = (size_t)l * nkv * MAXSEQ * hd;
+                for (int m = 0; m < M; ++m) {
+                    size_t kv_off = (size_t)m * NL * nkv * MAXSEQ * hd + l_kv_off;
+                    blackwell::kernels::update_kv_cache(
+                        S.d_kc + kv_off, S.d_vc + kv_off,
+                        S.d_K + m * KV, S.d_V + m * KV,
+                        0, step, nkv, hd, MAXSEQ, S.st);
+                }
+                
+                // Attention — per-sequence
+                for (int m = 0; m < M; ++m) {
+                    size_t m_kv_off = (size_t)m * NL * nkv * MAXSEQ * hd;
+                    blackwell::kernels::attention_decode_batched_gqa(
+                        S.d_attn + m * Q, S.d_Q + m * Q,
+                        S.d_kc + m_kv_off, S.d_vc + m_kv_off,
+                        step, nqh, nkv, hd, MAXSEQ, 1,
+                        (size_t)nkv * MAXSEQ * hd, l_kv_off, S.st);
+                }
+                
+                // Wo projection (batched)
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_attn_i4, S.d_attn_i4_sc, S.d_attn, Q, M, S.st);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
+                    W[l].o.d, W[l].o.sc16, Q, H, M, S.st);
+                // Residual add (per-sequence)
+                for (int m = 0; m < M; ++m) {
+                    blackwell::kernels::vector_add_fp32(
+                        S.d_x32 + m * H, S.d_proj + m * H, S.d_residual + m * H, H, S.st);
+                }
+                cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
+                               cudaMemcpyDeviceToDevice, S.st);
+                
+                // Pre-MLP norm + quantize (batched)
+                blackwell::kernels::fused_rmsnorm_batched(
+                    S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, S.st);
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                
+                // MLP gate + up (batched)
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_gate, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].g.d, W[l].g.sc16, H, I, M, S.st);
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_up, S.d_x_i4, S.d_x_i4_sc,
+                    W[l].u.d, W[l].u.sc16, H, I, M, S.st);
+                
+                // SwiGLU (per-sequence)
+                for (int m = 0; m < M; ++m) {
+                    blackwell::kernels::apply_swiglu(S.d_gate + m * I, S.d_gate + m * I, S.d_up + m * I, I, S.st);
+                }
+                // Quantize MLP output (batched)
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_mlp_i4, S.d_mlp_i4_sc, S.d_gate, I, M, S.st);
+                
+                // Down projection (batched)
+                blackwell::kernels::gemv_int4_batched_f16wsc(
+                    S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
+                    W[l].d.d, W[l].d.sc16, I, H, M, S.st);
+                // Final residual add (per-sequence)
+                for (int m = 0; m < M; ++m) {
+                    blackwell::kernels::vector_add_fp32(
+                        S.d_x32 + m * H, S.d_proj + m * H, S.d_residual + m * H, H, S.st);
+                }
             }
             
-            // Wo projection (batched)
-            blackwell::kernels::quantize_int4_batched(
-                S.d_attn_i4, S.d_attn_i4_sc, S.d_attn, Q, M, S.st);
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_proj, S.d_attn_i4, S.d_attn_i4_sc,
-                W[l].o.d, W[l].o.sc16, Q, H, M, S.st);
-            // Residual add (per-sequence — no batched vector_add)
-            for (int m = 0; m < M; ++m) {
-                blackwell::kernels::vector_add_fp32(
-                    S.d_x32 + m * H, S.d_proj + m * H, S.d_residual + m * H, H, S.st);
-            }
-            cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
-                           cudaMemcpyDeviceToDevice, S.st);
-            
-            // Pre-MLP norm + quantize (batched)
-            blackwell::kernels::fused_rmsnorm_batched(
-                S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, S.st);
-            blackwell::kernels::quantize_int4_batched(
-                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
-            
-            // MLP gate + up (batched)
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_gate, S.d_x_i4, S.d_x_i4_sc,
-                W[l].g.d, W[l].g.sc16, H, I, M, S.st);
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_up, S.d_x_i4, S.d_x_i4_sc,
-                W[l].u.d, W[l].u.sc16, H, I, M, S.st);
-            
-            // SwiGLU (per-sequence — no batched version)
-            for (int m = 0; m < M; ++m) {
-                blackwell::kernels::apply_swiglu(S.d_gate + m * I, S.d_gate + m * I, S.d_up + m * I, I, S.st);
-            }
-            // Quantize MLP output (batched)
-            blackwell::kernels::quantize_int4_batched(
-                S.d_mlp_i4, S.d_mlp_i4_sc, S.d_gate, I, M, S.st);
-            
-            // Down projection (batched)
-            blackwell::kernels::gemv_int4_batched_f16wsc(
-                S.d_proj, S.d_mlp_i4, S.d_mlp_i4_sc,
-                W[l].d.d, W[l].d.sc16, I, H, M, S.st);
-            // Final residual add (per-sequence)
-            for (int m = 0; m < M; ++m) {
-                blackwell::kernels::vector_add_fp32(
-                    S.d_x32 + m * H, S.d_proj + m * H, S.d_residual + m * H, H, S.st);
+            // Final norm + lm_head
+            {
+                int min_gen = *std::min_element(gen_start.begin(), gen_start.end());
+                if (step >= min_gen - 1) {
+                    // Batched final norm + quantize + lm_head
+                    blackwell::kernels::fused_rmsnorm_batched(
+                        S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
+                    blackwell::kernels::quantize_int4_batched(
+                        S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                    blackwell::kernels::gemv_int4_batched_f16wsc(
+                        S.d_logits, S.d_x_i4, S.d_x_i4_sc,
+                        lm_head_w.d, lm_head_w.sc16, H, V, M, S.st);
+                }
             }
         }
         
-        // Final norm + lm_head + sampling when any sequence is generating
+        // Sampling (always per-kernel, outside graph)
         {
             int min_gen = *std::min_element(gen_start.begin(), gen_start.end());
             if (step >= min_gen - 1) {
-                // Batched final norm + quantize + lm_head
-                blackwell::kernels::fused_rmsnorm_batched(
-                    S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
-                blackwell::kernels::quantize_int4_batched(
-                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
-                blackwell::kernels::gemv_int4_batched_f16wsc(
-                    S.d_logits, S.d_x_i4, S.d_x_i4_sc,
-                    lm_head_w.d, lm_head_w.sc16, H, V, M, S.st);
-                // Per-sequence sampling (only for sequences at generation stage)
                 for (int m = 0; m < M; ++m) {
                     if (step >= gen_start[m] - 1) {
-                        // Repetition penalty
                         if (rep_pen > 1.0f) {
                             int num_recent = (int)all_ids[m].size() - gen_start[m];
                             if (num_recent > 0) {
@@ -381,7 +605,6 @@ static void generate_batch(
             if (step >= gen_start[m] - 1) {
                 cudaMemcpy(&next_ids[m], S.d_next_id + m, 4, cudaMemcpyDeviceToHost);
                 all_ids[m].push_back(next_ids[m]);
-
             }
         }
         
@@ -392,7 +615,7 @@ static void generate_batch(
             }
         }
         
-        // Check for EOS (only for sequences that have started generating)
+        // Check for EOS
         bool all_done = true;
         for (int m = 0; m < M; ++m) {
             if (step >= gen_start[m] - 1) {
@@ -400,7 +623,6 @@ static void generate_batch(
                     all_done = false;
                 }
             } else {
-                // Sequence hasn't started generating yet, not done
                 all_done = false;
             }
         }
@@ -409,6 +631,10 @@ static void generate_batch(
     
     auto t_end = std::chrono::high_resolution_clock::now();
     float ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    
+    // Cleanup graph
+    if (graph_exec) cudaGraphExecDestroy(graph_exec);
+    if (graph) cudaGraphDestroy(graph);
     
     // Output
     for (int m = 0; m < M; ++m) {
@@ -430,14 +656,28 @@ int main(int argc, char** argv) {
     const char* prompt = "The capital of France is";
     int M = 4;
     int max_new = 20;
+    bool use_graph = false;
     
-    if (argc >= 2) prompt = argv[1];
-    if (argc >= 3) M = atoi(argv[2]);
-    if (argc >= 4) max_new = atoi(argv[3]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--graph") == 0) {
+            use_graph = true;
+        } else if (prompt == argv[1] || i > 1) {
+            // positional args
+            if (i == 1) prompt = argv[1];
+            else if (i == 2) M = atoi(argv[2]);
+            else if (i == 3) max_new = atoi(argv[3]);
+        }
+    }
+    // Re-parse positional args (skip --graph)
+    int pos = 1;
+    if (argc > 1 && strcmp(argv[1], "--graph") == 0) pos = 2;
+    if (argc > pos) prompt = argv[pos];
+    if (argc > pos+1) M = atoi(argv[pos+1]);
+    if (argc > pos+2) max_new = atoi(argv[pos+2]);
     const char* wdir = "weights_int4_qwen3_8b";
-    if (argc >= 5) wdir = argv[4];
+    if (argc > pos+3) wdir = argv[pos+3];
     
-    printf("# Batched INT4 8B — %d sequences\n", M);
+    printf("# Batched INT4 8B — %d sequences%s\n", M, use_graph ? " (CUDA Graph)" : "");
     printf("  Weights: %s\n", wdir);
     printf("  Prompt: \"%s\"\n", prompt);
     
@@ -545,7 +785,7 @@ int main(int argc, char** argv) {
     cudaMemcpy(S.d_fn, d_fn, H * 4, cudaMemcpyDeviceToDevice);
     
     float rep_pen = 1.3f;  // Repetition penalty (1.0=disabled, 1.3=moderate)
-    generate_batch(S, prompts, max_new, 0.0f, 0, rep_pen, W, lm_head_w, host_embed_d, host_embed_sc, tokenizer);
+    generate_batch(S, prompts, max_new, 0.0f, 0, rep_pen, W, lm_head_w, host_embed_d, host_embed_sc, tokenizer, use_graph);
     
     free_buffers(S);
     return 0;
