@@ -325,6 +325,8 @@ weights_int4_qwen3_8b/            # 8B INT4 symmetric weights + norms, FP32 scal
 weights_int4_qwen3_8b_fp16sc/     # 8B INT4 weights, FP16 scales (4.8 GB, PPL 24.39, +32% M=1 t/s) — PRODUCTION v0.12
 weights_int4_qwen3_8b_awq_perlayer/ # 8B INT4 AWQ per-layer α, FP32 scales (6.1 GB, PPL 21.98)
 weights_int4_qwen3_8b_awq_perlayer_fp16sc/ # 8B INT4 AWQ per-layer α, FP16 scales (5.1 GB, PPL 21.98) — BEST QUALITY v0.12.3
+weights_int4_qwen3_8b_awq_wikitext/ # 8B INT4 AWQ per-layer α, WikiText-2 corpus, FP32 (5.7 GB, PPL 21.98)
+weights_int4_qwen3_8b_awq_wikitext_fp16sc/ # 8B INT4 AWQ per-layer α, WikiText-2 corpus, FP16 (4.7 GB, PPL 21.98)
 weights_int8_qwen3_8b_mixed/  # 8B mixed: 8 FP16 + 28 INT8 (same quality as all-INT8)
 weights_int8_qwen3_8b_all_int8/ # 8B pure INT8 copy
 weights_int8_qwen35_9b/        # 9B GatedDeltaNet INT8 (11 GB)
@@ -404,6 +406,7 @@ Qwen3-1.7B actual config: **nqh=16, nkv=8, hd=128, KV=1024** (NOT nqh=32, nkv=4,
 | Best alpha (fixed) | **0.6** (PPL 21.82 vs 23.52, 7.2% improvement) |
 | Best alpha (per-layer search) | **mean=0.416, min=0.000, max=0.950** across 252 (layer,submodule) pairs |
 | Method | Random normal proxy (128 seq), per-layer MSE grid search (20 ratios) |
+| Real calibration data | WikiText-2 (128 seq, 106K tokens via tokenize_corpus) — PPL 21.98, same as random proxy. Activation stats similar between random normal and real text after RMSNorm. Random proxy sufficient. |
 | Scale integration | Folded into block scales `w_sc_new[n] = w_sc[n] * s[n]`, no kernel changes |
 | FP16 scales path | Write FP32 first, then `convert_scales_fp16.py` — avoids direct FP16 write bug |
 | Script | `scripts/quantize_awq_int4_8b.py` |
