@@ -298,8 +298,7 @@ static std::vector<uint32_t> generate_one(
         }
 
         if (step >= gen_start - 1) {
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
-            die(blackwell::kernels::quantize_int4(d_x_i4, d_x_i4_sc, d_xi_f, H, st), "q_fn");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,d_fn,H,eps,st),"fn_q");
             die(blackwell::kernels::gemv_int4_batched_f16wsc(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc16, H, V, 1, st), "lm_head");
             
             // Repetition penalty

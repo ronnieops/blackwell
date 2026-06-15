@@ -282,11 +282,16 @@ static void generate_batch(
             cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
                            cudaMemcpyDeviceToDevice, gs);
             
-            // Pre-attention norm + quantize (batched)
-            blackwell::kernels::fused_rmsnorm_batched(
-                S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, gs);
-            blackwell::kernels::quantize_int4_batched(
-                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            // Pre-attention norm + quantize (fused, M=1 only)
+            if (M == 1) {
+                blackwell::kernels::fused_rmsnorm_quant_int4(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_x32, W[l].rn_in, H, eps, gs);
+            } else {
+                blackwell::kernels::fused_rmsnorm_batched(
+                    S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, gs);
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            }
             
             // QKV projections (fused: 1 kernel launch vs 3)
             blackwell::kernels::fused_qkv_int4_f16wsc(
@@ -334,11 +339,16 @@ static void generate_batch(
             cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
                            cudaMemcpyDeviceToDevice, gs);
             
-            // Pre-MLP norm + quantize (batched)
-            blackwell::kernels::fused_rmsnorm_batched(
-                S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, gs);
-            blackwell::kernels::quantize_int4_batched(
-                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            // Pre-MLP norm + quantize (fused, M=1 only)
+            if (M == 1) {
+                blackwell::kernels::fused_rmsnorm_quant_int4(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_x32, W[l].rn_post, H, eps, gs);
+            } else {
+                blackwell::kernels::fused_rmsnorm_batched(
+                    S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, gs);
+                blackwell::kernels::quantize_int4_batched(
+                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+            }
             
             // MLP gate + up (batched, fused)
             blackwell::kernels::fused_gate_up_int4_f16wsc(
@@ -367,12 +377,16 @@ static void generate_batch(
                 S.d_x32, S.d_proj, S.d_residual, H, gs);
         }
         
-        // Final norm + lm_head
-        blackwell::kernels::fused_rmsnorm_batched(
-            S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, gs);
-        // Final norm + lm_head
-        blackwell::kernels::fused_rmsnorm_batched(
-            S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, gs);
+        // Final norm + lm_head (fused norm+quant for M=1)
+        if (M == 1) {
+            blackwell::kernels::fused_rmsnorm_quant_int4(
+                S.d_x_i4, S.d_x_i4_sc, S.d_x32, S.d_fn, H, eps, gs);
+        } else {
+            blackwell::kernels::fused_rmsnorm_batched(
+                S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, gs);
+            blackwell::kernels::quantize_int4_batched(
+                S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
+        }
         blackwell::kernels::quantize_int4_batched(
             S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, gs);
         if (M == 1) {
@@ -438,11 +452,16 @@ static void generate_batch(
                 cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
                                cudaMemcpyDeviceToDevice, S.st);
                 
-                // Pre-attention norm + quantize (batched)
-                blackwell::kernels::fused_rmsnorm_batched(
-                    S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, S.st);
-                blackwell::kernels::quantize_int4_batched(
-                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                // Pre-attention norm + quantize (fused for M=1)
+                if (M == 1) {
+                    blackwell::kernels::fused_rmsnorm_quant_int4(
+                        S.d_x_i4, S.d_x_i4_sc, S.d_x32, W[l].rn_in, H, eps, S.st);
+                } else {
+                    blackwell::kernels::fused_rmsnorm_batched(
+                        S.d_xi_f, S.d_x32, W[l].rn_in, H, eps, M, S.st);
+                    blackwell::kernels::quantize_int4_batched(
+                        S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                }
                 
                 // QKV projections (fused: 1 kernel launch vs 3)
                 blackwell::kernels::fused_qkv_int4_f16wsc(
@@ -502,11 +521,16 @@ static void generate_batch(
                 cudaMemcpyAsync(S.d_residual, S.d_x32, (size_t)M * H * 4,
                                cudaMemcpyDeviceToDevice, S.st);
                 
-                // Pre-MLP norm + quantize (batched)
-                blackwell::kernels::fused_rmsnorm_batched(
-                    S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, S.st);
-                blackwell::kernels::quantize_int4_batched(
-                    S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                // Pre-MLP norm + quantize (fused for M=1)
+                if (M == 1) {
+                    blackwell::kernels::fused_rmsnorm_quant_int4(
+                        S.d_x_i4, S.d_x_i4_sc, S.d_x32, W[l].rn_post, H, eps, S.st);
+                } else {
+                    blackwell::kernels::fused_rmsnorm_batched(
+                        S.d_xi_f, S.d_x32, W[l].rn_post, H, eps, M, S.st);
+                    blackwell::kernels::quantize_int4_batched(
+                        S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                }
                 
                 // MLP gate + up (batched, fused)
                 blackwell::kernels::fused_gate_up_int4_f16wsc(
@@ -543,11 +567,16 @@ static void generate_batch(
             {
                 int min_gen = *std::min_element(gen_start.begin(), gen_start.end());
                 if (step >= min_gen - 1) {
-                    // Batched final norm + quantize + lm_head
-                    blackwell::kernels::fused_rmsnorm_batched(
-                        S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
-                    blackwell::kernels::quantize_int4_batched(
-                        S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                    // Batched final norm + quantize (fused for M=1)
+                    if (M == 1) {
+                        blackwell::kernels::fused_rmsnorm_quant_int4(
+                            S.d_x_i4, S.d_x_i4_sc, S.d_x32, S.d_fn, H, eps, S.st);
+                    } else {
+                        blackwell::kernels::fused_rmsnorm_batched(
+                            S.d_xi_f, S.d_x32, S.d_fn, H, eps, M, S.st);
+                        blackwell::kernels::quantize_int4_batched(
+                            S.d_x_i4, S.d_x_i4_sc, S.d_xi_f, H, M, S.st);
+                    }
                     if (M == 1) {
                         blackwell::kernels::gemv_int4_warp_f16wsc(
                             S.d_logits, (const uint8_t*)S.d_x_i4, S.d_x_i4_sc,

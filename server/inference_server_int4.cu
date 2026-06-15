@@ -331,8 +331,7 @@ static void decode_one_token(uint32_t token_id, int step) {
         // ── Per-kernel path ──
         for (int l = 0; l < NL; ++l) {
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
-            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_in,H,eps,st),"rn_q_in");
             die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q, d_K, d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, 1, st), "qkv");
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
             head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
@@ -346,8 +345,7 @@ static void decode_one_token(uint32_t token_id, int step) {
             die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, st), "o_proj");
             die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
             die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
-            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
-            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
+            die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_post,H,eps,st),"rn_q_post");
             die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate, d_up, d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, 1, st), "gate_up");
             blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
             die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
@@ -375,8 +373,7 @@ static void capture_decode_graph() {
 
         // All kernels use the same global buffers (d_x32, d_Q, etc.)
         cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
-        blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, gs);
-        blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
+        blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_in,H,eps,gs);
         blackwell::kernels::fused_qkv_int4_f16wsc(d_Q, d_K, d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, W[l].k.d, W[l].k.sc16, W[l].v.d, W[l].v.sc16, H, Q, KV, 1, gs);
         head_norm_kernel<<<nqh,128,0,gs>>>(d_Q, W[l].qn, nqh, hd, eps);
         head_norm_kernel<<<nkv,128,0,gs>>>(d_K, W[l].kn, nkv, hd, eps);
@@ -389,8 +386,7 @@ static void capture_decode_graph() {
         blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, gs);
         blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, gs);
         cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
-        blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, gs);
-        blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
+        blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_post,H,eps,gs);
         blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate, d_up, d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, W[l].u.d, W[l].u.sc16, H, I, 1, gs);
         blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, gs);
         blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, gs);
@@ -637,8 +633,7 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
         decode_one_token(tid, step);
 
         // lm_head + sampling
-        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, d_fn, H, eps, st), "fn");
-        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_lm");
+        die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,d_fn,H,eps,st),"fn_q");
         die(blackwell::kernels::gemv_int4_batched_f16wsc(d_logits, (const uint8_t*)d_x_i4, d_x_i4_sc, lm_head_w.d, lm_head_w.sc16, H, V, 1, st), "lm_head");
 
         // Repetition penalty
