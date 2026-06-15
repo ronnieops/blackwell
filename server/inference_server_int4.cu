@@ -108,6 +108,18 @@ static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
     }
 }
 
+static void build_rope_cache(float* cos_cache, float* sin_cache, int max_seq, int head_dim) {
+    int pairs = head_dim / 2;
+    float rope_theta = 1000000.0f;
+    for (int pos = 0; pos < max_seq; ++pos) {
+        for (int d = 0; d < pairs; ++d) {
+            float theta = (float)pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);
+            cos_cache[pos * pairs + d] = cosf(theta);
+            sin_cache[pos * pairs + d] = sinf(theta);
+        }
+    }
+}
+
 // ── JSON helpers ──
 static std::string json_escape(const std::string& s);
 
@@ -168,6 +180,14 @@ static float *d_proj, *d_gate, *d_up;
 static uint8_t *d_mlp_i4; static float *d_mlp_i4_sc;
 static float *d_fn, *d_kc, *d_vc, *d_logits;
 static int *d_next_id, *d_recent;
+// CUDA Graph support
+static int* d_seq_pos;
+static int* h_seq_pos_pinned;
+static float* d_cos_cache;
+static float* d_sin_cache;
+static cudaGraph_t graph_decode;
+static cudaGraphExec_t graph_exec_decode;
+static bool graph_captured = false;
 // Batched decode buffers (M=1-8)
 static float *d_x32_batch;   // [MAX_BATCH][H]
 static float *d_xi_f_batch;   // [MAX_BATCH][H]
@@ -274,6 +294,20 @@ static void alloc_buffers() {
     AL(d_V_batch_prefill, (size_t)MAX_BATCH * KV * 4);
     // Attention output buffer for prefill (M × Q)
     AL(d_attn_batch_prefill, (size_t)MAX_BATCH * Q * 4);
+    // CUDA Graph buffers
+    AL(d_seq_pos, sizeof(int));
+    cudaHostAlloc(&h_seq_pos_pinned, sizeof(int), cudaHostAllocDefault);
+    {
+        int rope_pairs = hd / 2;
+        AL(d_cos_cache, (size_t)MAXSEQ * rope_pairs * 4);
+        AL(d_sin_cache, (size_t)MAXSEQ * rope_pairs * 4);
+        std::vector<float> cos_h(MAXSEQ * rope_pairs);
+        std::vector<float> sin_h(MAXSEQ * rope_pairs);
+        build_rope_cache(cos_h.data(), sin_h.data(), MAXSEQ, hd);
+        cudaMemcpy(d_cos_cache, cos_h.data(), (size_t)MAXSEQ * rope_pairs * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_sin_cache, sin_h.data(), (size_t)MAXSEQ * rope_pairs * 4, cudaMemcpyHostToDevice);
+    }
+    graph_captured = false;
     float iv7=1.f/7.f;
     { std::vector<float> tmp(H/16,iv7); cudaMemcpy(d_x_i4_sc,tmp.data(),(H/16)*4,cudaMemcpyHostToDevice); }
     { std::vector<float> tmp(Q/16,iv7); cudaMemcpy(d_attn_i4_sc,tmp.data(),(Q/16)*4,cudaMemcpyHostToDevice); }
@@ -288,34 +322,109 @@ static void decode_one_token(uint32_t token_id, int step) {
     dequant_embed_row(h_embed.data(), token_id, host_embed_d, host_embed_sc, H);
     die(cudaMemcpyAsync(d_x32, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed");
 
-    for (int l = 0; l < NL; ++l) {
-        die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
-        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
-        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, st), "q_proj");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, st), "k_proj");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, st), "v_proj");
-        head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
-        head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
-        apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step);
-        apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K, nkv, hd, step);
-        size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
-        die(blackwell::kernels::update_kv_cache(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, step, nkv, hd, MAXSEQ, st), "kv");
-        die(blackwell::kernels::attention_decode_batched_gqa(d_attn, d_Q, d_kc, d_vc, step, nqh, nkv, hd, MAXSEQ, 1,
-            (size_t)NL*nkv*MAXSEQ*hd, kv_off, st), "attn");
-        die(blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, st), "quant_attn");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, st), "o_proj");
-        die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
-        die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
-        die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
-        die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, st), "gate");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, st), "up");
-        blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
-        die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
-        die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, st), "down");
-        die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "mlp_res");
+    if (graph_captured) {
+        // ── CUDA Graph replay ──
+        *h_seq_pos_pinned = step;
+        cudaMemcpyAsync(d_seq_pos, h_seq_pos_pinned, sizeof(int), cudaMemcpyHostToDevice, st);
+        cudaGraphLaunch(graph_exec_decode, st);
+    } else {
+        // ── Per-kernel path ──
+        for (int l = 0; l < NL; ++l) {
+            die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res");
+            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, st), "rmsnorm_in");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_in");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, st), "q_proj");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, st), "k_proj");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, st), "v_proj");
+            head_norm_kernel<<<nqh,128,0,st>>>(d_Q, W[l].qn, nqh, hd, eps);
+            head_norm_kernel<<<nkv,128,0,st>>>(d_K, W[l].kn, nkv, hd, eps);
+            apply_rope_kernel<<<nqh,hd/2,0,st>>>(d_Q, nqh, hd, step);
+            apply_rope_kernel<<<nkv,hd/2,0,st>>>(d_K, nkv, hd, step);
+            size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
+            die(blackwell::kernels::update_kv_cache(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, step, nkv, hd, MAXSEQ, st), "kv");
+            die(blackwell::kernels::attention_decode_batched_gqa(d_attn, d_Q, d_kc, d_vc, step, nqh, nkv, hd, MAXSEQ, 1,
+                (size_t)NL*nkv*MAXSEQ*hd, kv_off, st), "attn");
+            die(blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, st), "quant_attn");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, st), "o_proj");
+            die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "attn_res");
+            die(cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, st), "save_res2");
+            die(blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, st), "rmsnorm_post");
+            die(blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, st), "quant_mlp_in");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, st), "gate");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_up,   (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, st), "up");
+            blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, st);
+            die(blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, st), "quant_mlp");
+            die(blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, st), "down");
+            die(blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, st), "mlp_res");
+        }
     }
+}
+
+// Capture CUDA Graph for decode loop (one token through all layers)
+// Must be called after prefill (KV cache populated). Graph captures the full
+// 36-layer decode with device-side seq_pos. Between replays, update seq_pos
+// via pinned host memory.
+static void capture_decode_graph() {
+    cudaStream_t gs;
+    cudaStreamCreate(&gs);
+
+    int capture_pos = 0;
+    cudaMemcpy(d_seq_pos, &capture_pos, sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaStreamBeginCapture(gs, cudaStreamCaptureModeGlobal);
+
+    for (int l = 0; l < NL; ++l) {
+        size_t kv_off = (size_t)l * nkv * MAXSEQ * hd;
+
+        // All kernels use the same global buffers (d_x32, d_Q, etc.)
+        cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
+        blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_in, H, eps, gs);
+        blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_Q, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].q.d, W[l].q.sc16, H, Q, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_K, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].k.d, W[l].k.sc16, H, KV, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_V, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].v.d, W[l].v.sc16, H, KV, 1, gs);
+        head_norm_kernel<<<nqh,128,0,gs>>>(d_Q, W[l].qn, nqh, hd, eps);
+        head_norm_kernel<<<nkv,128,0,gs>>>(d_K, W[l].kn, nkv, hd, eps);
+        blackwell::kernels::fused_rope_decode(d_Q, d_cos_cache, d_sin_cache, d_seq_pos, nqh, hd, MAXSEQ, gs);
+        blackwell::kernels::fused_rope_decode(d_K, d_cos_cache, d_sin_cache, d_seq_pos, nkv, hd, MAXSEQ, gs);
+        blackwell::kernels::update_kv_cache_device(d_kc+kv_off, d_vc+kv_off, d_K, d_V, 0, d_seq_pos, nkv, hd, MAXSEQ, gs);
+        blackwell::kernels::attention_decode_batched_gqa_device(d_attn, d_Q, d_kc, d_vc, d_seq_pos, nqh, nkv, hd, MAXSEQ, 1,
+            (size_t)NL*nkv*MAXSEQ*hd, kv_off, gs);
+        blackwell::kernels::quantize_int4_batched(d_attn_i4, d_attn_i4_sc, d_attn, Q, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_attn_i4, d_attn_i4_sc, W[l].o.d, W[l].o.sc16, Q, H, 1, gs);
+        blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, gs);
+        cudaMemcpyAsync(d_res, d_x32, H*4, cudaMemcpyDeviceToDevice, gs);
+        blackwell::kernels::fused_rmsnorm(d_xi_f, d_x32, W[l].rn_post, H, eps, gs);
+        blackwell::kernels::quantize_int4_batched(d_x_i4, d_x_i4_sc, d_xi_f, H, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_gate, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].g.d, W[l].g.sc16, H, I, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_up, (const uint8_t*)d_x_i4, d_x_i4_sc, W[l].u.d, W[l].u.sc16, H, I, 1, gs);
+        blackwell::kernels::apply_swiglu(d_gate, d_gate, d_up, I, gs);
+        blackwell::kernels::quantize_int4_batched(d_mlp_i4, d_mlp_i4_sc, d_gate, I, 1, gs);
+        blackwell::kernels::gemv_int4_batched_f16wsc(d_proj, (const uint8_t*)d_mlp_i4, d_mlp_i4_sc, W[l].d.d, W[l].d.sc16, I, H, 1, gs);
+        blackwell::kernels::vector_add_fp32(d_x32, d_proj, d_res, H, gs);
+    }
+
+    cudaError_t cerr = cudaStreamEndCapture(gs, &graph_decode);
+    if (cerr != cudaSuccess) {
+        fprintf(stderr, "FAIL graph capture: %s\n", cudaGetErrorString(cerr));
+        cudaStreamDestroy(gs);
+        return;
+    }
+
+    size_t num_nodes = 0;
+    cudaGraphGetNodes(graph_decode, NULL, &num_nodes);
+    fprintf(stderr, "CUDA Graph: %zu nodes captured\n", num_nodes);
+
+    cerr = cudaGraphInstantiate(&graph_exec_decode, graph_decode, NULL, NULL, 0);
+    if (cerr != cudaSuccess) {
+        fprintf(stderr, "FAIL graph instantiate: %s\n", cudaGetErrorString(cerr));
+        cudaGraphDestroy(graph_decode);
+        cudaStreamDestroy(gs);
+        return;
+    }
+
+    graph_captured = true;
+    cudaStreamDestroy(gs);
 }
 
 // Prefill M prompt tokens through all layers via batched QKV + per-token attention.
@@ -526,6 +635,12 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
     // Long prompts use original per-token decode.
     if (gen_start > 0) {
         prefill_tokens_batched(input_ids, 0, gen_start);
+    }
+
+    // Capture CUDA Graph for decode loop once (after prefill to set KV cache)
+    // Skip if already captured at startup
+    if (!graph_captured) {
+        capture_decode_graph();
     }
 
     // ── Phase 2: Decode — generate new tokens one at a time ──
