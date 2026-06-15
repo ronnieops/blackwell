@@ -105,7 +105,7 @@ and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier
 
 **Prior (v0.11)**: 59 t/s, 5.3 GB. Root cause of pre-v0.9 INT4 failures: `upload_w4` scale buffer bug — allocated 256 floats instead of N×kblocks (38.9M for lm_head).
 
-**CUDA Graph for INT4 (Session 72)**: Captured 867 nodes (36 layers × full decode: QKV→head_norm→RoPE→KV cache→attention→MLP→lm_head). Speedup **2.1%** (64→65 t/s) after replacing H2D memcpy with device-side seq_pos. New graph-safe APIs: `attention_decode_batched_gqa_device()` and `attention_decode_gqa_device()` (no H2D memcpy). Limited by GEMV dominance (92% of runtime). Benchmark: `./bench/decode_int4_cgraph_8b [tokens]`.
+**CUDA Graph for INT4 (Session 72, updated v0.12.4)**: 832 nodes captured in batched bench, +2.4% (66→68 t/s M=1). Device-side seq_pos, graph-safe kernels. `--graph` flag: `./bench/text_generate_int4_batched --graph "prompt" 1 tokens wdir`. Standalone graph bench: `./bench/decode_int4_cgraph_8b [tokens]` (76.5 t/s, warp kernel). M>1 falls through to per-kernel path. Multi-size graph not implemented (per-sequence loops add complexity, per-kernel already exceeds llama.cpp at M=8+).
 
 **Batched INT4 (Session 64/65, updated v0.12)**: M=1: 74 t/s, M=2: 135 t/s, M=4: 178 t/s, M=8: 205 t/s, M=16: 220 t/s (all FP16 scales). v0.11 FP32: M=1: 63, M=8: 119, M=16: 138, M=32: 150, M=48: 154.
 Scales monotonically to M=48 with correct output (no garbage). No M>8 bug — kernel supports M=1-16 via switch, memory supports up to ~M=100.
