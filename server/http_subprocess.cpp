@@ -159,7 +159,7 @@ public:
         struct { const char* key; const char* path; } bin_dirs[] = {
             {"gemma", bin_gemma}, {"9b", bin9b},
             {"batched", bin_int4_batched}, {"llama", bin_llama},
-            {"qwen3", bin_int4}, {"int4", bin_int4},
+            {"qwen3", bin_int4}, {"int4_batched", bin_int4_batched}, {"int4", bin_int4},
         };
         for (auto& d : bin_dirs) { if (strstr(model, d.key)) { bin = d.path; break; } }
 
