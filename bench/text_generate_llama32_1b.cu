@@ -85,6 +85,7 @@ struct LF32 {
     float* qn; float* kn; float* rn_in; float* rn_post;
 };
 
+// Local kernel copies (not yet migrated to shared bench_kernels.h)
 __global__ void head_norm_kernel(float* data, const float* weight, int nh, int hd, float eps) {
     int h=blockIdx.x; if(h>=nh) return;
     float* d=data+h*hd;
@@ -130,7 +131,7 @@ int main(int argc, char** argv) {
     }
     
     cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
-    printf("# Text Generation — Qwen3-1.7B INT4 (GGUF converted)\n");
+    printf("# Text Generation — Llama 3.2 1B INT4 (GGUF converted)\n");
     printf("  Weights: %s\n", wdir);
     printf("  Device: %s\n", P.name);
     printf("  Prompt: \"%s\"%s\n", prompt, chat_mode?" (chat)":"");
@@ -166,7 +167,6 @@ int main(int argc, char** argv) {
     float *d_fn, *d_fn_sc, *d_kc, *d_vc, *d_logits;
     int *d_next_id, *d_recent;
 
-    // const int NL=28; // Qwen3-1.7B — now using global NL=16 for Llama 3.2 1B
     #define AL(p,n){cudaError_t _e=cudaMalloc(&(p),(n));\
         if(_e!=cudaSuccess){printf("FAIL malloc %s: %s\n",#p,cudaGetErrorString(_e));die(_e,#p);}}
     AL(d_x32,H*4);AL(d_xi_f,H*4);AL(d_res,H*4);

@@ -190,7 +190,6 @@ int main(int argc, char** argv) {
             dequant_embed_row(h_embed.data(),next_id,host_embed_d,host_embed_sc,H);
             die(cudaMemcpyAsync(d_x32,h_embed.data(),H*4,cudaMemcpyHostToDevice,st),"embed_cpy");
         }
-        // Print decoded text
         std::string txt=tok.decode(next_id);
         fprintf(stderr,"%s",txt.c_str()); fflush(stderr);
     }

@@ -1,17 +1,13 @@
 // include/blackwell/bench_kernels.h — Shared CUDA kernels for bench files
 //
-// head_norm_kernel: per-head RMSNorm for Q/K after GEMV
-// apply_rope_kernel: in-place RoPE for a single position
-//
-// Avoids 14+ copies of identical code across bench/ and server/ files.
+// Shared head_norm + apply_rope for new bench files.
+// Migration of existing files pending.
 
 #pragma once
 #ifndef BLACKWELL_BENCH_KERNELS_H
 #define BLACKWELL_BENCH_KERNELS_H
 
 #include <cuda_runtime.h>
-#include <cstdio>
-#include <cstdlib>
 #include <cmath>
 
 // ── Per-head RMSNorm ─────────────────────────────────────────────────────
