@@ -247,7 +247,6 @@ int main(int argc, char** argv) {
     printf("All weights loaded.\n\n");
 
     cudaStream_t st;die(cudaStreamCreate(&st),"stream");
-    srand((unsigned)time(nullptr));
 
     std::vector<float> h_embed(H);
     // Clear pending CUDA errors before generation

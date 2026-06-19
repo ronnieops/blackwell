@@ -1,13 +1,4 @@
-# docker-compose.yml — Blackwell v0.13 multi-model inference server
-# Run: docker compose up -d
-# Each model on a different port.
-# Weights directories must be available on host at given paths.
-#
-# For a single model:
-#   docker compose up blackwell-8b-int4
-#
-# All:
-#   docker compose up -d
+# docker-compose.yml — Blackwell v0.13 multi-model. docker compose up -d
 
 services:
   # ── Production: Qwen3-8B INT4 (74 t/s, PPL 21.98) ──────────────────────

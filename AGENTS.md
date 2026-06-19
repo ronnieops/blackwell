@@ -57,7 +57,7 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 
 **14B INT4 quantization (Session 86)**: Qwen3-14B raw INT4 with FP16 scales completed via streaming quantizer (`scripts/quantize_int4_qwen3_14b.py`). Uses torch mmap for BF16→F32 conversion (no memory spike). 645 files, 6.9 GB. Architecture: H=5120, I=17408, NL=40, nqh=40, nkv=8, hd=128, V=151936. SwiGLU MLP, RMSNorm, RoPE theta=1000000. AWQ calibration pending (optional, 8B got PPL 24.39 raw vs 21.98 AWQ).
 
-**Disk cleanup (Session 86)**: Freed ~550 GB from HF cache. Deleted: Gemma4 GGUF variants (21+73+117+46+21+33=311 GB), Qwen3.6 GGUF (109+97=206 GB), unsloth GGUF (5.2+4.7+4.6=14.5 GB), Qwen3-1.7B (3.8 GB), Qwen2.5-0.5B (5.1 GB), Qwen3-8B HF source (16 GB), 30B INT4 weights (18 GB). Remaining: Qwen3-14B safetensors (28 GB), Qwen3-30B-A3B HF source (57 GB), wikitext dataset (15 MB). Disk: 564 GB free (58%).
+**Disk cleanup (Session 86)**: Freed ~550 GB from HF cache. Deleted: Gemma4 GGUF variants (21+73+117+46+21+33=311 GB), Qwen3.6 GGUF (109+97=206 GB), unsloth GGUF (5.2+4.7+4.6=14.5 GB), Qwen3-1.7B (3.8 GB), Qwen2.5-0.5B HF source (5.1 GB deleted; INT4 382 MB re-quantized from GGUF), Qwen3-8B HF source (16 GB), 30B INT4 weights (18 GB). Remaining: Qwen3-14B safetensors (28 GB), Qwen3-30B-A3B HF source (57 GB), wikitext dataset (15 MB). Disk: 564 GB free (58%).
 
 **30B MoE weights deleted**: 18 GB `weights_int4_qwen3_30b_a3b/` removed. Blocked by RAM (needs 55+ GB). HF source (57 GB) kept for future re-quantize.
 
@@ -66,6 +66,7 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 **Gemma4 12B safetensors download**: ~14 GB of ~24 GB downloaded at `/mnt/data/ai/hf/models--google--gemma-4-12B-it/`. Will provide clean FP32 weights for converter-based quantization once complete.
 
 **Version history**:
+- v0.13.1: Qwen2.5-0.5B INT4 bench (482 t/s, garbled), Llama 3.2 1B bench (256 t/s). docker-compose.yml 4-service update. Dead-code cleanup (error_node, orphan dequant_embed_row body).
 - v0.13.0: Docker image pushed (198 MB). 5 model aliases: int4_8b, batched, llama32-3b, int4_14b. Fused kernels + FP16 scales + AWQ. Header 1555→873 lines. Dead code cleanup (25 kernel sources removed, 139→138 symbols). Tagged git v0.13.
 - v0.12.7: 14B INT4 raw quantization complete (6.9 GB, 645 files). Disk cleanup (~550 GB freed).
 - v0.12.1: Fixed multi-block RMSNorm bug in fusion kernels. Wired all 4 fusion sites (3 RMSNorm + 1 SwiGLU). M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better than baseline 23.52!). New unit test bench/test_fused_int4.cu (bit-identical at N=4096/12288).
@@ -340,12 +341,14 @@ docker run --gpus all -p 8080:8080 \
   -v /path/to/weights_llama32_3b:/app/weights_llama32_3b \
   blackwell-server:int4 8080 llama32-3b
 ```
-### Docker compose (multi-model, TBD — docker-compose.yml not yet updated for v0.13)
+### Docker compose (v0.13 — 4 services)
 ```bash
-docker-compose up -d blackwell-1.7b   # port 8081
-docker-compose up -d blackwell-9b    # port 8083
-# Or all three:
-docker-compose up -d
+docker compose up -d blackwell-8b-int4   # port 8081 (production)
+docker compose up -d blackwell-8b-batched # port 8082 (batched M=8)
+docker compose up -d blackwell-llama32-3b # port 8083 (experimental)
+docker compose up -d blackwell-14b-int4   # port 8084 (experimental)
+# Or all:
+docker compose up -d
 ```
 
 ---
