@@ -312,8 +312,6 @@ int main(int argc, char** argv) {
     if (cerr != cudaSuccess) {
         fprintf(stderr, "FAIL capture: %s\n", cudaGetErrorString(cerr));
         // Try to get more info
-        cudaGraphNode_t error_node;
-        cudaGraphExec_t dummy;
         cudaGetLastError();
         return 1;
     }

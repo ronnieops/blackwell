@@ -151,7 +151,7 @@ Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens weights_int
 - **RoPE fix**: GGUF v3 uses nested prefixes (rope.freq_base stored under full repo URL). Fixed by searching for any key ending with the suffix.
 - **Llama 3.2 1B verified**: `bench/text_generate_llama32_1b` — 223 t/s, coherent output. 16L, H=2048, I=8192, nqh=32, nkv=8, hd=64, V=128256, rope_theta=500000. Mixed Q4_K/Q6_K quantization. 262 files, 891 MB.
 - **Llama 3.2 3B INT4**: `bench/text_generate_llama32_3b` — 155 t/s, 28L, H=3072, I=8192, nqh=24, nkv=8, hd=128, V=128256, rope_theta=500000. Server alias `llama32-3b`. Tied embeddings. Garbled output (28-layer INT4 wall).
-- **Qwen2.5-0.5B verified**: 392 files, mixed Q4_K/Q5_0/Q6_K/Q8_0. Config: 24 layers, H=896, I=4864, nqh=14, nkv=2, hd=64.
+- **Qwen2.5-0.5B INT4**: `bench/text_generate_qwen25_0.5b` — 482 t/s, 24L, H=896, I=4864, nqh=14, nkv=2, hd=64, V=151936, rope_theta=1000000. FP16 scales. Garbled output (24-layer INT4 wall).
 - Usage: `./better-inference/gguf_convert model.gguf output_dir/`
 
 **PPL quality (1.7B, WikiText-2, 512 ctx)**

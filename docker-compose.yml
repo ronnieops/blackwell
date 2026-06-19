@@ -1,53 +1,72 @@
-# docker-compose.yml — Blackwell multi-model inference server
+# docker-compose.yml — Blackwell v0.13 multi-model inference server
 # Run: docker compose up -d
 # Each model on a different port.
 # Weights directories must be available on host at given paths.
 #
 # For a single model:
-#   docker compose up blackwell-1.7b
+#   docker compose up blackwell-8b-int4
 #
-# All three:
+# All:
 #   docker compose up -d
 
 services:
-  blackwell-1.7b:
-    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
-    container_name: blackwell-1.7b
+  # ── Production: Qwen3-8B INT4 (74 t/s, PPL 21.98) ──────────────────────
+  blackwell-8b-int4:
+    image: ghcr.io/ronnieops/blackwell-server:int4
+    container_name: blackwell-8b-int4
     ports:
       - "8081:8080"
     volumes:
-      - ./weights_int8_bf16:/app/weights_int8_bf16
+      - ./weights_int4_qwen3_8b_fp16sc:/app/weights_int4_qwen3_8b_fp16sc
       - ./tokenizer_data.bin:/app/tokenizer_data.bin
     environment:
       - CUDA_VISIBLE_DEVICES=0
-    command: ["8080", "1.7b"]
+    command: ["8080", "int4_8b"]
     runtime: nvidia
     restart: unless-stopped
 
-  blackwell-8b:
-    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
-    container_name: blackwell-8b
+  # ── Production: Qwen3-8B INT4 batched (M=8, 7.3 GB) ───────────────────
+  blackwell-8b-batched:
+    image: ghcr.io/ronnieops/blackwell-server:int4
+    container_name: blackwell-8b-batched
     ports:
       - "8082:8080"
     volumes:
-      - ./weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b
+      - ./weights_int4_qwen3_8b_fp16sc:/app/weights_int4_qwen3_8b_fp16sc
       - ./tokenizer_data.bin:/app/tokenizer_data.bin
     environment:
       - CUDA_VISIBLE_DEVICES=0
-    command: ["8080", "8b"]
+      - BATCH_SIZE=8
+      - BATCH_WAIT_MS=2
+    command: ["8080", "batched"]
     runtime: nvidia
     restart: unless-stopped
 
-  blackwell-9b:
-    image: ghcr.io/ronnieops/blackwell-server:v0.7.0
-    container_name: blackwell-9b
+  # ── Experimental: Llama 3.2 3B INT4 (155 t/s, garbled) ────────────────
+  blackwell-llama32-3b:
+    image: ghcr.io/ronnieops/blackwell-server:int4
+    container_name: blackwell-llama32-3b
     ports:
       - "8083:8080"
     volumes:
-      - ./weights_int8_qwen35_9b:/app/weights_int8_qwen35_9b
-      - ./tokenizer_data_9b.bin:/app/tokenizer_data_9b.bin
+      - ./weights_llama32_3b:/app/weights_llama32_3b
     environment:
       - CUDA_VISIBLE_DEVICES=0
-    command: ["8080", "9b"]
+    command: ["8080", "llama32-3b"]
+    runtime: nvidia
+    restart: unless-stopped
+
+  # ── Experimental: Qwen3-14B INT4 (35 t/s, garbled) ─────────────────────
+  blackwell-14b-int4:
+    image: ghcr.io/ronnieops/blackwell-server:int4
+    container_name: blackwell-14b-int4
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./weights_int4_qwen3_14b_fp16sc:/app/weights_int4_qwen3_14b_fp16sc
+      - ./tokenizer_data.bin:/app/tokenizer_data.bin
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: ["8080", "int4_14b"]
     runtime: nvidia
     restart: unless-stopped

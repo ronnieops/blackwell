@@ -107,20 +107,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
 }
-    const float* host_sc, int K)
-{
-    int kblocks=K/16;
-    for(int b=0;b<kblocks;++b){
-        float sc=host_sc[token*kblocks+b];
-        for(int i=0;i<16;++i){
-            size_t byte_idx=(size_t)token*K/2+(size_t)b*8+i/2;
-            uint8_t byte=host_w[byte_idx];
-            int nib=(i&1)?((byte>>4)&0x0F):(byte&0x0F);
-            int val=nib-8;
-            out[b*16+i]=(float)val*sc;
-        }
-    }
-}
 
 int main(int argc, char** argv) {
     const char* prompt = "Once upon a time";
