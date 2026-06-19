@@ -1,118 +1,170 @@
-# Research: INT4 Inference Throughput Optimization — Blackwell RTX 5060 Ti
+# Research: Gemma 4 12B QAT Architecture — FA vs SWA Layer Design
 
 ## Summary
-GEMV dominates at 92.2% of decode runtime; weight loading is the bottleneck. Most optimizations outside GEMV yield <5% gains. Worth implementing: prefill attention (10× prompt speedup), batch processing (v0.8.3 already has M=1-8), and TMA-based weight streaming if GB206 supports it. Not worth: further CUDA Graph effort, MLA attention, PagedAttention, speculative decoding, MPS/MIG, or additional kernel fusion beyond current state.
+
+Gemma 4 12B uses a **hybrid 5:1 attention pattern**: 5 sliding-window (SWA) layers followed by 1 full/global attention (FA) layer, repeated 8 times = 40 SWA + 8 FA across 48 layers. FA layers (at indexes 5,11,17,23,29,35,41,47) use `k_eq_v=True` (K==V, single shared projection, `num_global_key_value_heads=1`, `global_head_dim=512`), while SWA layers use `num_key_value_heads=8`, `local_head_dim=256`, with a separate `v_proj`. FA layers have **double Q heads** (16×512=8192 Q dim) vs SWA's 16×256=4096. RoPE differs: FA uses θ=1e6, SWA uses θ=1e4. `final_logit_softcapping=30.0` applies `cap * tanh(logits / cap)`. Our bench's FA handling is **partially correct** but has 3 likely bugs causing the "garbled after 1-2 tokens" issue (QK norm replication, layer-47 q_proj sharing, and shared-KV semantics).
 
 ## Findings
 
-### 1. CUDA Graph — Diminishing Returns Confirmed
-**CUDA Graph captured 867 nodes. Speedup: 64→65 t/s (+2.1%).** This matches expectations when a single kernel type dominates runtime. GEMV at 92.2% means even if kernel launch overhead were 100% eliminated, max gain = 7.8%. vLLM reports similar: CUDA Graph helps most when many small kernel launches exist (e.g. Transformer with 40+ layers × 15 ops = 600 launches). With GEMV at 55 μs average and launch overhead ~3-5 μs on Blackwell, the savings are <10% total. [Source: Efficiently Serving LLMs Part 4 — CUDA Graphs in vLLM](https://www.linkedin.com/pulse/efficiently-serving-llms-part-4-how-cuda-graphs-make-vllm); [vLLM CUDA Graph Design](https://docs.vllm.ai/en/stable/design/cuda_graphs/); [llama.cpp CUDA Graph Issue #6763](https://github.com/ggml-org/llama.cpp/issues/6763)
+### 1. Layer Pattern: 5:1 SWA:FA — 40 SWA + 8 FA, FA every 6th layer
 
-**Verdict: SKIP further work. 2.1% confirmed ceiling.**
+Gemma 4 inherits Gemma 3's **5:1 sliding-window-to-full-attention interleaving**. Gemma 3 introduced this pattern (5 local SWA layers : 1 global FA layer, repeating). Gemma 4 12B has 48 layers → 8 FA layers at positions 5,11,17,23,29,35,41,47 (every 6th, 0-indexed) and 40 SWA layers. [Google DeepMind Gemma 4](https://deepmind.google/models/gemma/gemma-4/) | [Gemma 3 explained — Google Developers Blog](https://developers.googleblog.com/en/gemma-explained) | [Welcome Gemma 3 blog](https://huggingface.co/blog/gemma3) | [Gemma 3 Technical Report (arXiv:2503.19786)](https://arxiv.org/pdf/2503.19786)
 
-### 2. Flash Attention / MLA — Not Relevant for Decode-Only
-MLA (Multi-head Latent Attention) reduces KV cache size via low-rank projection — relevant for memory-bound serving at large batch sizes. At M=1 decode, attention is 0.9% of runtime (3.9 μs avg). Current GQA kernel already handles nqh=32, nkv=8, hd=128 efficiently. Flash Attention optimizes for long-context prefill (softmax tiling), not single-token decode. [Source: TransMLA — arXiv 2502.07864](https://arxiv.org/abs/2502.07864); [DeepSeek MLA Analysis — arXiv 2506.02523](https://arxiv.org/abs/2506.02523)
+**Local confirmation**: `bench/text_generate_gemma4_12b_qat.cu` line ~38 hardcodes `SWA_LAYERS[NL] = {1,1,1,1,1,0, ...}` (5 SWA, 1 FA, ×8) — matches exactly. The GGUF metadata stores this as a per-layer `head_count_kv` array: `[8,8,8,8,8,1, 8,8,8,8,8,1, ...]` (FA layers have `nkv=1`, SWA have `nkv=8`). Converter `better-inference/gguf_convert.cpp` lines ~224-235 reads `gemma4.attention.head_count_kv` as `std::vector<int32_t>`.
 
-**Verdict: SKIP. Attention is 0.9% of wall time.**
+### 2. FA Layers: k_eq_v=True, num_global_key_value_heads=1, global_head_dim=512
 
-### 3. PagedAttention / vLLM Patterns — No Decode-Side Benefit
-PagedAttention optimizes KV cache memory management for large batches (fragmentation, sharing). For single-sequence M=1 decode, the current fixed KV cache (`MAXSEQ=4096`, pre-allocated per layer) is optimal. Paged memory would add indirection overhead with zero benefit at M=1. vLLM uses it for batching thousands of sequences. [Source: HuggingFace PagedAttention docs](https://huggingface.co/docs/text-generation-inference/en/conceptual/paged_attention)
+FA (global/full attention) layers in Gemma 4:
+- **`num_global_key_value_heads = 1`** (NOT 2 — confirmed by GGUF metadata `head_count_kv=1` at FA positions, and by AGENTS.md note "num_global_key_value_heads = 2" being a misread; the per-layer array shows 1)
+- **`global_head_dim = 512`** (GGUF key `attention.key_length=512`)
+- **`k_eq_v = True`**: K and V share a **single projection** — there is **no separate `v_proj`** for FA layers. The GGUF converter correctly skips `attn_v` tensors for FA layers (`gguf_convert.cpp` line ~464: "For gemma4, attn_v.weight may be absent for FA layers (k_eq_v)").
+- **Q dim = 16 × 512 = 8192** (double Q heads vs SWA's 4096)
+- **K dim = V dim = 1 × 512 = 512**
+- **o_proj input dim = 8192** (= nqh × global_head_dim = 16 × 512)
 
-**Verdict: SKIP. M=1 decode has no fragmentation problem.**
+Sources: [google/gemma-4-12B-it-qat-q4_0-gguf (HF)](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf) | [unsloth/gemma-4-12B-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF) | [Two Major KV Optimizations in Gemma4 (LinkedIn)](https://www.linkedin.com/pulse/two-major-kv-opt) | [Gemma4Backbone (Keras Hub)](https://keras.io/keras_hub/api/models/gemma4/gemma4_backbone)
 
-### 4. Blackwell-Specific Optimizations — Potentially Valuable
+**⚠️ Correction to AGENTS.md**: The project notes state "num_global_key_value_heads = 2". The GGUF metadata per-layer array shows `nkv=1` at FA positions. The `head_count_kv` array is `[8,8,8,8,8,1,...]`. This should be **1**, not 2. The bench code correctly uses `nkv_fa=1` (line 35). The "2" in AGENTS.md may refer to a different metadata field or a misreading.
 
-#### 4a. Tensor Memory Accelerator (TMA) / TMEM
-Blackwell (SM_120) introduces Tensor Memory Accelerator (TMA) and Tensor Memory (TMEM). TMA enables async 1D/2D/3D data copies from global→shared without register file usage. **Critical question**: Does GB206 (RTX 5060 Ti) include TMA? Blackwell datacenter (B100/B200/GB202) has TMA. Consumer GB206 may lack tensor memory hardware — this needs verification via sm_120a PTX ISA support. If TMA is available, weight streaming into shared memory via TMA could overlap with tensor core compute, reducing effective GEMV time. [Source: NVIDIA Blackwell Tuning Guide 13](https://docs.nvidia.com/cuda/blackwell-tuning-guide/); [Microbenchmarking Blackwell — arXiv 2512.02189](https://arxiv.org/abs/2512.02189); [Blackwell SM100 TMEM/TMA blog — Jianyu Huang](https://jianyuh.github.io/cuda/2026/04/12/blackwell-tensor-core)
+### 3. SWA Layers: Standard GQA, local_head_dim=256, separate v_proj
 
-#### 4b. WGMMA / MKI Instructions
-Blackwell adds `wgmma.mma_sp` (sparse tensor core) and MKI instructions. These target GEMM workloads with tile sizes ≥ 16×64. Current GEMV (1×N vector × N×M matrix) has tile size [1×128] × [128×4096] — tensor cores are inefficient for such skinny dimensions. WGMMA would require batching multiple queries to form a GEMM. At M=8, batched GEMV already gives 169 t/s (2.7× M=1). WGMMA could accelerate the batched path further. [Source: Semianalysis — Dissecting NVIDIA Blackwell Tensor Cores](https://newsletter.semianalysis.com/p/dissecting-nvidia-blackwell-tensor); [CUTLASS Blackwell Changelog](https://docs.nvidia.com/cutlass/latest/CHANGELOG.html)
+SWA (sliding window attention) layers:
+- **`num_key_value_heads = 8`**
+- **`local_head_dim = 256`** (GGUF key `attention.key_length_swa=256`)
+- **Q dim = 16 × 256 = 4096**
+- **K dim = V dim = 8 × 256 = 2048**
+- **Has separate `v_proj`** (not k_eq_v)
+- **Sliding window = 1024 tokens** (local context, SWA_WINDOW in bench)
 
-#### 4c. CUTLASS 3.x + Blackwell
-CUTLASS 3.5+ has Blackwell (SM_120) kernel support. Could generate batched GEMV kernels using CUTLASS instead of hand-written. Gains uncertain — current hand-optimized warp-cooperative GEMV uses dp4a SIMD at near-peak L2 bandwidth. Tensor core GEMV for M=1 likely slower due to setup overhead. [Source: CUTLASS Documentation](https://docs.nvidia.com/cutlass/latest/overview.html); [CUTLASS Tutorial: Tensor Memory Accelerator](https://research.colfax-intl.com/cutlass-tutorial-tma/)
+Sources: [Gemma 4 model card (Google AI)](https://ai.google.dev/gemma/docs/core/model_card_4) | [Welcome Gemma 4 (HF Blog)](https://huggingface.co/blog/gemma4)
 
-**Verdict: INVESTIGATE TMA support on GB206. If present, prototype TMA weight streaming. WGMMA for batched M≥4 is promising but lower priority.**
+### 4. QK Norms: Per-layer head_dim — 256 for SWA, 512 for FA
 
-### 5. Speculative Decoding — NOT VIABLE (tested 2026-06-13)
-`bench/text_generate_speculative.cu` — 1.7B INT4 draft + 8B INT4 target.
-Acceptance rate: 1.3% (draft and target produce completely different tokens).
-Throughput: 30 t/s (slower than target alone at 56 t/s due to sequential execution).
+QK normalization (`attn_q_norm`, `attn_k_norm`) operates at the **per-layer head dimension**:
+- **SWA layers**: QK norms are **256-dim** (one norm weight per head element, applied per-head)
+- **FA layers**: QK norms are **512-dim** (matching `global_head_dim=512`)
 
-**Root cause**: INT4 1.7B draft quality is too poor to predict 8B target output.
-Would need FP16/INT8 draft (higher quality) which uses more GPU memory.
-Not viable on 16 GB GPU with both models loaded.
+The GGUF converter reads the actual tensor element count to determine the correct head_dim per layer (`gguf_convert.cpp` lines ~445-460: `if (tensor_nelems > 0 && tensor_nelems < hd) l_hd_norm = tensor_nelems`). It writes per-layer norm files with correct dimensions.
 
-**Verdict: ABANDONED. Speculative decode requires a higher-quality draft model
-that doesn't fit in available GPU memory alongside the target.**
+**⚠️ LIKELY BUG in bench**: `text_generate_gemma4_12b_qat.cu` lines ~253-265 reads QK norms as 256-dim for ALL layers then **replicates 256→512** for FA layers (`for (int i = nq; i < l_hd; i++) w256[i] = w256[i % hd_swa]`). This is WRONG. The GGUF converter writes FA-layer QK norms as native 512-dim tensors. The bench should read the full 512-dim norm directly, not replicate a 256-dim norm. This replication corrupts FA-layer Q/K normalization → **likely cause of garbled output**.
 
-### 6. Server Concurrency — MPS/MIG Not Useful
-**MPS (Multi-Process Service)**: Shares single GPU context across processes. Reduces context-switch overhead for multiple independent clients. But MPS adds latency and has known bugs with CUDA Graph capture. Not useful for single-GPU decode serving where throughput is CPU-side request parsing bound.
-**MIG (Multi-Instance GPU)**: Only available on datacenter Blackwell (B100/B200). RTX 5060 Ti does not support MIG. [Source: NVIDIA MPS Docs](https://docs.nvidia.com/deploy/mps/latest/index.html); [NVIDIA MIG User Guide](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/); [Blackwell Architecture vGPU Types](https://docs.nvidia.com/ai-enterprise/release-7/)
+### 5. RoPE: Dual theta — FA uses 1e6, SWA uses 1e4
 
-**Verdict: SKIP MPS/MIG. Current batch endpoint (M≤8) is correct concurrency approach.**
+Gemma 4 uses **separate RoPE base frequencies** for the two attention types:
+- **FA layers**: `rope_theta = 1,000,000` (1e6) — long-range global context
+- **SWA layers**: `rope_theta = 10,000` (1e4) — local sliding window
 
-### 7. Kernel Fusion — Already Mostly Done
-Current pipeline per layer: `rmsnorm → quantize → GEMV(QKV) → head_norm → RoPE → attention → GEMV(Wo) → residual add → rmsnorm → quantize → GEMV(gate+up) → SwiGLU → GEMV(down) → residual add`. This is already tight.
+This is confirmed in the bench file (lines 34-35: `rope_theta_swa=10000.0f`, `rope_theta_fa=1000000.0f`) and referenced in multiple architecture analyses as "Dual RoPE." [Gemma 4 Architecture Deep Dive (CloudInsight)](https://cloudinsight.cc/en/blog/gemma-4-architecture) | [Gemma 4 Architecture Explained (Botmonster)](https://botmonster.com/posts/gemma-4-architecture) | [Gemma 4: Architecture and Multimodal Innovations (Jianyu)](https://jianyuh.github.io/architecture/2026/04/)
 
-**Fusions that exist**: `fused_swiglu_quant` (SwiGLU + quant), `rmsnorm + quant` (separate kernels but sequential). `fused_rmsnorm_quant_int8` combines RMSNorm + quant.
+### 6. final_logit_softcapping = 30.0
 
-**Fusions worth considering**:
-- **quantize + GEMV**: Fuse absmax computation with GEMV read. Current: quantize (1.3%, 1.3 μs) then GEMV (54.8 μs). Could absorb quantize latency by overlapping with GEMV weight load. ~1% gain.
-- **head_norm + RoPE**: Already attempted. Fused version gave 141 vs 140 t/s (+0.7%). Negligible.
-- **residual add + next RMSNorm**: Both element-wise. Could fuse residual add (0.3 μs estimated) into next layer's RMSNorm. ~0.5% gain.
+Formula: **`logits = cap * tanh(logits / cap)`** where `cap = 30.0`. This is identical to Gemma 2/3's logit softcap. It bounds logits to [-30, +30] via tanh saturation.
 
-**Verdict: LOW PRIORITY. Already 97.6% of time in fusions. Remaining 2.4% split across tiny kernels.**
+**⚠️ BUG in bench**: The bench DISABLES softcap (line ~415: "Skip softcap until quality improves") with a comment that "INT4 quantization noise pushes raw logits beyond softcap range." This is incorrect reasoning — softcap is designed to handle large logits via tanh. Disabling it changes the output distribution. However, if logits are truly garbage (from upstream bugs), softcap would make them uniformly bad. The root cause is upstream (QK norm bug), not the softcap.
 
-### 8. Prefill Attention — Highest Impact Untapped Optimization
-Current: decode-only server. prefill_decode_benchmark shows prefill+decode pipeline at 5.2 ms vs 42-66 ms decode-only (8-13× faster prompt processing). Blocked by cache layout incompatibility: decode cache `[NL][ms][nkv][hd]` can't serve batched prefill attention. [Source: POD-Attention — ASPLOS 2025](https://arxiv.org/abs/2410.18038); [POD-Attention paper PDF](https://akkamath.github.io/files/ASPLOS25_POD.pdf)
+Sources: [Gemma 2 paper (softcap origin)](https://arxiv.org/abs/2408.00118) | [Gemma 3 modeling code (HF Transformers)](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py)
 
-**Required changes**:
-1. Separate prefill KV cache: `[max_seq][NL][nkv][hd]` layout
-2. `attention_prefill_v2` kernel (batched softmax attention)
-3. Copy prefill KV into decode KV cache slots after completion
-4. Server path: prefill→copy→decode loop
+### 7. GGUF Conversion Issues — Layer 47 q_proj truncation
 
-**POD-Attention overlap**: Prefill KV compute can overlap with decode tokens for prior sequence. More complex but gives higher utilization.
+Known GGUF conversion issue: **layer 47's `q_proj` tensor is missing/truncated** in the GGUF file. The bench works around this by sharing layer 46's q_proj for layer 47 (line ~243: `W[l].q = W[46].q`). This is a known artifact of the QAT GGUF export, not a fundamental architecture property. [Eval bug: Gemma 4 generates tokens (llama.cpp #21321)](https://github.com/ggml-org/llama.cpp/issues/21321) | [unsloth/gemma-4-31B-it-GGUF token accuracy issues](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF)
 
-**Verdict: IMPLEMENT. Prefill+decode pipeline is the single largest remaining optimization.** Estimated gain: prompt processing 3-5× faster for multi-turn conversations.
+**⚠️ POTENTIAL BUG**: Sharing layer 46's q_proj for layer 47 is a workaround. Layer 47 IS an FA layer (position 47 = 7×6+5). If layer 46 (SWA, hd=256) and layer 47 (FA, hd=512) have different q_proj dimensions (4096 vs 8192), sharing would produce dimension mismatch or garbage. The bench does NOT check this — `W[46].q` has K=3840, N=4096 (SWA dims), but layer 47 needs N=8192 (FA dims). **This is almost certainly wrong** — the GEMV would produce a 4096-element Q vector for a layer expecting 8192, and the subsequent o_proj (expecting 8192 input) would read uninitialized memory.
 
-## Implementation Recommendations (Priority Order)
+### 8. Shared KV Semantics — "shared_kv_states"
 
-| Priority | Optimization | Est. Gain | Effort | Rationale |
-|----------|-------------|-----------|--------|-----------|
-| **P0** | TMA support investigation | 0-15% | 2-3 days | If available, weight streaming overlaps compute. If not, skip. Check `sm_120a` PTX for TMA instructions. |
-| ~~**P0**~~ | ~~Prefill KV cache + attention~~ | ~~2-5× prompt speed~~ | ✅ DONE (2026-06-13) | Multi-chunk prefill working. Fixed pinned buffer race in seq_pos H2D copy. |
-| **P1** | Speculative decoding | 1.5-2.5× | 2-3 weeks | High ceiling but requires full pipeline. Draft model fits in 16 GB. |
-| **P2** | WGMMA batched GEMV | 10-20% at M≥4 | 1-2 weeks | Only helps batch workloads. M=4+ already fast (148 t/s). |
-| **P3** | quantize→GEMV fusion | ~1% | 1 day | Absorb 1.3 μs quantize into GEMV load. Clean code win. |
-| **SKIP** | CUDA Graph | ~0% | 0 | 2.1% already demonstrated. Ceiling understood. |
-| **SKIP** | MLA/Flash Attention | ~0% | 0 | Attention is 0.9% of runtime for decode. |
-| **SKIP** | PagedAttention | ~0% | 0 | No memory fragmentation at M=1. |
-| **SKIP** | MPS/MIG | 0% | 0 | MIG not on RTX. MPS adds bugs. Batch endpoint is correct. |
-| **SKIP** | Further kernel fusion | <1% | 0 | Remaining kernels are too small to matter. |
+The HF Transformers Gemma 4 modeling code uses a `shared_kv_states` dictionary. FA layers **reuse K/V from the last same-type (FA) layer** rather than computing their own. This means:
+- FA layer 5 computes K/V from its k_proj
+- FA layer 11 reuses layer 5's K/V (appended with new tokens)
+- FA layer 17 reuses layer 11's K/V
+- etc.
+
+This is a **KV cache sharing optimization** across FA layers — all 8 FA layers share a single growing KV cache. The bench does NOT implement this — each FA layer has its own independent KV cache slot (`kv_offsets[l]`). This means FA layers attend only to their own position's K/V, not the accumulated global context from prior FA layers. **This is a significant architectural deviation** that would produce incorrect attention for all FA layers except the first.
+
+Sources: [Two Major KV Optimizations in Gemma4 (LinkedIn)](https://www.linkedin.com/pulse/two-major-kv-opt) | [Gemma4 (HF Transformers docs)](https://huggingface.co/docs/transformers/model_doc/gemma4) | [Gemma4Backbone (Keras)](https://keras.io/keras_hub/api/models/gemma4/gemma4_backbone) | [Gemma 4 is not your standard transformer (idlemachines)](https://idlemachines.co.uk/essays/gemma4-architecture)
+
+### 9. 4 RMSNorms Per Layer (Gemma 4 specific)
+
+Gemma 4 uses **4 RMSNorms per layer** (vs 2 in most transformers):
+1. `attn_norm` / `input_layernorm` — pre-attention
+2. `post_attention_norm` / `post_attn_norm` — post-attention residual
+3. `ffn_norm` / `post_attention_layernorm` — pre-FFN
+4. `post_ffw_norm` / `post_ffn_norm` — post-FFN residual
+
+Plus a final `output_norm` / `final_norm`. The bench correctly loads all 4 per-layer norms (lines ~288-310). The GeGLU activation (not SwiGLU) is used for the FFN.
+
+### 10. Config Summary (Gemma 4 12B QAT)
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| `hidden_size` (H) | 3840 | GGUF `embedding_length` |
+| `intermediate_size` (I) | 15360 | GGUF `feed_forward_length` |
+| `num_hidden_layers` (NL) | 48 | GGUF `block_count` |
+| `num_attention_heads` (nqh) | 16 | GGUF `attention.head_count` |
+| `vocab_size` (V) | 262144 | GGUF tokenizer count |
+| SWA `head_dim` | 256 | GGUF `attention.key_length_swa` |
+| FA `head_dim` | 512 | GGUF `attention.key_length` |
+| SWA `num_kv_heads` | 8 | GGUF per-layer `head_count_kv` |
+| FA `num_kv_heads` | 1 | GGUF per-layer `head_count_kv` (k_eq_v) |
+| SWA `rope_theta` | 10,000 | Architecture docs |
+| FA `rope_theta` | 1,000,000 | Architecture docs |
+| `sliding_window` | 1024 | Architecture docs |
+| `final_logit_softcapping` | 30.0 | Gemma family standard |
+| FA layer positions | 5,11,17,23,29,35,41,47 | 5:1 pattern |
+| FA `k_eq_v` | True | No v_proj in GGUF for FA layers |
+| Embeddings | Tied (embed == lm_head) | GGUF tensor analysis |
 
 ## Sources
-- **Kept**: [vLLM CUDA Graph Design](https://docs.vllm.ai/en/stable/design/cuda_graphs/) — Reference for CUDA Graph throughput limits
-- **Kept**: [Efficiently Serving LLMs Part 4 — CUDA Graphs](https://www.linkedin.com/pulse/efficiently-serving-llms-part-4-how-cuda-graphs-make-vllm) — Confirms graph wins diminish when one kernel dominates
-- **Kept**: [NVIDIA Blackwell Tuning Guide 13](https://docs.nvidia.com/cuda/blackwell-tuning-guide/) — Official Blackwell optimization reference
-- **Kept**: [Microbenchmarking Blackwell — arXiv 2512.02189](https://arxiv.org/abs/2512.02189) — Blackwell architectural characterization
-- **Kept**: [Blackwell TMEM/TMA blog — Jianyu Huang](https://jianyuh.github.io/cuda/2026/04/12/blackwell-tensor-core) — Deep dive into tensor memory architecture
-- **Kept**: [POD-Attention — ASPLOS 2025](https://arxiv.org/abs/2410.18038) — Prefill-decode overlap technique
-- **Kept**: [Speculative Decoding Survey — arXiv 2402.01528](https://arxiv.org/abs/2402.01528) — Draft model speedup benchmarks
-- **Kept**: [Semianalysis — Blackwell Tensor Cores](https://newsletter.semianalysis.com/p/dissecting-nvidia-blackwell-tensor) — WGMMA and MKI instruction analysis
-- **Kept**: [NVIDIA MPS Docs](https://docs.nvidia.com/deploy/mps/latest/index.html) — Multi-Process Service limitations
-- **Kept**: [CUTLASS Blackwell Changelog](https://docs.nvidia.com/cutlass/latest/CHANGELOG.html) — SM_120 kernel support status
-- **Kept**: [llama.cpp CUDA Graph Issue #6763](https://github.com/ggml-org/llama.cpp/issues/6763) — Original CUDA Graph integration discussion
-- **Dropped**: Hardware Corner llama.cpp Blackwell blog — Secondary, no technical depth
-- **Dropped**: NVIDIA Blackwell Breaks 1000 TPS blog — Datacenter-focused, not relevant to consumer GPU decode
+
+### Kept (authoritative / directly relevant)
+- **Local: `bench/text_generate_gemma4_12b_qat.cu`** — Our implementation with FA/SWA handling. Primary evidence for what our code does (and where bugs are).
+- **Local: `better-inference/gguf_convert.cpp`** — GGUF→INT4 converter that reads actual GGUF metadata (`head_count_kv` per-layer array, `key_length`/`key_length_swa`). Authoritative for config values.
+- **[google/gemma-4-12B-it-qat-q4_0-gguf (HF)](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf)** — Official QAT GGUF model. Source of the GGUF metadata our converter parsed.
+- **[google/gemma-4-12B (HF)](https://huggingface.co/google/gemma-4-12B)** — Official model card.
+- **[Gemma 4 — Google DeepMind](https://deepmind.google/models/gemma/gemma-4/)** — Official model page.
+- **[Gemma 4 model card (Google AI)](https://ai.google.dev/gemma/docs/core/model_card_4)** — Official model card with specs.
+- **[Welcome Gemma 4 (HF Blog)](https://huggingface.co/blog/gemma4)** — Official release blog.
+- **[Gemma4Backbone (Keras Hub)](https://keras.io/keras_hub/api/models/gemma4/gemma4_backbone)** — Official Google Keras implementation reference.
+- **[Gemma4 (HF Transformers docs)](https://huggingface.co/docs/transformers/model_doc/gemma4)** — HF Transformers documentation for Gemma4.
+- **[HuggingFace Transformers gemma4 source](https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4)** — Modeling code (modeling_gemma4.py, configuration_gemma4.py).
+- **[Gemma 4 Architecture Deep Dive (CloudInsight)](https://cloudinsight.cc/en/blog/gemma-4-architecture)** — Detailed architecture analysis (MoE, Dual RoPE).
+- **[Gemma 4 Architecture Explained (Botmonster)](https://botmonster.com/posts/gemma-4-architecture)** — Per-layer embeddings, shared KV explanation.
+- **[Gemma 4: Architecture and Multimodal Innovations (Jianyu)](https://jianyuh.github.io/architecture/2026/04/)** — Technical architecture breakdown.
+- **[Two Major KV Optimizations in Gemma4 (LinkedIn)](https://www.linkedin.com/pulse/two-major-kv-opt)** — KV sharing and optimization details.
+- **[Gemma 4 is not your standard transformer (idlemachines)](https://idlemachines.co.uk/essays/gemma4-architecture)** — Architecture analysis.
+- **[Google's Gemma 4 will Change How AI Models are Built](https://www.artificialintelligencemadesimple.co)** — Architecture commentary.
+- **[Gemma 3 Technical Report (arXiv:2503.19786)](https://arxiv.org/pdf/2503.19786)** — Gemma 3 paper (5:1 pattern origin, softcap).
+- **[Gemma explained: What's new in Gemma 3 (Google Dev Blog)](https://developers.googleblog.com/en/gemma-explained)** — Official Gemma 3 architecture explanation (SWA pattern).
+- **[Eval bug: Gemma 4 generates tokens (llama.cpp #21321)](https://github.com/ggml-org/llama.cpp/issues/21321)** — Known GGUF conversion issue.
+- **[unsloth/gemma-4-12B-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF)** — Unsloth QAT GGUF.
+- **[Gemma 4 Architecture -- Complete Technical Comparison (g4.si5.pl)](https://g4.si5.pl/)** — Technical comparison reference.
+
+### Dropped
+- Wikipedia "Gemma (language model)" — appeared in many searches but lacked specific Gemma 4 FA/SWA technical detail at the depth needed.
+- Various Medium/blog posts (DEV.to, Medium ML authors) — secondary commentary, not authoritative.
 
 ## Gaps
-- **GB206 TMA support**: Unknown if RTX 5060 Ti consumer chip includes Tensor Memory Accelerator. Need to verify by inspecting PTX ISA for `cp.async.bulk.tensor` or `tma` instructions on `sm_120a`. If absent, TMA-based optimizations are impossible.
-- **Speculative decoding acceptance rates**: Exact acceptance rate for 1.7B→8B on this specific model pair (Qwen3) is unknown. General literature reports 60-80%, but per-domain variance is high.
-- **POD-Attention for decode-only server**: Paper focuses on prefill-decode overlap. Our server is decode-only with no prefill at all — implementing basic prefill is the prerequisite.
 
-## Next Steps
-1. **Verify TMA support**: Compile `asm("{ cp.async.bulk.tensor ... }")` on `sm_120a` or check CUDA 13 PTX ISA for `sm_120` tensor memory instructions.
-2. **Implement prefill cache**: Allocate `[max_seq][NL][nkv][hd]` FP16 cache. Write `attention_prefill_v2` kernel with softmax tiling. Copy prefill KV into decode cache slots.
-3. **Profile with prefill+decode**: Measure end-to-end speedup for multi-turn scenarios vs pure decode loop.
-4. **If TMA confirmed**: Prototype weight streaming in `gemv_int4_batched` — load weights into shared memory via TMA while previous warp's MMA completes.
+### High-priority gaps for resolving the "garbled after 1-2 tokens" bug
+
+1. **Shared KV implementation NOT confirmed from source code.** The claim that FA layers share a single growing KV cache (`shared_kv_states`) comes from architecture blog posts and the LinkedIn article, NOT from directly reading the HF Transformers `modeling_gemma4.py` source. **This is the #1 suspect for the garbled output.** Need to read the actual modeling code to confirm:
+   - Do FA layers share K/V across FA layers, or does each FA layer have its own K/V?
+   - Is `shared_kv_states` a runtime cache optimization or an architectural feature (weights)?
+   - If shared: what is the sharing pattern — last FA layer only, or all previous FA layers?
+
+2. **QK norm dimension for FA layers not confirmed from HF source.** Our bench replicates 256→512, but the GGUF converter writes native per-layer dims. Need to verify from `modeling_gemma4.py` whether FA-layer QK norms are genuinely 512-dim or if the norm is applied differently (e.g., per 256-dim half-head).
+
+3. **Layer 47 q_proj dimension mismatch not verified.** Need to check the actual GGUF tensor: is layer 47's q_proj truly missing, or is it present with FA dims (8192)? If present, sharing from layer 46 (SWA, 4096) is definitely wrong. If truly missing, the model itself may have a design where layer 47 reuses a prior FA layer's q_proj (like layer 41 or 35), not a SWA layer's.
+
+4. **`num_global_key_value_heads` = 1 vs 2 discrepancy.** AGENTS.md says 2, GGUF metadata says 1 (per-layer array). Need to read `configuration_gemma4.py` to confirm. If it's actually 2, then K=V dim = 2×512=1024, not 512 — and our bench's `l_k_dim=512` would be wrong.
+
+### Suggested next steps
+
+1. **Read `modeling_gemma4.py` from HF Transformers** — specifically the attention class and KV cache handling. This is the single most important step. URL: `https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py`
+2. **Read `configuration_gemma4.py`** — confirm `num_global_key_value_heads`, `global_head_dim`, `k_eq_v`, `shared_kv_layers` config fields.
+3. **Inspect actual GGUF tensor list** for the QAT model — run `gguf_convert` in debug mode to see all tensor names and shapes, especially for layers 5, 11, 47. Verify whether v_proj exists for FA layers and whether layer 47 q_proj is present.
+4. **Fix shared KV cache** — if FA layers share KV, implement a single FA KV cache (1 head × 512 dim × MAXSEQ) shared across all 8 FA layers, not 8 separate caches.
+5. **Fix QK norm loading** — read native per-layer dim norms directly (converter already writes them correctly).
+
+## Supervisor coordination
+
+No supervisor contact needed — research task complete. The key actionable finding is that the "garbled after 1-2 tokens" bug likely stems from **3 compounding issues**: (1) QK norm 256→512 replication for FA layers, (2) layer 47 q_proj dimension mismatch when sharing from SWA layer 46, and (3) missing shared-KV implementation across FA layers. Reading `modeling_gemma4.py` is the critical next step to confirm the shared KV behavior before implementing fixes.

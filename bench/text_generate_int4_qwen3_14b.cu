@@ -1,17 +1,15 @@
 #include "blackwell/int4_weights.h"
 using namespace blackwell::weights;
-// bench/text_generate_int4.cu — End-to-end text generation with INT4 Qwen3-1.7B
+// bench/text_generate_int4_qwen3_14b.cu — Qwen3-14B INT4 text generation
 //
-// Tokenize prompt → INT4 embedding lookup → 28L INT4 decode (17 kernels/layer)
-// → final norm → INT4 lm_head GEMV → GPU sampling → print tokens.
-//
-// Correct residual connections (mirrors INT8 pipeline structure).
+// 40L, H=5120, I=17408, nqh=40, nkv=8, hd=128, V=151936
+// FP16 weight scales. Batched GEMV kernels (M=1).
 //
 // Build:
 //   CUDACXX=/usr/local/cuda-13.3/bin/nvcc nvcc -O3 -std=c++17 \
 //     -gencode=arch=compute_120a,code=sm_120a \
-//     -I include bench/text_generate_int4.cu build/libblackwell_kernels.a \
-//     -o bench/text_generate_int4
+//     -I include bench/text_generate_int4_qwen3_14b.cu build/libblackwell_kernels.a \
+//     -o bench/text_generate_int4_qwen3_14b
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -26,34 +24,20 @@ using namespace blackwell::weights;
 #include "blackwell/kernels.h"
 #include "blackwell/bpe_tokenizer.h"
 
+// FP16 embed table on GPU (pre-loaded, 1.56 GB)
+static __half* d_embed_f16 = nullptr;
+
 static void die(cudaError_t e, const char* m) {
     if(e!=cudaSuccess){printf("FAIL %s: %s\n",m,cudaGetErrorString(e));exit(1);}
 }
 
 using Clock = std::chrono::high_resolution_clock;
 
-const int H=4096, Q=4096, KV=1024, I=12288;
-const int nqh=32, nkv=8, hd=128, MAXSEQ=4096;
+const int NL=40;
+const int H=5120, Q=5120, KV=1024, I=17408;
+const int nqh=40, nkv=8, hd=128, MAXSEQ=4096;
 const float eps=1e-6f;
 const int V=151936;
-
-struct DevW4 { int K, N; uint8_t* d; float* sc; };
-static DevW4 upload_w4(const char* prefix) {
-    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
-    FILE* f=fopen(p,"rb"); int h[5]; fread(h,4,5,f);
-    DevW4 dw; dw.K=h[0]; dw.N=h[1];
-    size_t ds=(size_t)h[0]*h[1]/2;
-    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
-    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
-    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
-    size_t ss=(size_t)h[3]*h[4];  // Use scale_t header for scale count
-    float* ts=new float[ss]; fread(ts,4,ss,f); fclose(f);
-    cudaMalloc(&dw.sc,ss*4); cudaMemcpy(dw.sc,ts,ss*4,cudaMemcpyHostToDevice); delete[] ts;
-    return dw;
-}
-
-// FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
-// Packed .int4_t bytes are identical to the FP32-scale format.
 
 struct LW4 {
     DevW4f16 q,k,v,o,g,u,d;
@@ -82,58 +66,41 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
 }
-    const float* host_sc, int K)
-{
-    int kblocks=K/16;
-    for(int b=0;b<kblocks;++b){
-        float sc=host_sc[token*kblocks+b];
-        for(int i=0;i<16;++i){
-            size_t byte_idx=(size_t)token*K/2+(size_t)b*8+i/2;
-            uint8_t byte=host_w[byte_idx];
-            int nib=(i&1)?((byte>>4)&0x0F):(byte&0x0F);
-            int val=nib-8;
-            out[b*16+i]=(float)val*sc;
-        }
-    }
-}
 
 int main(int argc, char** argv) {
     const char* prompt = "Once upon a time";
     int max_new = 50;
-    bool chat_mode = false;
     float temperature = 0.0f;
     int top_k = 0;
-    if(argc>1) prompt=argv[1];
-    if(argc>2) max_new=atoi(argv[2]);
+    const char* wdir = "weights_int4_qwen3_14b_fp16sc";
+    // First pass: extract flags
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--chat")==0) chat_mode=true;
+        if(strcmp(argv[i],"-w")==0&&i+1<argc) wdir=argv[++i];
         if(strcmp(argv[i],"-t")==0&&i+1<argc) temperature=atof(argv[++i]);
         if(strcmp(argv[i],"-k")==0&&i+1<argc) top_k=atoi(argv[++i]);
     }
+    // Non-flag args: first is prompt, second is max_new
+    int arg_ix=1;
+    for(;arg_ix<argc;arg_ix++){
+        if(argv[arg_ix][0]!='-') break;
+        if(strcmp(argv[arg_ix],"-w")==0||strcmp(argv[arg_ix],"-t")==0||strcmp(argv[arg_ix],"-k")==0) arg_ix++; // skip value
+    }
+    if(arg_ix<argc) prompt=argv[arg_ix++];
+    if(arg_ix<argc) max_new=atoi(argv[arg_ix]);
 
     cudaDeviceProp P; cudaGetDeviceProperties(&P,0);
-    printf("# Text Generation — Qwen3-8B INT4\n");
+    printf("# Text Generation — Qwen3-14B INT4\n");
     printf("  Device: %s\n", P.name);
-    printf("  Prompt: \"%s\"%s\n", prompt, chat_mode?" (chat)":"");
-    printf("  Temp: %.1f, Top-K: %d, Max new: %d\n\n", temperature, top_k, max_new);
+    printf("  Prompt: \"%s\"\n", prompt);
+    printf("  Weights: %s\n", wdir);
+    printf("  Config: NL=%d H=%d I=%d nqh=%d nkv=%d hd=%d V=%d\n\n", NL, H, I, nqh, nkv, hd, V);
 
     blackwell::BpeTokenizer tokenizer;
     if(tokenizer.load("tokenizer_data.bin")!=0){
         fprintf(stderr,"FAIL: no tokenizer_data.bin\n");return 1;
     }
 
-    std::vector<uint32_t> input_ids;
-    if(chat_mode){
-        input_ids.push_back(151644);
-        for(char c:std::string("user\n")) input_ids.push_back((uint32_t)(unsigned char)c);
-        auto pt=tokenizer.encode(prompt);
-        input_ids.insert(input_ids.end(),pt.begin(),pt.end());
-        input_ids.push_back(151645);
-        input_ids.push_back(151644);
-        for(char c:std::string("assistant\n")) input_ids.push_back((uint32_t)(unsigned char)c);
-    }else{
-        input_ids=tokenizer.encode(prompt);
-    }
+    std::vector<uint32_t> input_ids=tokenizer.encode(prompt);
     printf("Input: %zu tokens\n", input_ids.size());
 
     // Device buffers
@@ -146,7 +113,7 @@ int main(int argc, char** argv) {
     float *d_fn, *d_fn_sc, *d_kc, *d_vc, *d_logits;
     int *d_next_id;
 
-    const int NL=36;
+    // NL defined at file scope
     #define AL(p,n){cudaError_t _e=cudaMalloc(&(p),(n));\
         if(_e!=cudaSuccess){printf("FAIL malloc %s: %s\n",#p,cudaGetErrorString(_e));die(_e,#p);}}
     AL(d_x32,H*4);AL(d_xi_f,H*4);AL(d_res,H*4);
@@ -162,7 +129,6 @@ int main(int argc, char** argv) {
     #undef AL
 
     float iv7=1.f/7.f;
-    // Initialize ALL activation scales to 1/7 (not just first element)
     { std::vector<float> tmp(H/16, iv7); cudaMemcpy(d_x_i4_sc, tmp.data(), (H/16)*4, cudaMemcpyHostToDevice); }
     { std::vector<float> tmp(Q/16, iv7); cudaMemcpy(d_attn_i4_sc, tmp.data(), (Q/16)*4, cudaMemcpyHostToDevice); }
     { std::vector<float> tmp(I/16, iv7); cudaMemcpy(d_mlp_i4_sc, tmp.data(), (I/16)*4, cudaMemcpyHostToDevice); }
@@ -170,20 +136,20 @@ int main(int argc, char** argv) {
     int dummy=0;cudaMemcpy(d_next_id,&dummy,4,cudaMemcpyHostToDevice);
 
     printf("Loading %d-layer INT4 model...\n",NL);fflush(stdout);
-    std::vector<LW4> W(NL); char p_[256];
+    std::vector<LW4> W(NL); char p_[512];
     for(int l=0;l<NL;++l){
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l);W[l].q=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l);W[l].k=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l);W[l].v=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l);W[l].o=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l);W[l].g=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l);W[l].u=upload_w4_f16sc(p_);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l);W[l].d=upload_w4_f16sc(p_);
-        if((l+1)%7==0||l+1==NL)printf("  layer %d/%d\n",l+1,NL);
+        snprintf(p_,512,"%s/%d_q_proj",wdir,l);W[l].q=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_k_proj",wdir,l);W[l].k=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_v_proj",wdir,l);W[l].v=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_o_proj",wdir,l);W[l].o=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_gate_proj",wdir,l);W[l].g=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_up_proj",wdir,l);W[l].u=upload_w4_f16sc(p_);
+        snprintf(p_,512,"%s/%d_down_proj",wdir,l);W[l].d=upload_w4_f16sc(p_);
+        if((l+1)%10==0||l+1==NL)printf("  layer %d/%d\n",l+1,NL);
     }
 
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");(void)fread(qk_h,4,NL*2*hd,f);fclose(f);}
+    {snprintf(p_,512,"%s/qk_norms.f32",wdir);FILE*f=fopen(p_,"rb");if(!f){printf("FAIL open %s\n",p_);exit(1);}size_t nr=fread(qk_h,4,NL*2*hd,f);if(nr!=(size_t)NL*2*hd){printf("FAIL read qk_norms\n");exit(1);}fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -191,37 +157,38 @@ int main(int argc, char** argv) {
 
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
-        {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
+        snprintf(p_,512,"%s/%d_ln1.f32",wdir,l);
+        {FILE*f=fopen(p_,"rb");if(!f){printf("FAIL open %s\n",p_);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){printf("FAIL read %s\n",p_);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p_,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
-        {FILE*f=fopen(p_,"rb");(void)fread(w,4,H,f);fclose(f);}
+        snprintf(p_,512,"%s/%d_ln2.f32",wdir,l);
+        {FILE*f=fopen(p_,"rb");if(!f){printf("FAIL open %s\n",p_);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){printf("FAIL read %s\n",p_);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
 
     {float*w=(float*)malloc(H*4);
-    FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");(void)fread(w,4,H,f);fclose(f);
+    snprintf(p_,512,"%s/final_norm.f32",wdir);FILE*f=fopen(p_,"rb");if(!f){printf("FAIL open %s\n",p_);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){printf("FAIL read final_norm\n");exit(1);}fclose(f);
     cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice);free(w);}
 
-    DevW4f16 embed=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/embed_tokens");
-    uint8_t* host_embed_d=new uint8_t[(size_t)embed.K*embed.N/2];
-    float* host_embed_sc=new float[(size_t)embed.N*(embed.K/16)];
-    {char p[256];
-    snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t");
-    FILE*f=fopen(p,"rb");int h[5];fread(h,4,5,f);
-    size_t ds=(size_t)h[0]*h[1]/2;fread(host_embed_d,1,ds,f);fclose(f);
-    // FP16 scale file: read as __half, convert to FP32 host array once
-    // (embed is host-side dequantized per token, not a GPU GEMV).
-    snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t");
-    f=fopen(p,"rb");fread(h,4,5,f);size_t ss=(size_t)h[3]*h[4];
-    {__half* tmp=new __half[ss];fread(tmp,2,ss,f);
-     for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);
-     delete[] tmp;}
-    fclose(f);}
-    printf("Embed tokens loaded: %d x %d (INT4)\n",embed.K,embed.N);
-    // Load separate lm_head
-    DevW4f16 lm_head_w = upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
+    // Embed loaded as FP16 on GPU (pre-loaded, no dequant per token)
+    // embed.fp16 format: [V][H] FP16, row-major
+    {char p[512];
+    snprintf(p,512,"%s/embed_tokens.fp16",wdir);
+    FILE* f=fopen(p,"rb"); if(!f){printf("FAIL open %s\n",p);exit(1);}
+    fseek(f,0,SEEK_END); size_t fsize=ftell(f); fseek(f,0,SEEK_SET);
+    size_t n_f16 = fsize / 2;
+    __half* host_buf = new __half[n_f16];
+    size_t nr = fread(host_buf,2,n_f16,f);
+    if(nr != n_f16){printf("FAIL read embed.fp16: read %zu expected %zu\n",nr,n_f16);exit(1);}
+    fclose(f);
+    cudaMalloc(&d_embed_f16, fsize);
+    cudaMemcpy(d_embed_f16, host_buf, fsize, cudaMemcpyHostToDevice);
+    delete[] host_buf;
+    printf("Embed tokens loaded: 151936 x %d (FP16, %.1f MB)\n",H,(float)fsize/1e6);}
+
+    // Load lm_head INT4
+    char lm_p[512]; snprintf(lm_p,512,"%s/lm_head",wdir);
+    DevW4f16 lm_head_w = upload_w4_f16sc(lm_p);
     printf("lm_head loaded: %d x %d (INT4)\n", lm_head_w.K, lm_head_w.N);
     printf("All weights loaded.\n\n");
 
@@ -232,10 +199,12 @@ int main(int argc, char** argv) {
     cudaMemset(d_kc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
     cudaMemset(d_vc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
 
+    // Pre-allocate FP16 embed row buffer on GPU
+    __half* d_embed_row;
+    cudaMalloc(&d_embed_row, (size_t)H * sizeof(__half));
+
     printf("── Generating ──\n");
-    if(chat_mode)printf("[assistant] ");
-    else printf("%s",prompt);
-    fflush(stdout);
+    printf("%s",prompt);fflush(stdout);
 
     std::vector<uint32_t> all_ids=input_ids;
     int gen_start=(int)input_ids.size();
@@ -245,21 +214,29 @@ int main(int argc, char** argv) {
     for(int step=0;step<total;++step){
         uint32_t tid=(step<gen_start)?input_ids[step]:all_ids.back();
 
-        // ── INT4 Embedding: host dequant single row → GPU ──
-        dequant_embed_row(h_embed.data(),tid,host_embed_d,host_embed_sc,H);        die(cudaMemcpyAsync(d_x32,h_embed.data(),H*4,cudaMemcpyHostToDevice,st),"embed_cpy");
+        // FP16 Embedding: D2D copy from pre-loaded GPU table, then FP16→FP32 convert
+        die(cudaMemcpyAsync(d_embed_row, d_embed_f16 + (size_t)tid * H,
+            (size_t)H * sizeof(__half), cudaMemcpyDeviceToDevice, st), "embed_copy");
+        // Convert FP16→FP32: simple launch
+        // FP16 Embedding: D2D copy from pre-loaded GPU table, then FP16→FP32 convert
+        die(cudaMemcpyAsync(d_embed_row, d_embed_f16 + (size_t)tid * H,
+            (size_t)H * sizeof(__half), cudaMemcpyDeviceToDevice, st), "embed_copy");
+        blackwell::kernels::convert_fp16_to_fp32(d_x32, d_embed_row, H, st);
 
-        // ══ 28-layer decode ══
+        // 40-layer decode
         for(int l=0;l<NL;++l){
-
             // Save residual before norm
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res");
 
             die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_in,H,eps,st),"rmsnorm_quant_in");
 
-            // QKV projections (batched M=1)
-            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_Q,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].q.d,W[l].q.sc16,H,Q,st),"q_proj");
-            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_K,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].k.d,W[l].k.sc16,H,KV,st),"k_proj");
-            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_V,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].v.d,W[l].v.sc16,H,KV,st),"v_proj");
+            // Fused QKV projections (3 GEMV → 1 kernel)
+            die(blackwell::kernels::fused_qkv_int4_f16wsc(d_Q,d_K,d_V,
+                (const uint8_t*)d_x_i4,d_x_i4_sc,
+                W[l].q.d,W[l].q.sc16,
+                W[l].k.d,W[l].k.sc16,
+                W[l].v.d,W[l].v.sc16,
+                H,Q,KV,1,st),"fused_qkv");
 
             // Q/K head norms + RoPE
             head_norm_kernel<<<nqh,128,0,st>>>(d_Q,W[l].qn,nqh,hd,eps);
@@ -281,32 +258,29 @@ int main(int argc, char** argv) {
             die(blackwell::kernels::quantize_int4(d_attn_i4,d_attn_i4_sc,d_attn,Q,st),"quant_attn");
             die(blackwell::kernels::gemv_int4_warp_f16wsc(d_proj,(const uint8_t*)d_attn_i4,d_attn_i4_sc,W[l].o.d,W[l].o.sc16,Q,H,st),"o_proj");
 
-            // Attention residual: d_x32 = d_proj + d_res (original input)
-            // Note: use vector_add(out, a, b) = out = a + b
-            // We want d_x32 = d_proj + d_res (not d_x32 which is the pre-norm input)
-            // But vector_add uses __restrict__ so out=b is UB. Let's use a temp buffer.
-            // Actually, d_res is correct — it's the saved pre-norm input.
-            // d_proj + d_res → d_x32 using explicit array copy to avoid restrict violation
+            // Attention residual
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"attn_res");
 
-            // Save pre-MLP state for second residual
+            // Save pre-MLP state
             die(cudaMemcpyAsync(d_res,d_x32,H*4,cudaMemcpyDeviceToDevice,st),"save_res2");
 
             die(blackwell::kernels::fused_rmsnorm_quant_int4(d_x_i4,d_x_i4_sc,d_x32,W[l].rn_post,H,eps,st),"rmsnorm_quant_post");
 
-            // MLP gate + up
-            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_gate,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].g.d,W[l].g.sc16,H,I,st),"gate");
-            die(blackwell::kernels::gemv_int4_warp_f16wsc(d_up,(const uint8_t*)d_x_i4,d_x_i4_sc,W[l].u.d,W[l].u.sc16,H,I,st),"up");
+            // Fused gate+up projections (2 GEMV → 1 kernel)
+            die(blackwell::kernels::fused_gate_up_int4_f16wsc(d_gate,d_up,
+                (const uint8_t*)d_x_i4,d_x_i4_sc,
+                W[l].g.d,W[l].g.sc16,
+                W[l].u.d,W[l].u.sc16,
+                H,I,1,st),"fused_gate_up");
 
-            // SwiGLU + INT4 quant (fused: skips d_gate rewrite + read)
+            // SwiGLU + INT4 quant (fused)
             die(blackwell::kernels::fused_swiglu_quant_int4(d_mlp_i4,d_mlp_i4_sc,d_gate,d_up,I,st),"swiglu_quant");
 
             // Down projection
             die(blackwell::kernels::gemv_int4_warp_f16wsc(d_proj,(const uint8_t*)d_mlp_i4,d_mlp_i4_sc,W[l].d.d,W[l].d.sc16,I,H,st),"down");
 
-            // MLP residual: d_x32 = d_proj + d_res (pre-MLP state)
+            // MLP residual
             die(blackwell::kernels::vector_add_fp32(d_x32,d_proj,d_res,H,st),"mlp_res");
-            
         }
 
         // Final norm + lm_head + GPU sampling
@@ -347,6 +321,6 @@ int main(int argc, char** argv) {
         cudaFree(w.qn);cudaFree(w.kn);
         cudaFree(w.rn_in);cudaFree(w.rn_post);
     }
-    delete[] host_embed_d;delete[] host_embed_sc;
+    if(d_embed_f16) cudaFree(d_embed_f16);
     return 0;
 }

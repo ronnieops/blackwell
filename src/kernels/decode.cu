@@ -442,8 +442,13 @@ __global__ void attn_batched_kernel(
     }
     __syncthreads();
 
-    // Q into registers via float4
+    // Q into registers via float4. Loop over head_dim/128 chunks so any head_dim
+    // that is a multiple of 128 works (128=32 lanes*4 floats). For head_dim<=128
+    // (e.g. 8B, Llama) this is a single chunk and bit-identical to the original.
+    const int n_chunks = head_dim / 128;  // assumes head_dim % 128 == 0
     float Q_reg[4];
+    // NOTE: only the first chunk is cached in registers; later chunks are loaded
+    // inside the position loop (Q is in smem, cheap).
     {
         const float4* Q4 = reinterpret_cast<const float4*>(smem_Q);
         float4 q4 = Q4[lane_id];
@@ -452,11 +457,18 @@ __global__ void attn_batched_kernel(
 
     // Compute scores: 4 warps, each handles npos/4
     for (int t = warp_id; t < npos; t += 4) {
-        const float4* K4 = reinterpret_cast<const float4*>(
-            K_cache + t * head_dim);
+        const float* K_row = K_cache + t * head_dim;
+        const float4* K4 = reinterpret_cast<const float4*>(K_row);
         float4 kv = K4[lane_id];
         float dot = Q_reg[0] * kv.x + Q_reg[1] * kv.y
                   + Q_reg[2] * kv.z + Q_reg[3] * kv.w;
+        // Additional chunks for head_dim > 128 (256=2 chunks, 512=4 chunks).
+        for (int c = 1; c < n_chunks; ++c) {
+            const float4* Qc = reinterpret_cast<const float4*>(smem_Q) + c * 32;
+            float4 qc = Qc[lane_id];
+            float4 kc = K4[c * 32 + lane_id];
+            dot += qc.x * kc.x + qc.y * kc.y + qc.z * kc.z + qc.w * kc.w;
+        }
         for (int off = 16; off > 0; off >>= 1)
             dot += __shfl_xor_sync(0xffffffff, dot, off);
         if (lane_id == 0) {
@@ -533,6 +545,9 @@ __global__ void attn_batched_kernel_pos(
     }
     __syncthreads();
 
+    // Loop over head_dim/128 chunks so any head_dim that is a multiple of 128
+    // works. For head_dim<=128 this is a single chunk (bit-identical to orig).
+    const int n_chunks = head_dim / 128;
     float Q_reg[4];
     {
         const float4* Q4 = reinterpret_cast<const float4*>(smem_Q);
@@ -541,11 +556,17 @@ __global__ void attn_batched_kernel_pos(
     }
 
     for (int t = warp_id; t < npos; t += 4) {
-        const float4* K4 = reinterpret_cast<const float4*>(
-            K_cache + t * head_dim);
+        const float* K_row = K_cache + t * head_dim;
+        const float4* K4 = reinterpret_cast<const float4*>(K_row);
         float4 kv = K4[lane_id];
         float dot = Q_reg[0] * kv.x + Q_reg[1] * kv.y
                   + Q_reg[2] * kv.z + Q_reg[3] * kv.w;
+        for (int c = 1; c < n_chunks; ++c) {
+            const float4* Qc = reinterpret_cast<const float4*>(smem_Q) + c * 32;
+            float4 qc = Qc[lane_id];
+            float4 kc = K4[c * 32 + lane_id];
+            dot += qc.x * kc.x + qc.y * kc.y + qc.z * kc.z + qc.w * kc.w;
+        }
         for (int off = 16; off > 0; off >>= 1)
             dot += __shfl_xor_sync(0xffffffff, dot, off);
         if (lane_id == 0) {

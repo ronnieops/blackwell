@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/text_generate_gemma.cu — Gemma 4 12B INT4 decode
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -65,8 +67,6 @@ static DevW4 upload_w4(const char* prefix) {
 static bool file_exists(const char* path) {
     FILE* f=fopen(path,"rb"); if(f){fclose(f);return true;} return false;
 }
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
     const float* host_sc, int K)
 {
     int kblocks=K/16;

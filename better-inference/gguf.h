@@ -149,6 +149,11 @@ public:
     }
 
     // Read entire file into memory (for mmap-free path)
+    // Get file position where tensor data starts (right after header + tensor info)
+    uint64_t tensor_data_offset() const {
+        return tensor_data_off_;
+    }
+
     uint8_t* read_all() const {
         if (!valid_ || !f_) return nullptr;
         fseek(f_, 0, SEEK_END);
@@ -167,6 +172,7 @@ private:
     std::unordered_map<std::string, GGUFValue> metadata_;
     std::vector<GGUFTensorInfo> tensors_;
     mutable uint64_t last_seek_pos_ = 0;
+    uint64_t tensor_data_off_ = 0;
 
     template<typename T>
     T read_scalar() {
@@ -225,6 +231,9 @@ private:
             tensors_.push_back(ti);
         }
 
+        // Record current file position — this is right before tensor data
+        // (may need alignment padding). The ftell gives us the actual file position.
+        tensor_data_off_ = ftell(f_);
         return true;
     }
 
@@ -362,6 +371,48 @@ static void dequant_q8_0(const uint8_t* src, float* dst, uint64_t n_el) {
     uint64_t n_blocks = (n_el + 31) / 32;
     for (uint64_t b = 0; b < n_blocks; b++)
         dequant_q8_0_block(src + b * 34, dst + b * 32);
+}
+
+// ── Q4_0 dequant ────────────────────────────────────────────────
+// Q4_0: 32 elements/block, 18 bytes/block (2 fp16 scale + 16 bytes nibbles)
+// Each nibble is unsigned 4-bit (0-15), dequant: y = d * (nibble - 8)
+static void dequant_q4_0_block(const uint8_t* src, float* dst) {
+    float d;
+    dequant_f16(src, &d);
+    const uint8_t* qs = src + 2;
+    for (int i = 0; i < 32; i++) {
+        uint8_t nibble = qs[i / 2];
+        nibble = (i % 2 == 0) ? (nibble & 0x0F) : (nibble >> 4);
+        dst[i] = d * (float)((int)nibble - 8);
+    }
+}
+
+static void dequant_q4_0(const uint8_t* src, float* dst, uint64_t n_el) {
+    uint64_t n_blocks = (n_el + 31) / 32;
+    for (uint64_t b = 0; b < n_blocks; b++)
+        dequant_q4_0_block(src + b * 18, dst + b * 32);
+}
+
+// ── Q4_1 dequant ────────────────────────────────────────────────
+// Q4_1: 32 elements/block, 20 bytes/block (2 fp16 scale + 2 fp16 min + 16 bytes nibbles)
+// Each nibble is unsigned 4-bit (0-15), dequant: y = d * (nibble - 8) + m
+// Block layout: [d:2][m:2][qs:16] = 20 bytes
+static void dequant_q4_1_block(const uint8_t* src, float* dst) {
+    float d, m;
+    dequant_f16(src, &d);
+    dequant_f16(src + 2, &m);
+    const uint8_t* qs = src + 4;
+    for (int i = 0; i < 32; i++) {
+        uint8_t nibble = qs[i / 2];
+        nibble = (i % 2 == 0) ? (nibble & 0x0F) : (nibble >> 4);
+        dst[i] = d * (float)((int)nibble - 8) + m;
+    }
+}
+
+static void dequant_q4_1(const uint8_t* src, float* dst, uint64_t n_el) {
+    uint64_t n_blocks = (n_el + 31) / 32;
+    for (uint64_t b = 0; b < n_blocks; b++)
+        dequant_q4_1_block(src + b * 20, dst + b * 32);
 }
 
 // ── Q5_0 dequant ────────────────────────────────────────────────

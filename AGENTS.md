@@ -28,8 +28,10 @@ INT8/INT4 decode throughput vs llama.cpp Q4_K_M.
 |-------|--------|-----|--------|---------|
 | 1.7B INT8 HTTP | `http_subprocess 1.7b` | **~23** | ~43 | PPL 18.65 (1.5× BF16) ✅ |
 | **8B INT4 HTTP (FP16 sc)** | `http_subprocess int4_8b` | **~74** | ~13.5 | PPL 24.39 (was 23.52) ✅ |
+| **14B INT4 (raw, FP16 sc)** | `http_subprocess int4_14b` | **TBD** | **TBD** | PPL TBD (raw, no AWQ) |
 | **8B INT4 batched HTTP (FP16 sc, M=1)** | `http_subprocess int4_8b_batched` | **~65** | ~15.4 | PPL 24.39 ✅ |
 | **8B INT4 batched HTTP (8 concurrent)** | `http_subprocess int4_8b_batched` | **~183** | ~5.5 | PPL 24.39 ✅ **2.86× real-world** |
+| **Llama 3.2 3B INT4** | `http_subprocess llama32-3b` | **155** | ~6.5 | ❌ Garbled (28-layer INT4 wall) |
 | **Gemma 4 12B INT4** | `http_subprocess gemma` | **~24** | ~42 | Coherent (requires Python tokenizer wrapper) ⚠️ |
 
 **INT4 server divergence (v0.9.0 → v0.10.x)**: `inference_server_int4.cu` migrated from `gemv_int4_warp`
@@ -51,10 +53,21 @@ Repetition penalty eliminates token looping — clients can override via JSON bo
 - Critical fixes: seq_pos sync bug, empty prompt, prefill cache layout
 
 **Docker**: `ghcr.io/ronnieops/blackwell-server:v0.8.3` (160 MB)
-**INT4 Docker**: `blackwell-server:int4` (148 MB) — see `Dockerfile.int4`
+**INT4 Docker**: `ghcr.io/ronnieops/blackwell-server:int4` (198 MB, v0.13) — see `Dockerfile.int4`
+
+**14B INT4 quantization (Session 86)**: Qwen3-14B raw INT4 with FP16 scales completed via streaming quantizer (`scripts/quantize_int4_qwen3_14b.py`). Uses torch mmap for BF16→F32 conversion (no memory spike). 645 files, 6.9 GB. Architecture: H=5120, I=17408, NL=40, nqh=40, nkv=8, hd=128, V=151936. SwiGLU MLP, RMSNorm, RoPE theta=1000000. AWQ calibration pending (optional, 8B got PPL 24.39 raw vs 21.98 AWQ).
+
+**Disk cleanup (Session 86)**: Freed ~550 GB from HF cache. Deleted: Gemma4 GGUF variants (21+73+117+46+21+33=311 GB), Qwen3.6 GGUF (109+97=206 GB), unsloth GGUF (5.2+4.7+4.6=14.5 GB), Qwen3-1.7B (3.8 GB), Qwen2.5-0.5B (5.1 GB), Qwen3-8B HF source (16 GB), 30B INT4 weights (18 GB). Remaining: Qwen3-14B safetensors (28 GB), Qwen3-30B-A3B HF source (57 GB), wikitext dataset (15 MB). Disk: 564 GB free (58%).
+
+**30B MoE weights deleted**: 18 GB `weights_int4_qwen3_30b_a3b/` removed. Blocked by RAM (needs 55+ GB). HF source (57 GB) kept for future re-quantize.
+
+**Gemma4 GGUF all corrupted**: Systematic unsloth GGUF export bug for entire Gemma4 family. All FP32 norm tensors contain garbage values (1e22+). No blackwell fix possible. Requires clean FP32 weights from HuggingFace safetensors.
+
+**Gemma4 12B safetensors download**: ~14 GB of ~24 GB downloaded at `/mnt/data/ai/hf/models--google--gemma-4-12B-it/`. Will provide clean FP32 weights for converter-based quantization once complete.
 
 **Version history**:
-- v0.12.3: AWQ per-layer alpha search + FP16 scales fix. PPL 24.98→21.98 (AWQ+FP16 bug fixed). Per-layer alpha search (mean=0.416, 252 submodules). Script `scripts/quantize_awq_int4_8b.py` now writes FP32 scales, converts via `convert_scales_fp16.py`. `convert_scales_fp16.py` accepts CLI args. New weight dir `weights_int4_qwen3_8b_awq_perlayer/` (6.1 GB FP32) and `weights_int4_qwen3_8b_awq_perlayer_fp16sc/` (5.1 GB FP16).
+- v0.13.0: Docker image pushed (198 MB). 5 model aliases: int4_8b, batched, llama32-3b, int4_14b. Fused kernels + FP16 scales + AWQ. Header 1555→873 lines. Dead code cleanup (25 kernel sources removed, 139→138 symbols). Tagged git v0.13.
+- v0.12.7: 14B INT4 raw quantization complete (6.9 GB, 645 files). Disk cleanup (~550 GB freed).
 - v0.12.1: Fixed multi-block RMSNorm bug in fusion kernels. Wired all 4 fusion sites (3 RMSNorm + 1 SwiGLU). M=1 warp 64→70 t/s (+9%). PPL 24.39→21.98 (-10%, better than baseline 23.52!). New unit test bench/test_fused_int4.cu (bit-identical at N=4096/12288).
 - v0.12.0: INT4 8B FP16 weight scales. PPL 23.52→24.39 (+0.87). M=1 56→74 t/s (+32%). M=8 207→205, M=16 217→220. New kernels `gemv_int4_warp_f16wsc`/`gemv_int4_batched_f16wsc` (templated on WScaleT). New weight dir `weights_int4_qwen3_8b_fp16sc/` (4.8 GB, scales FP16). Conversion script `scripts/convert_scales_fp16.py`. dp4a INT4 inner loop (prior phase).
 - v0.11.0: Multi-chunk prefill (any prompt length). Fixed pinned buffer seq_pos race. Server hardening (rate limit all endpoints, restart, payload limit, max_tokens clamp, security fixes).
@@ -70,21 +83,40 @@ and MIXED(8 FP16 + 28 INT8) produce IDENTICAL output. The earlier
 "garbled 8B INT8" observation was from WRONG model dimensions.
 
 **Gemma 4 12B INT4 (Session 79-81)**: New model ported via GGUF bridge.
-- Config: H=3840, I=15360, NL=48, nqh=16, nkv=8, hd=512, V=262144
-- GeGLU activation (not SwiGLU), sliding window attention (every 6th layer is SWA, shares V weights)
-- No QK head norms (Gemma doesn't use them)
+- Config: H=3840, I=15360, NL=48, nqh=16, nkv=8, hd=256, V=262144
+- GeGLU activation (not SwiGLU), sliding window attention (every 6th layer is SWA)
+- QK head norms on ALL layers (per-layer files)
+- 4 RMSNorms per layer: attn_norm, post_attention_norm, ffn_norm, post_ffw_norm
 - Tokenizer: SentencePiece (BPE incompatible — use Python HF tokenizer wrapper)
-- Weights: 11 GB, fits in 16 GB GPU
-- Benchmark: 24 t/s (`./bench/text_generate_gemma`)
-- HTTP: `http_subprocess gemma` → 24 t/s
-- See `scripts/gemma_wrapper.py` for correct tokenization
+- Tied embeddings: embed_tokens == lm_head (no separate lm_head)
+- Final logit softcapping: cap=30.0
 
-**Benchmarks (INT4 8B)**
+**Gemma 4 12B QAT (Session 84)**: QAT model from `google/gemma-4-12B-it-qat-q4_0-gguf`.
+- Converted via `better-inference/gguf_convert` from Q4_0 GGUF → INT4 block-16
+- **FA layers** at positions 5,11,17,23,29,35,41,47: double Q heads (32×256=8192), K=V (k_eq_v, 2 heads=512), no v_proj, o_proj input 8192→3840
+- **SWA layers** (40 layers): standard 16 Q heads (4096), 8 KV heads (2048), has v_proj
+- Layer 47: missing q_proj in GGUF (truncated). Bench shares from layer 46.
+- Weights: 7.0 GB (322 INT4 weight files + norms + embed)
+- Bench runs at 43 t/s M=1 but quality garbled (KV cache sharing for FA layers not implemented)
+- Bench: `./bench/text_generate_gemma4_12b_qat [token_file] [tokens]`
+- Server dims fixed (was H=4608/hd=128/NL=40 — now H=3840/hd=256/NL=48)
+- Server needs FA layer handling ported (K=V, double Q, no v_proj)
+
+**Key QAT architecture findings**:
+- FA layers use `k_eq_v=True` (K == V, single shared projection), from HF Transformers code
+- FA layers have `num_global_key_value_heads` = 2, `global_head_dim` = 256
+- GGUF converter doesn't emit v_proj for FA layers (correct — they don't exist)
+- GGUF converter truncates layer 47 q_proj (GGUF tensor missing)
+- Gemma 4 uses `shared_kv_states` dict: last N layers reuse K/V from last same-type layer
+- For both bench and server: FA layer KV cache management is incomplete — needs proper shared KV handling
+
+**Benchmarks (INT4)**
 | Config | t/s | ms/tok | Notes |
 |--------|-----|--------|-------|
-| Batched GEMV M=1 | **63** | **16** | Production |
-| Warp GEMV M=1 | **59** | **17** | Benchmark |
-| HTTP batched | **55** | **18** | With HTTP overhead |
+| Llama 3.2 3B M=1 | **155** | **6.5** | Experimental (garbled) |
+| Qwen3-8B M=1 | **63** | **16** | Production |
+| Warp GEMV M=1 (8B) | **59** | **17** | Benchmark |
+| HTTP batched (8B) | **55** | **18** | With HTTP overhead |
 
 **nsys Profile Breakdown** (nsys profile --trace=cuda):
 | Kernel | % Time | Avg (μs) | Instances |
@@ -118,6 +150,7 @@ Benchmark: `./bench/text_generate_int4_batched "prompt" M gen_tokens weights_int
 - **Critical fix**: GGUF v3 tensor offsets are RELATIVE to tensor data section, not absolute. Converter must add `tensor_data_off` to `ti.offset` when reading tensor data. This bug caused all F32 layernorm weights to be garbage → NaN logits.
 - **RoPE fix**: GGUF v3 uses nested prefixes (rope.freq_base stored under full repo URL). Fixed by searching for any key ending with the suffix.
 - **Llama 3.2 1B verified**: `bench/text_generate_llama32_1b` — 223 t/s, coherent output. 16L, H=2048, I=8192, nqh=32, nkv=8, hd=64, V=128256, rope_theta=500000. Mixed Q4_K/Q6_K quantization. 262 files, 891 MB.
+- **Llama 3.2 3B INT4**: `bench/text_generate_llama32_3b` — 155 t/s, 28L, H=3072, I=8192, nqh=24, nkv=8, hd=128, V=128256, rope_theta=500000. Server alias `llama32-3b`. Tied embeddings. Garbled output (28-layer INT4 wall).
 - **Qwen2.5-0.5B verified**: 392 files, mixed Q4_K/Q5_0/Q6_K/Q8_0. Config: 24 layers, H=896, I=4864, nqh=14, nkv=2, hd=64.
 - Usage: `./better-inference/gguf_convert model.gguf output_dir/`
 
@@ -162,7 +195,7 @@ hd=128, KV=1024). **8B server dims also correct** (nqh=32, nkv=8, hd=128).
 **Stack**: CUDA 13.3, SM_120a, CMake, C++17
 **Target**: RTX 5060 Ti 16 GB, compute 12.0, 36 SMs, ~500 GB/s GDDR7
 **Nvcc path**: `/usr/local/cuda-13.3/bin/nvcc`
-**Library**: 189 symbols in `build/libblackwell_kernels.a`
+**Library**: 139 symbols in `build/libblackwell_kernels.a`
 
 **Production kernels (INT8 path)**:
 - `gemv_int8_warp` — Warp-cooperative INT8 GEMV (1 warp/row, dp4a SIMD, shuffle reduce)
@@ -275,7 +308,7 @@ python3 scripts/gemma_wrapper.py "The capital of France is" 30
 
 ### Diagnostics
 ```bash
-nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 189
+nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l  # expect 139
 ```
 
 ### Docker server (v0.7.0, 160 MB, weights mounted at runtime)
@@ -296,13 +329,18 @@ docker run --gpus all -p 8081:8080 \
 ### INT4 Docker (v0.10.0, 154 MB)
 ```bash
 docker build -f Dockerfile.int4 -t blackwell-server:int4 .
+# v0.13 models: int4_8b (production), batched (M=8), llama32-3b (experimental), int4_14b (experimental)
 # Run with weights mounted:
 docker run --gpus all -p 8080:8080 \
-  -v /path/to/weights_int4_qwen3_8b:/app/weights_int4_qwen3_8b \
-  -v /path/to/weights_int8_qwen3_8b:/app/weights_int8_qwen3_8b \
+  -v /path/to/weights_int4_qwen3_8b_fp16sc:/app/weights_int4_qwen3_8b_fp16sc \
+  -v /path/to/tokenizer_data.bin:/app/tokenizer_data.bin \
   blackwell-server:int4 8080 int4_8b
+# Run Llama 3.2 3B:
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/weights_llama32_3b:/app/weights_llama32_3b \
+  blackwell-server:int4 8080 llama32-3b
 ```
-### Docker compose (multi-model)
+### Docker compose (multi-model, TBD — docker-compose.yml not yet updated for v0.13)
 ```bash
 docker-compose up -d blackwell-1.7b   # port 8081
 docker-compose up -d blackwell-9b    # port 8083
@@ -327,6 +365,7 @@ weights_int4_qwen3_8b_awq_perlayer/ # 8B INT4 AWQ per-layer α, FP32 scales (6.1
 weights_int4_qwen3_8b_awq_perlayer_fp16sc/ # 8B INT4 AWQ per-layer α, FP16 scales (5.1 GB, PPL 21.98) — BEST QUALITY v0.12.3
 weights_int4_qwen3_8b_awq_wikitext/ # 8B INT4 AWQ per-layer α, WikiText-2 corpus, FP32 (5.7 GB, PPL 21.98)
 weights_int4_qwen3_8b_awq_wikitext_fp16sc/ # 8B INT4 AWQ per-layer α, WikiText-2 corpus, FP16 (4.7 GB, PPL 21.98)
+weights_int4_qwen3_14b_fp16sc/ # 14B INT4 raw, FP16 scales (6.9 GB, 645 files) — NEW v0.12.7
 weights_int8_qwen3_8b_mixed/  # 8B mixed: 8 FP16 + 28 INT8 (same quality as all-INT8)
 weights_int8_qwen3_8b_all_int8/ # 8B pure INT8 copy
 weights_int8_qwen35_9b/        # 9B GatedDeltaNet INT8 (11 GB)
@@ -541,7 +580,7 @@ observe → plan → edit → build → test → reflect → update AGENTS.md on
 
 Build: `CUDACXX=/usr/local/cuda-13.3/bin/nvcc cmake -B build && cmake --build build --parallel`
 Test: `./bench/decode_int8_cgraph 28` (M=1 benchmark)
-Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 189)
+Verify: `nm build/libblackwell_kernels.a | c++filt | grep " T blackwell" | wc -l` (expect 139)
 HTTP test: `curl -s -X POST http://localhost:8123/v1/completions -H "Content-Type: application/json" -d '{"prompt":"hi","max_tokens":1}'`
 
 ---

@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // server/inference_server_int4_batched.cu — Batched INT4 8B server
 // Processes up to M=8 prompts, each independently, then returns batched results.
 //
@@ -46,21 +48,6 @@ static DevW4 upload_w4(const char* prefix) {
 }
 
 // FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
-struct DevW4f16 { int K, N; uint8_t* d; __half* sc16; };
-static DevW4f16 upload_w4_f16sc(const char* prefix) {
-    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
-    FILE* f=fopen(p,"rb"); if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}
-    int h[5]; fread(h,4,5,f);
-    DevW4f16 dw; dw.K=h[0]; dw.N=h[1];
-    size_t ds=(size_t)h[0]*h[1]/2;
-    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
-    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
-    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
-    size_t ss=(size_t)h[3]*h[4];
-    __half* ts=new __half[ss]; fread(ts,2,ss,f); fclose(f);
-    cudaMalloc(&dw.sc16,ss*2); cudaMemcpy(dw.sc16,ts,ss*2,cudaMemcpyHostToDevice); delete[] ts;
-    return dw;
-}
 
 struct LW4 { DevW4f16 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
 
@@ -85,19 +72,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float theta=(float)pos*powf(1000000.0f,-2.0f*(float)d/(float)head_dim);
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
-}
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w, const float* host_sc, int K) {
-    int kblocks=K/16;
-    for(int b=0;b<kblocks;++b){
-        float sc=host_sc[token*kblocks+b];
-        for(int i=0;i<16;++i){
-            size_t byte_idx=(size_t)token*K/2+(size_t)b*8+i/2;
-            uint8_t byte=host_w[byte_idx];
-            int nib=(i&1)?((byte>>4)&0x0F):(byte&0x0F);
-            out[b*16+i]=(float)(nib-8)*sc;
-        }
-    }
 }
 
 static std::string read_stdin_line() {
@@ -160,7 +134,9 @@ static cudaStream_t st;
 
 static std::vector<LW4> W(NL);
 static DevW4f16 embed_w, lm_head_w;
-static float* d_embed_fp32;  // Pre-loaded full embedding table (FP32)
+// Host-side INT4 embed data for on-the-fly CPU dequant (saves 2.5 GB GPU memory)
+static uint8_t* host_embed_d = nullptr;
+static float* host_embed_sc = nullptr;
 static blackwell::BpeTokenizer tokenizer;
 
 #define AL(p,n) die(cudaMalloc(&(p),(n)),"malloc "#p)
@@ -201,40 +177,20 @@ static void load_model() {
     lm_head_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
     fprintf(stderr,"  embed: %dx%d, lm_head: %dx%d\n",embed_w.K,embed_w.N,lm_head_w.K,lm_head_w.N);
     
-    // Pre-load full embedding table to GPU as FP32 (optimization)
-    // Dequantize once at startup, avoid per-token CPU dequantization
+    // Load INT4 embed on host for CPU dequant (no GPU FP32 cache)
+    if (host_embed_d) delete[] host_embed_d;
+    if (host_embed_sc) delete[] host_embed_sc;
     size_t embed_size = (size_t)embed_w.K * embed_w.N;
-    die(cudaMalloc(&d_embed_fp32, embed_size * 4), "embed_fp32");
-    
-    // Load INT4 embedding, dequantize to FP32, copy to GPU
-    uint8_t* tmp_i4 = new uint8_t[embed_size / 2];
-    float* tmp_sc = new float[embed_w.N * (embed_w.K / 16)];
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
-     fread(tmp_i4,1,(size_t)h[0]*h[1]/2,f);fclose(f);
-     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");fread(h,4,5,f);
-     {__half* tmp_sc16=new __half[(size_t)h[3]*h[4]];fread(tmp_sc16,2,(size_t)h[3]*h[4],f);
-      for(size_t i=0;i<(size_t)h[3]*h[4];++i) tmp_sc[i]=__half2float(tmp_sc16[i]);
+    host_embed_d = new uint8_t[embed_size / 2];
+    host_embed_sc = new float[embed_w.N * (embed_w.K / 16)];
+    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");if(!f){fprintf(stderr,"FAIL open embed_tokens.int4_t\n");exit(1);}int h[5];if(fread(h,4,5,f)!=5){fprintf(stderr,"FAIL read embed header\n");exit(1);}
+     if(fread(host_embed_d,1,(size_t)h[0]*h[1]/2,f)!=(size_t)h[0]*h[1]/2){fprintf(stderr,"FAIL read embed data\n");exit(1);}fclose(f);
+     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");if(!f){fprintf(stderr,"FAIL open embed_tokens.scale_t\n");exit(1);}if(fread(h,4,5,f)!=5){fprintf(stderr,"FAIL read embed scale header\n");exit(1);}
+     {__half* tmp_sc16=new __half[(size_t)h[3]*h[4]];if(fread(tmp_sc16,2,(size_t)h[3]*h[4],f)!=(size_t)h[3]*h[4]){fprintf(stderr,"FAIL read embed scales\n");exit(1);}
+      for(size_t i=0;i<(size_t)h[3]*h[4];++i) host_embed_sc[i]=__half2float(tmp_sc16[i]);
       delete[] tmp_sc16;}
      fclose(f);}
-    
-    // Dequantize to FP32 on CPU
-    float* tmp_fp32 = new float[embed_size];
-    int kblocks = embed_w.K / 16;
-    for (int row = 0; row < embed_w.N; ++row) {
-        for (int kb = 0; kb < kblocks; ++kb) {
-            float sc = tmp_sc[row * kblocks + kb];
-            for (int i = 0; i < 16; ++i) {
-                size_t byte_idx = (size_t)row * embed_w.K / 2 + (size_t)kb * 8 + i / 2;
-                uint8_t byte = tmp_i4[byte_idx];
-                int nib = (i & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
-                tmp_fp32[row * embed_w.K + kb * 16 + i] = (float)(nib - 8) * sc;
-            }
-        }
-    }
-    die(cudaMemcpy(d_embed_fp32, tmp_fp32, embed_size * 4, cudaMemcpyHostToDevice), "embed_copy");
-    delete[] tmp_i4; delete[] tmp_sc; delete[] tmp_fp32;
-    
-    fprintf(stderr,"All weights loaded (embed pre-loaded to GPU).\n");
+    fprintf(stderr,"All weights loaded (host-side INT4 embed).\n");
 }
 
 static void alloc_buffers() {
@@ -266,10 +222,13 @@ static std::vector<uint32_t> generate_one(
     cudaMemset(d_kc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
     cudaMemset(d_vc,0,(size_t)NL*nkv*MAXSEQ*hd*4);
 
+    std::vector<float> h_embed(H);
+
     for (int step = 0; step < total; ++step) {
         uint32_t tid = (step < gen_start) ? all_ids[step] : all_ids.back();
-        // Direct GPU copy from pre-loaded embedding (no CPU dequantization)
-        die(cudaMemcpyAsync(d_x32, d_embed_fp32 + (size_t)tid * H, H * 4, cudaMemcpyDeviceToDevice, st), "embed");
+        // CPU dequant from INT4 embed, then H2D copy (no GPU FP32 cache)
+        dequant_embed_row(h_embed.data(), tid, host_embed_d, host_embed_sc, H);
+        die(cudaMemcpyAsync(d_x32, h_embed.data(), H*4, cudaMemcpyHostToDevice, st), "embed");
 
         for (int l = 0; l < NL; ++l) {
             size_t kv_off = (size_t)l*nkv*MAXSEQ*hd;
@@ -401,12 +360,14 @@ static std::vector<std::vector<uint32_t>> generate_batch_multi(
 
     int max_steps = max_new + *std::max_element(gen_start.begin(), gen_start.end());
 
+    std::vector<float> h_embed(H);
     for (int step = 0; step < max_steps; ++step) {
-        // Embed all M sequences (D2D from pre-loaded FP32 table)
+        // Embed all M sequences (CPU dequant + H2D)
         for (int m = 0; m < M; ++m) {
             uint32_t tid = (step < gen_start[m]) ? all_ids[m][step] : all_ids[m].back();
-            cudaMemcpyAsync(g_bs.d_x32 + (size_t)m*H, d_embed_fp32 + (size_t)tid*H,
-                           H*4, cudaMemcpyDeviceToDevice, st);
+            dequant_embed_row(h_embed.data(), tid, host_embed_d, host_embed_sc, H);
+            cudaMemcpyAsync(g_bs.d_x32 + (size_t)m*H, h_embed.data(),
+                           H*4, cudaMemcpyHostToDevice, st);
         }
 
         for (int l = 0; l < NL; ++l) {

@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/decode_int4_cgraph_8b.cu — CUDA Graph for INT4 8B
 // Captures full 36-layer decode loop with graph-safe KV cache + attention + RoPE.
 // All seq_pos reads from device memory (no H2D memcpy in capture).
@@ -41,21 +43,6 @@ static DevW4 upload_w4(const char* prefix) {
 }
 
 // FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
-struct DevW4f16 { int K, N; uint8_t* d; __half* sc16; };
-static DevW4f16 upload_w4_f16sc(const char* prefix) {
-    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
-    FILE* f=fopen(p,"rb"); if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}
-    int h[5]; fread(h,4,5,f);
-    DevW4f16 dw; dw.K=h[0]; dw.N=h[1];
-    size_t ds=(size_t)h[0]*h[1]/2;
-    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
-    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
-    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
-    size_t ss=(size_t)h[3]*h[4];
-    __half* ts=new __half[ss]; fread(ts,2,ss,f); fclose(f);
-    cudaMalloc(&dw.sc16,ss*2); cudaMemcpy(dw.sc16,ts,ss*2,cudaMemcpyHostToDevice); delete[] ts;
-    return dw;
-}
 
 struct LW4 { DevW4f16 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
 
@@ -72,19 +59,6 @@ __global__ void head_norm_kernel(float* data, const float* weight, int nh, int h
     if(threadIdx.x==0) wp[0]=rsqrtf(s/hd+eps); __syncthreads();
     float is=wp[0];
     for(int i=threadIdx.x;i<hd;i+=blockDim.x) d[i]=d[i]*is*weight[i];
-}
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w, const float* host_sc, int K) {
-    int kblocks=K/16;
-    for(int b=0;b<kblocks;++b){
-        float sc=host_sc[token*kblocks+b];
-        for(int i=0;i<16;++i){
-            size_t byte_idx=(size_t)token*K/2+(size_t)b*8+i/2;
-            uint8_t byte=host_w[byte_idx];
-            int nib=(i&1)?((byte>>4)&0x0F):(byte&0x0F);
-            out[b*16+i]=(float)(nib-8)*sc;
-        }
-    }
 }
 
 // Pre-compute cos/sin RoPE cache for all positions up to MAXSEQ

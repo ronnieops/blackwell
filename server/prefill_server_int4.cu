@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // server/prefill_server_int4.cu — INT4 8B server with prefill support
 // Adds batched QKV projection for prompt tokens + prefill attention.
 // Overall: 8-13× prompt processing speedup.
@@ -75,8 +77,6 @@ __global__ void rope_kernel(float* d, int nh, int hd, int pos) {
     float c=cosf(t),s=sinf(t),x=p[0],y=p[1];
     p[0]=x*c-y*s; p[1]=x*s+y*c;
 }
-
-static void dequant_embed_row(float* out, int tok, const uint8_t* host_w,
     const float* host_sc, int K) {
     int kb=K/16;
     for(int b=0;b<kb;++b){

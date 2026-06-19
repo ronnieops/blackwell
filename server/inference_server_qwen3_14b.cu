@@ -1,9 +1,8 @@
 #include "blackwell/int4_weights.h"
 using namespace blackwell::weights;
-// server/inference_server_int4.cu — INT4 Qwen3-8B inference server (JSON stdio)
-// Uses the EXACT decode loop from bench/text_generate_int4_qwen3_8b.cu
-// which produces correct coherent output at 57 t/s.
-//
+// server/inference_server_qwen3_14b.cu — INT4 Qwen3-14B inference server (JSON stdio)
+// EXPERIMENTAL: 14B INT4 produces garbled output (40-layer depth at 4-bit).
+// Use 8B server for production-quality inference.
 // Protocol: reads JSON from stdin, writes JSON to stdout.
 // Input:  {"prompts":["str1","str2"],"max_tokens":N,"temperature":T,"top_k":K,"repetition_penalty":P}
 // Output: {"tokens":[[id1,...],[...]],"text":["text1","text2"]}
@@ -29,31 +28,13 @@ static void die(cudaError_t e, const char* m) {
     if(e!=cudaSuccess){fprintf(stderr,"FAIL %s: %s\n",m,cudaGetErrorString(e));exit(1);}
 }
 
-const int H=4096, Q=4096, KV=1024, I=12288;
-const int nqh=32, nkv=8, hd=128, MAXSEQ=2048;
+const int H=5120, Q=5120, KV=1024, I=17408;
+const int nqh=40, nkv=8, hd=128, MAXSEQ=2048;
 const float eps=1e-6f;
 const int V=151936;
-const int NL=36;
+const int NL=40;
 
-// ── INT4 weight struct + loader ──
-struct DevW4 { int K, N; uint8_t* d; float* sc; };
-
-static DevW4 upload_w4(const char* prefix) {
-    char p[256]; snprintf(p,256,"%s.int4_t",prefix);
-    FILE* f=fopen(p,"rb"); if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}
-    int h[5]; fread(h,4,5,f);
-    DevW4 dw; dw.K=h[0]; dw.N=h[1];
-    size_t ds=(size_t)h[0]*h[1]/2;
-    uint8_t* td=new uint8_t[ds]; fread(td,1,ds,f); fclose(f);
-    cudaMalloc(&dw.d,ds); cudaMemcpy(dw.d,td,ds,cudaMemcpyHostToDevice); delete[] td;
-    snprintf(p,256,"%s.scale_t",prefix); f=fopen(p,"rb"); fread(h,4,5,f);
-    size_t ss=(size_t)h[3]*h[4];
-    float* ts=new float[ss]; fread(ts,4,ss,f); fclose(f);
-    cudaMalloc(&dw.sc,ss*4); cudaMemcpy(dw.sc,ts,ss*4,cudaMemcpyHostToDevice); delete[] ts;
-    return dw;
-}
-
-// FP16 weight-scale variant. W_scale uploaded as __half (half the traffic).
+// ── INT4 weight struct + loader (FP16 scales) ──
 
 struct LW4 { DevW4f16 q,k,v,o,g,u,d; float* qn,*kn,*rn_in,*rn_post; };
 
@@ -190,28 +171,30 @@ static cudaStream_t st;
 
 static std::vector<LW4> W(NL);
 static DevW4f16 embed_w, lm_head_w;
-static uint8_t* host_embed_d;
-static float* host_embed_sc;
+static uint8_t* host_embed_d = nullptr;
+static float* host_embed_sc = nullptr;
 static blackwell::BpeTokenizer tokenizer;
 
 #define AL(p,n) die(cudaMalloc(&(p),(n)),"malloc " #p)
 
+static const char* g_weight_dir = "weights_int4_qwen3_14b_awq";
+
 static void load_model() {
-    fprintf(stderr, "Loading %d-layer INT4 model...\n", NL);
+    fprintf(stderr, "Loading %d-layer INT4 model from %s...\n", NL, g_weight_dir);
     char p[256];
     for (int l = 0; l < NL; ++l) {
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l); W[l].q=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l); W[l].k=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l); W[l].v=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l); W[l].o=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l); W[l].g=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l);   W[l].u=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l); W[l].d=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_q_proj",g_weight_dir,l); W[l].q=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_k_proj",g_weight_dir,l); W[l].k=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_v_proj",g_weight_dir,l); W[l].v=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_o_proj",g_weight_dir,l); W[l].o=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_gate_proj",g_weight_dir,l); W[l].g=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_up_proj",g_weight_dir,l);   W[l].u=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_down_proj",g_weight_dir,l); W[l].d=upload_w4_f16sc(p);
         if ((l+1)%7==0) fprintf(stderr, "  layer %d/%d\n", l+1, NL);
     }
     // QK norms
     float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");size_t nr=fread(qk_h,4,NL*2*hd,f);if(nr!=(size_t)NL*2*hd){fprintf(stderr, "Truncated qk_norms\n");exit(1);}fclose(f);}
+    {snprintf(p,256,"%s/qk_norms.f32",g_weight_dir);FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}size_t nr=fread(qk_h,4,NL*2*hd,f);if(nr!=(size_t)NL*2*hd){fprintf(stderr, "Truncated qk_norms\n");exit(1);}fclose(f);}
     for(int l=0;l<NL;++l){
         cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
         cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
@@ -219,29 +202,32 @@ static void load_model() {
     // Per-layer RMSNorm
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
-        {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated layernorm %d\n",l);exit(1);}fclose(f);}
+        snprintf(p,256,"%s/%d_ln1.f32",g_weight_dir,l);
+        {FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated ln1 %d\n",l);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
-        {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated post layernorm %d\n",l);exit(1);}fclose(f);}
+        snprintf(p,256,"%s/%d_ln2.f32",g_weight_dir,l);
+        {FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated ln2 %d\n",l);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     // Final norm
     {float*w=(float*)malloc(H*4);
-     FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated final_norm\n");exit(1);}fclose(f);
+     snprintf(p,256,"%s/final_norm.f32",g_weight_dir);FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated final_norm\n");exit(1);}fclose(f);
      AL(d_fn,H*4); cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice); free(w);}
     // Embed + lm_head
-    embed_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/embed_tokens");
-    lm_head_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
+    snprintf(p,256,"%s/embed_tokens",g_weight_dir); embed_w=upload_w4_f16sc(p);
+    snprintf(p,256,"%s/lm_head",g_weight_dir); lm_head_w=upload_w4_f16sc(p);
     fprintf(stderr,"  embed: %dx%d, lm_head: %dx%d\n",embed_w.K,embed_w.N,lm_head_w.K,lm_head_w.N);
     // Host embed for CPU dequant
+    // Free old allocations if reloading
+    if (host_embed_d) delete[] host_embed_d;
+    if (host_embed_sc) delete[] host_embed_sc;
     host_embed_d=new uint8_t[(size_t)embed_w.K*embed_w.N/2];
     host_embed_sc=new float[embed_w.N*(embed_w.K/16)];
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
-     size_t ds=(size_t)h[0]*h[1]/2;size_t nr=fread(host_embed_d,1,ds,f);if(nr!=ds){fprintf(stderr,"Truncated embed_tokens\n");exit(1);}fclose(f);
-     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");fread(h,4,5,f);
-     size_t ss=(size_t)h[3]*h[4];{__half* tmp=new __half[ss];size_t nr=fread(tmp,2,ss,f);if(nr!=ss){fprintf(stderr,"Truncated embed_tokens scales\n");exit(1);}
+    {snprintf(p,256,"%s/embed_tokens.int4_t",g_weight_dir);FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}int h[5];size_t nr=fread(h,4,5,f);if(nr!=5){fprintf(stderr,"FAIL read embed header\n");exit(1);}
+     size_t ds=(size_t)h[0]*h[1]/2;nr=fread(host_embed_d,1,ds,f);if(nr!=ds){fprintf(stderr,"Truncated embed_tokens\n");exit(1);}fclose(f);
+     snprintf(p,256,"%s/embed_tokens.scale_t",g_weight_dir);f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}nr=fread(h,4,5,f);if(nr!=5){fprintf(stderr,"FAIL read embed scale header\n");exit(1);}
+     size_t ss=(size_t)h[3]*h[4];{__half* tmp=new __half[ss];nr=fread(tmp,2,ss,f);if(nr!=ss){fprintf(stderr,"Truncated embed_tokens scales\n");exit(1);}
       for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);delete[] tmp;}fclose(f);}
     fprintf(stderr,"All weights loaded.\n");
 }
@@ -342,7 +328,7 @@ static void decode_one_token(uint32_t token_id, int step) {
 
 // Capture CUDA Graph for decode loop (one token through all layers)
 // Must be called after prefill (KV cache populated). Graph captures the full
-// 36-layer decode with device-side seq_pos. Between replays, update seq_pos
+// 40-layer decode with device-side seq_pos. Between replays, update seq_pos
 // via pinned host memory.
 static void capture_decode_graph() {
     cudaStream_t gs;
@@ -668,7 +654,17 @@ static std::string json_escape(const std::string& s) {
 int main(int argc, char** argv) {
     const char* model = argc > 1 ? argv[1] : "8b";
 
-    fprintf(stderr, "Blackwell INT4 Server v0.9.1\n");
+    fprintf(stderr, "Blackwell INT4 Server v0.9.1 - 14B EXPERIMENTAL\n");
+    fprintf(stderr, "WARNING: 14B INT4 garbled (40-layer depth at 4-bit). Use 8B for production.\n\n");
+
+    // Parse -w flag for weight directory
+    for (int i = 1; i < argc - 1; ++i) {
+        if (strcmp(argv[i], "-w") == 0) {
+            g_weight_dir = argv[i + 1];
+            break;
+        }
+    }
+
     cudaDeviceProp P; cudaGetDeviceProperties(&P, 0);
     fprintf(stderr, "Device: %s (CC %d.%d)\n", P.name, P.major, P.minor);
 

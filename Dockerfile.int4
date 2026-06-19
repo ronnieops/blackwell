@@ -1,32 +1,36 @@
-# Dockerfile — Blackwell Multi-Model Inference Server
-# Supports: Qwen3-8B INT4 (56 t/s), Llama 3.2 1B, Llama 3.1 8B
+# Dockerfile — Blackwell Multi-Model Inference Server v0.13
+# Supports: Qwen3-8B INT4 (74 t/s, AWQ, fused kernels, FP16 scales)
+#           Llama 3.2 3B INT4 (155 t/s, experimental — garbled)
+#           Qwen3-14B INT4 (35 t/s, experimental — garbled)
 # Weights + tokenizers mounted as volumes at runtime
 #
 # Build:
 #   docker build -f Dockerfile.int4 -t blackwell-server:int4 .
 #
-# Run Qwen3-8B INT4:
+# Run Qwen3-8B INT4 (production):
 #   docker run --gpus all -p 8080:8080 \
-#     -v /mnt/data/ai/models/qwen3-8b-int4:/app/weights_int4_qwen3_8b \
-#     -v /mnt/data/ai/models/qwen3-8b-int4/tokenizer_data.bin:/app/tokenizer_data.bin \
+#     -v /path/to/weights_int4_qwen3_8b_fp16sc:/app/weights_int4_qwen3_8b_fp16sc \
+#     -v /path/to/tokenizer_data.bin:/app/tokenizer_data.bin \
 #     blackwell-server:int4 8080 int4_8b
 #
-# Run Llama 3.2 1B:
+# Run Llama 3.2 3B (experimental):
 #   docker run --gpus all -p 8080:8080 \
-#     -v /mnt/data/ai/models/llama32-1b-int4-from-safetensors:/app/weights_llama32_1b \
-#     -v /mnt/data/ai/models/llama32-1b-int4-from-safetensors/tokenizer_data.bin:/app/tokenizer_data_llama.bin \
-#     blackwell-server:int4 8080 llama32-1b
+#     -v /path/to/weights_llama32_3b:/app/weights_llama32_3b \
+#     blackwell-server:int4 8080 llama32-3b
+#
+# v0.13 features:
+# - Fused QKV + gate-up kernels (3+2→2 launches per layer)
+# - FP16 weight scales (33% less GEMV memory traffic)
+# - AWQ per-layer calibration (PPL 21.98 for 8B)
+# - Batched server (M=8, 7.3 GB VRAM, no OOM)
+# - CUDA Graph support (760 nodes, +2.5%)
+# - Multi-model: Qwen3-8B, Llama 3.2 3B, Qwen3-14B
+# - 138 kernel symbols (was 209), 873-line header (was 1555)
 
 FROM ubuntu:24.04
 
-LABEL description="Blackwell Multi-Model — RTX 5060 Ti, Qwen3-8B + Llama"
-LABEL version="0.10.0"
-
-# v0.10.0 features:
-# - Fixed tokenizer byte encoder (GGUF converter bug: bytes 127+ had duplicate codepoints)
-# - Regenerated weights with quantize_generic.py (not GGUF bridge — double quantization error)
-# - Rate limiting (60 req/s per endpoint)
-# - Graceful shutdown (SIGINT/SIGTERM)
+LABEL description="Blackwell Multi-Model v0.13 — RTX 5060 Ti, Qwen3-8B INT4 (74 t/s)"
+LABEL version="0.13.0"
 
 RUN apt-get update \
     -o Acquire::Check-Valid-Until=false \
@@ -36,14 +40,19 @@ RUN apt-get update \
     apt-get install -y --allow-unauthenticated --no-install-recommends \
     ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-# Copy CUDA runtime library from host
+# Copy CUDA 13.3 runtime library
 COPY cuda-libs/libcudart.so.13* /usr/local/lib/
 RUN ln -sf /usr/local/lib/libcudart.so.13 /usr/local/lib/libcudart.so
 
 WORKDIR /app
 
 # Binaries (weights + tokenizers mounted from host at runtime)
-COPY server/http_subprocess server/inference_server_int4 server/inference_server_llama /app/server/
+COPY server/http_subprocess \
+     server/inference_server_int4 \
+     server/inference_server_int4_batched \
+     server/inference_server_llama32_3b \
+     server/inference_server_qwen3_14b \
+     /app/server/
 
 RUN ldconfig || true
 
@@ -51,5 +60,5 @@ EXPOSE 8080
 ENV CUDA_VISIBLE_DEVICES=0
 
 ENTRYPOINT ["/app/server/http_subprocess"]
-# Models: int4_8b (Qwen3-8B), llama32-1b, llama31-8b
+# Models: int4_8b (Qwen3-8B, production), batched (M=8), llama32-3b (experimental), int4_14b (experimental)
 CMD ["8080", "int4_8b"]

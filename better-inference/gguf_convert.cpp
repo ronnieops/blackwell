@@ -20,6 +20,21 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+// FP16 helpers (host-side, no CUDA dependency)
+static uint16_t float_to_half(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    uint32_t sign = (u >> 16) & 0x8000;
+    uint32_t exp = (u >> 23) & 0xFF;
+    uint32_t mant = u & 0x7FFFFF;
+    if (exp == 0xFF) { return (uint16_t)(sign | 0x7C00 | (mant ? 0x200 : 0)); }
+    if (exp == 0) { return (uint16_t)(sign | 0); }
+    int32_t newexp = (int32_t)exp - 127 + 15;
+    if (newexp >= 31) { return (uint16_t)(sign | 0x7C00); }
+    if (newexp <= 0) { return (uint16_t)(sign | 0); }
+    uint32_t newmant = mant >> 13;
+    return (uint16_t)(sign | (newexp << 10) | newmant);
+}
 #include "gguf.h"
 
 struct GGUFFile {
@@ -74,16 +89,22 @@ static void write_int4_weight(const char* out_dir, const char* name,
     fwrite(packed, 1, (size_t)N * K / 2, f);
     fclose(f);
 
-    // .scale_t: header [0, 0, 0, num_kb, N] + scales
+    // .scale_t: header [0, 0, 0, num_kb, N] + scales as FP16
+    // Bench upload functions (upload_w4_f16sc) read scales as __half (2 bytes each)
     snprintf(path, 256, "%s/%s.scale_t", out_dir, name);
     f = fopen(path, "wb");
     if (!f) return;
     int hdr_sc[5] = {0, 0, 0, num_kb, N};
     fwrite(hdr_sc, 4, 5, f);
-    fwrite(scales, 4, (size_t)N * num_kb, f);
+    // Convert FP32 scales to FP16
+    size_t num_scales = (size_t)N * num_kb;
+    uint16_t* hsc = new uint16_t[num_scales];
+    for (size_t i = 0; i < num_scales; i++) hsc[i] = float_to_half(scales[i]);
+    fwrite(hsc, 2, num_scales, f);
+    delete[] hsc;
     fclose(f);
 
-    double mb = ((double)N * K / 2 + (double)N * num_kb * 4) / (1024 * 1024);
+    double mb = ((double)N * K / 2 + (double)N * num_kb * 2) / (1024 * 1024);
     printf("  %s: %dx%d INT4 %.1fMB\n", name, N, K, mb);
 }
 
@@ -134,7 +155,7 @@ static void write_fp16_weight(const char* out_dir, const char* name, const float
 // Write combined Q/K head norms
 static void write_qk_norms(const char* out_dir, int NL, int hd,
                            const float* qnorms, const float* knorms) {
-    // Layout: [l][2][hd] — q_norm then k_norm per layer
+    // Layout: [l][2][hd] - q_norm then k_norm per layer
     std::vector<float> buf((size_t)NL * 2 * hd);
     for (int l = 0; l < NL; l++) {
         memcpy(&buf[(size_t)l * 2 * hd], &qnorms[(size_t)l * hd], hd * 4);
@@ -162,11 +183,10 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(out_dir);
 
     // Load GGUF
-    GGUFFile gf = load_whole_file(gguf_path);
-    if (!gf.data) { fprintf(stderr, "FAIL: can't read %s\n", gguf_path); return 1; }
+    // gguf_mem loaded after config parse (we need tensor_data_off first)
 
     // Parse header manually (since GGUFReader uses FILE*, not memory)
-    // We'll use the reader approach — read from memory
+    // We'll use the reader approach - read from memory
     // For now, use GGUFReader on the file
     GGUFReader reader(gguf_path);
     if (!reader.valid()) { fprintf(stderr, "FAIL: can't parse GGUF\n"); return 1; }
@@ -181,12 +201,15 @@ int main(int argc, char** argv) {
     std::string prefix = arch;
     // Normalize: lowercase
     for (auto& c : prefix) if (c >= 'A' && c <= 'Z') c += 32;
+    bool is_gemma4 = (arch == "gemma4");
     bool is_llama = (arch == "llama");
 
     auto get_meta = [&](const char* key_suffix, int default_val) -> int {
         char full_key[128];
         snprintf(full_key, 128, "%s.%s", prefix.c_str(), key_suffix);
-        return reader.meta_int(full_key, default_val);
+        int v = reader.meta_int(full_key, -1);
+        if (v >= 0) return v;
+        return default_val;
     };
 
     int NL = get_meta("block_count", 0);
@@ -194,19 +217,75 @@ int main(int argc, char** argv) {
     int I = get_meta("feed_forward_length", 0);
     int nqh = get_meta("attention.head_count", 0);
     int nkv = get_meta("attention.head_count_kv", 0);
-    // Gemma 4 stores head_count_kv as a per-layer array (all values equal)
-    // If nkv == 0 from the array, try extracting the first element
-    if (nkv == 0) {
+    // Gemma 4 stores head_count_kv as a per-layer array
+    std::vector<int> l_nkv;
+    if (nkv == 0 && is_gemma4) {
         const auto& meta = reader.metadata();
         auto it = meta.find("gemma4.attention.head_count_kv");
         if (it != meta.end()) {
             if (auto* v = std::get_if<std::vector<int32_t>>(&it->second)) {
+                l_nkv.assign(v->begin(), v->end());
                 if (!v->empty()) nkv = (*v)[0];
+                printf("  head_count_kv per-layer: first=%d, count=%zu\n",
+                       nkv, l_nkv.size());
+            }
+        }
+    } else {
+        // Uniform KV heads; populate l_nkv for convenience
+        l_nkv.assign(NL, nkv);
+    }
+    // Gemma 4: head_count is also a per-layer array
+    std::vector<int> l_nqh;
+    if (nqh == 0 && is_gemma4) {
+        const auto& meta = reader.metadata();
+        auto it = meta.find("gemma4.attention.head_count");
+        if (it != meta.end()) {
+            if (auto* v = std::get_if<std::vector<int32_t>>(&it->second)) {
+                l_nqh.assign(v->begin(), v->end());
+                if (!v->empty()) nqh = (*v)[0];
+                printf("  head_count per-layer: first=%d, count=%zu\n",
+                       nqh, l_nqh.size());
+            }
+        }
+    } else {
+        l_nqh.assign(NL, nqh);
+    }
+    // Per-layer head_dim: Gemma 4 uses different dims for SWA (256) and FA (512)
+    int hd = get_meta("attention.key_length", 0);        // global (FA) head_dim
+    int hd_swa_meta = get_meta("attention.key_length_swa", 0);  // SWA head_dim
+    if (hd == 0 && nqh > 0) hd = H / nqh;
+
+    // Build per-layer head_dim array
+    std::vector<int> l_hd(NL, hd);
+    if (hd_swa_meta > 0 && hd_swa_meta != hd) {
+        // FA uses hd (global), SWA uses hd_swa_meta
+        for (int i = 0; i < NL; i++) {
+            if (i < (int)l_nkv.size() && l_nkv[i] > 0) {
+                // Layers with nkv=1 (FA) use hd; others (SWA) use hd_swa_meta
+                if (l_nkv[i] == 1)
+                    l_hd[i] = hd;
+                else
+                    l_hd[i] = hd_swa_meta;
+            }
+        }
+        printf("  head_dim per-layer: SWA=%d, FA=%d\n", hd_swa_meta, hd);
+    }
+    printf("  head_dim=%d (SWA), global=%d (FA)\n", hd_swa_meta > 0 ? hd_swa_meta : hd, hd);
+
+    // For Gemma 4, verify per-layer head_dim from first attn_q tensor
+    if (is_gemma4 && nqh > 0) {
+        for (auto& ti : reader.tensors()) {
+            if (ti.name.find("attn_q.weight") != std::string::npos && ti.shape.size() > 1) {
+                int N = (int)ti.shape[1];
+                int tensor_hd = N / nqh;
+                if (tensor_hd > 0) {
+                    printf("  Detected head_dim=%d from first attn_q tensor (nqh=%d, N=%d)\n",
+                           tensor_hd, nqh, N);
+                }
+                break;
             }
         }
     }
-    int hd = get_meta("attention.key_length", 0);
-    if (hd == 0) hd = (nqh > 0) ? H / nqh : 0;
     // Get vocab size from tokens array count in metadata
     auto it = reader.metadata().find("tokenizer.ggml.tokens");
     int V = 151936;
@@ -222,7 +301,7 @@ int main(int argc, char** argv) {
     // We need to search for any key ending with the suffix.
     auto get_meta_f = [&](const char* key_suffix, float default_val) -> float {
         char full_key[128];
-        snprintf(full_key, 128, "%s.%s", prefix, key_suffix);
+        snprintf(full_key, 128, "%s.%s", prefix.c_str(), key_suffix);
         auto it = reader.metadata().find(full_key);
         if (it != reader.metadata().end()) {
             if (auto* v = std::get_if<float>(&it->second)) return *v;
@@ -297,80 +376,12 @@ int main(int argc, char** argv) {
     // Tensor data offset: after header + metadata + tensor infos (aligned to 32)
     // Compute from the last tensor's offset + file_size in GGUFReader data.
     // The reader holds the raw file data, we need the start of the data section.
-    // Simplest: compute from the reader's tensor info — last tensor offset + size
-    // gives data section end, which equals data section start + data section size.
-    // Actually the reader doesn't have data section start readily. Compute manually:
-    uint64_t tensor_data_off = 24;  // skip header
-    {
-        // Re-read header values
-        uint64_t meta_count = *(const uint64_t*)(gguf_mem.data + 16);
-        uint64_t total_tensors = *(const uint64_t*)(gguf_mem.data + 8);
-        // Use GGUFReader's internal position to get tensor data offset
-        // The reader already parsed metadata + tensor info. We need the offset
-        // AFTER tensor info, aligned to 32 bytes.
-        // Compute from the file by finding the last tensor offset and its file_size.
-        auto& tensors = reader.tensors();
-        if (!tensors.empty()) {
-            uint64_t max_end = 0;
-            for (auto& t : tensors) {
-                uint64_t end = t.offset + t.file_size;
-                if (end > max_end) max_end = end;
-            }
-            // max_end is relative to data section start. The actual data section
-            // end in file = tensor_data_off + max_end. But we don't know tensor_data_off.
-            // Instead, compute from the first tensor offset.
-            // The first tensor's offset is 0, so tensor_data_off = first_tensor_file_pos.
-            // We can't get this from the reader since it stores relative offsets.
-            // Fallback: walk raw memory
-        }
-        // Walk raw memory to compute tensor_data_off
-        const uint8_t* pp = gguf_mem.data + 24;
-        fprintf(stderr, "DEBUG: gguf_mem.size=%zu, pp-offset=%llu\n", gguf_mem.size, (unsigned long long)(pp - gguf_mem.data));
-        for (uint64_t i = 0; i < meta_count; i++) {
-            if ((uint64_t)(pp - gguf_mem.data) + 12 > gguf_mem.size) {
-                fprintf(stderr, "META WALK: hit end of file at metadata %llu\n", (unsigned long long)i);
-                break;
-            }
-            uint64_t klen = *(const uint64_t*)pp; pp += 8;
-            pp += klen;
-            uint32_t raw_type = *(const uint32_t*)pp; pp += 4;
-            if (raw_type == 0) { pp += 1; }
-            else if (raw_type == 1) { pp += 1; }
-            else if (raw_type == 2) { pp += 2; }
-            else if (raw_type == 3) { pp += 2; }
-            else if (raw_type == 4) { pp += 4; }
-            else if (raw_type == 5) { pp += 4; }
-            else if (raw_type == 6) { pp += 4; }
-            else if (raw_type == 7) { pp += 1; }
-            else if (raw_type == 8) { uint64_t slen = *(const uint64_t*)pp; pp += 8; pp += slen; }
-            else if (raw_type == 9) {
-                uint32_t atype = *(const uint32_t*)pp; pp += 4;
-                uint64_t alen = *(const uint64_t*)pp; pp += 8;
-                if (atype == 8) { while (alen-- > 0) { uint64_t sl = *(const uint64_t*)pp; pp += 8; pp += sl; } }
-                else if (atype == 7 || atype == 0 || atype == 1) { pp += alen; }
-                else if (atype == 2 || atype == 3) { pp += alen * 2; }
-                else { pp += alen * 4; }
-            }
-            else if (raw_type == 10 || raw_type == 11) { pp += 8; }
-            else if (raw_type == 12) { pp += 2; }
-            else if (raw_type == 13) { pp += 8; }
-            else { pp += 4; }
-        }
-        // Skip tensor info entries
-        uint64_t total_tensors_from_header = *(const uint64_t*)(gguf_mem.data + 8);
-        for (uint64_t i = 0; i < total_tensors_from_header; i++) {
-            uint64_t nlen = *(const uint64_t*)pp; pp += 8;
-            pp += nlen;
-            uint32_t ndims = *(const uint32_t*)pp; pp += 4;
-            pp += ndims * 8;
-            pp += 4;  // type
-            pp += 8;  // offset
-        }
-        tensor_data_off = (uint64_t)(pp - gguf_mem.data);
-        tensor_data_off = (tensor_data_off + 31) & ~31;
-        printf("Tensor data offset: %llu\n", (unsigned long long)tensor_data_off);
-        fflush(stdout);
-    }
+    // Use GGUFReader's tracked tensor data offset.
+    // The reader records file position after metadata + tensor info parsing.
+    uint64_t tensor_data_off = reader.tensor_data_offset();
+    tensor_data_off = (tensor_data_off + 31) & ~31;  // 32-byte align
+    printf("Tensor data offset (from reader): %llu\n", (unsigned long long)tensor_data_off);
+    fflush(stdout);
 
     // Process all tensors from GGUF reader
     auto& tensors = reader.tensors();
@@ -383,19 +394,141 @@ int main(int argc, char** argv) {
     // Buffers for norms (collected per layer)
     std::vector<float> input_norms((size_t)NL * H);
     std::vector<float> post_norms((size_t)NL * H);
-    std::vector<float> q_norms((size_t)NL * hd, 1.0f);  // init to 1.0 (identity)
-    std::vector<float> k_norms((size_t)NL * hd, 1.0f);  // init to 1.0 (identity)
+    std::vector<float> pre_ffn_norms((size_t)NL * H);
+    std::vector<float> post_ffn_norms((size_t)NL * H);
+    // For Gemma 4, QK norms have per-layer head_dim (256 for SWA, 512 for FA)
+    // Compute per-layer offsets: we flatten into a single buffer with max hd per layer
+    int max_hd = hd;  // global hd (FA)
+    if (hd_swa_meta > max_hd) max_hd = hd_swa_meta;
+    std::vector<size_t> qk_offsets(NL + 1, 0);
+    for (int i = 0; i < NL; i++) {
+        int lhd = l_hd[i];
+        qk_offsets[i] = (i == 0) ? 0 : qk_offsets[i-1] + l_hd[i-1];
+    }
+    qk_offsets[NL] = qk_offsets[NL-1] + l_hd[NL-1];
+    size_t total_qk = qk_offsets[NL];
+    std::vector<float> q_norms(total_qk, 1.0f);
+    std::vector<float> k_norms(total_qk, 1.0f);
 
     // Process each tensor
     for (auto& ti : tensors) {
-        
+
         char bw_name[128];
-        if (!map_tensor_name(ti.name.c_str(), bw_name, sizeof(bw_name))) {
-            printf("  SKIP: %s (unmapped)\n", ti.name.c_str());
+
+        // Early-intercept: handle F32 norm tensors before map_tensor_name check.
+        // Gemma 4 uses additional norm tensor names not in the standard map.
+        if (ti.type == GGML_TYPE_F32 && ti.nelements() <= (uint64_t)std::max(H, hd) * 4) {
+            auto nm = ti.name.c_str();
+            int l = extract_blk_layer(nm);
+            // GUARD: reject OOB layer indices before any memcpy
+            if (l >= NL) {
+                printf("  SKIP: %s (layer %d >= NL=%d)\n", nm, l, NL);
+                continue;
+            }
+            // GUARD: check tensor data offset bounds before memcpy
+            if (tensor_data_off + ti.offset + ti.file_size > gguf_mem.size) {
+                printf("  ERROR: %s offset out of bounds\n", nm);
+                continue;
+            }
+            // Compute per-layer head_dim for QK norms
+            int l_hd_norm = (l >= 0 && l < (int)l_hd.size()) ? l_hd[l] : hd;
+            // Read GGUF tensor size to determine actual head_dim
+            uint64_t tensor_nelems = ti.nelements();
+            if (tensor_nelems > 0 && tensor_nelems < (uint64_t)hd) {
+                l_hd_norm = (int)tensor_nelems;
+            }
+            size_t qk_off = (l >= 0 && l < (int)qk_offsets.size()) ? qk_offsets[l] : 0;
+
+            if (strstr(nm, "attn_norm.weight") && !strstr(nm, "post_")) {
+                memcpy(&input_norms[(size_t)l * H], gguf_mem.data + tensor_data_off + ti.offset, H * 4);
+                printf("  %s: F32 attn_norm -> %d_input_layernorm\n", nm, l);
+                continue;
+            }
+            if (strstr(nm, "post_attention_norm.weight")) {
+                memcpy(&post_norms[(size_t)l * H], gguf_mem.data + tensor_data_off + ti.offset, H * 4);
+                printf("  %s: F32 -> %d_post_attn_norm\n", nm, l);
+                continue;
+            }
+            if (strstr(nm, "ffn_norm.weight") && !strstr(nm, "post_")) {
+                memcpy(&pre_ffn_norms[(size_t)l * H], gguf_mem.data + tensor_data_off + ti.offset, H * 4);
+                printf("  %s: F32 -> %d_post_attention_layernorm\n", nm, l);
+                continue;
+            }
+            if (strstr(nm, "post_ffw_norm.weight")) {
+                memcpy(&post_ffn_norms[(size_t)l * H], gguf_mem.data + tensor_data_off + ti.offset, H * 4);
+                printf("  %s: F32 -> %d_post_ffn_norm\n", nm, l);
+                continue;
+            }
+            if (strstr(nm, "attn_q_norm.weight")) {
+                int copy_hd = (int)std::min((uint64_t)l_hd_norm, ti.nelements());
+                memcpy(&q_norms[qk_off], gguf_mem.data + tensor_data_off + ti.offset, copy_hd * 4);
+                printf("  %s: F32 -> %d_attn_q_norm (%d dims)\n", nm, l, copy_hd);
+                continue;
+            }
+            if (strstr(nm, "attn_k_norm.weight")) {
+                int copy_hd = (int)std::min((uint64_t)l_hd_norm, ti.nelements());
+                memcpy(&k_norms[qk_off], gguf_mem.data + tensor_data_off + ti.offset, copy_hd * 4);
+                printf("  %s: F32 -> %d_attn_k_norm (%d dims)\n", nm, l, copy_hd);
+                continue;
+            }
+            if (strstr(nm, "output_norm.weight")) {
+                write_f32(out_dir, "final_norm", (const float*)(gguf_mem.data + tensor_data_off + ti.offset), ti.nelements());
+                printf("  final_norm: F32\n");
+                continue;
+            }
+            // Small F32 not matching any norm — skip (layer_output_scale, rope_freqs)
+            printf("  SKIP: %s (small F32, %llu elems)\n", nm, (unsigned long long)ti.nelements());
             continue;
         }
 
-        // Get file data pointer — GGUF v3 tensor offset is RELATIVE to tensor data section
+        if (!map_tensor_name(ti.name.c_str(), bw_name, sizeof(bw_name))) {
+            // For gemma4, attn_v.weight may be absent for FA layers (k_eq_v).
+            // If this is a block-level tensor name we don't recognize, check if it's
+            // the eval-only tensors (attn_v_eval, etc.) that we should skip.
+            if (is_gemma4) {
+                int ll = extract_blk_layer(ti.name.c_str());
+                if (ll >= 0 || strstr(ti.name.c_str(), "attn_v")) {
+                    printf("  SKIP: %s (unmapped — k_eq_v layer?)\n", ti.name.c_str());
+                } else {
+                    printf("  SKIP: %s (unmapped)\n", ti.name.c_str());
+                }
+            } else {
+                printf("  SKIP: %s (unmapped)\n", ti.name.c_str());
+            }
+            continue;
+        }
+
+        // For Gemma 4 FA layers (nkv=1): verify q_proj/o_proj dims match expected per-layer head_dim
+        int ll = extract_blk_layer(ti.name.c_str());
+        if (is_gemma4 && ll >= 0 && ll < (int)l_hd.size() && l_nkv[ll] == 1) {
+            uint64_t K = ti.shape[0];
+            uint64_t N = ti.shape.size() > 1 ? ti.shape[1] : 1;
+            int exp_hd = l_hd[ll];
+            (void)K;
+            // q_proj: N should be nqh * exp_hd
+            if (strstr(bw_name, "q_proj")) {
+                int exp_q = nqh * exp_hd;
+                if ((int)N != exp_q)
+                    printf("  NOTE: q_proj dim %llu vs expected %d (FA layer %d, hd=%d)\n",
+                           (unsigned long long)N, exp_q, ll, exp_hd);
+            }
+            // k_proj: N should be nkv * exp_hd = 1 * exp_hd
+            if (strstr(bw_name, "k_proj")) {
+                int exp_k = l_nkv[ll] * exp_hd;
+                if ((int)N != exp_k)
+                    printf("  NOTE: k_proj dim %llu vs expected %d (FA layer %d, hd=%d)\n",
+                           (unsigned long long)N, exp_k, ll, exp_hd);
+            }
+            // o_proj: K should be nqh * exp_hd
+            if (strstr(bw_name, "o_proj")) {
+                int exp_o = nqh * exp_hd;
+                if ((int)K != exp_o)
+                    printf("  NOTE: o_proj input dim %llu vs expected %d (FA layer %d)\n",
+                           (unsigned long long)K, exp_o, ll);
+            }
+        }
+
+        // Get file data pointer - GGUF v3 tensor offset is RELATIVE to tensor data section
         uint64_t file_offset = tensor_data_off + ti.offset;
         if (file_offset + ti.file_size > gguf_mem.size) {
             fprintf(stderr, "  ERROR: %s offset out of bounds (data_off=%llu + ti.off=%llu + size=%llu > %zu)\n",
@@ -409,46 +542,97 @@ int main(int argc, char** argv) {
         int l = extract_blk_layer(ti.name.c_str());
 
         if (ti.type == GGML_TYPE_F32 || ti.type == GGML_TYPE_F16) {
-            // Handle norm weights (F32 or F16)
+            // All norms and small F32 handled by early-intercept above.
+            // F32 weights with >1024 elements that reach here are actual weights to requant.
             uint64_t n_el = ti.nelements();
+            if (n_el < 1024) {
+                printf("  SKIP: %s (small F32)\n", ti.name.c_str());
+                continue;
+            }
+            uint64_t K = ti.shape[0];
+            uint64_t N = ti.shape.size() > 1 ? ti.shape[1] : 1;
+            printf("  Converting %s: [%llu x %llu] F32\n", ti.name.c_str(), (unsigned long long)N, (unsigned long long)K);
             std::vector<float> f32_buf(n_el);
-            if (ti.type == GGML_TYPE_F16) {
-                for (uint64_t i = 0; i < n_el; i++)
-                    dequant_f16(src + i * 2, &f32_buf[i]);
+            memcpy(f32_buf.data(), src, n_el * 4);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
             } else {
-                memcpy(f32_buf.data(), src, n_el * 4);
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
+        }
+
+        // Handle Q4_0 quantized tensors
+        if (ti.type == GGML_TYPE_Q4_0) {
+            uint64_t n_el = ti.nelements();
+            uint64_t K = ti.shape[0];
+            uint64_t N = ti.shape.size() > 1 ? ti.shape[1] : 1;
+
+            printf("  Converting %s: [%llu x %llu] Q4_0\n",
+                   ti.name.c_str(), (unsigned long long)N,
+                   (unsigned long long)K);
+
+            if (n_el < 1024) { printf("    -> too small, skipping\n"); continue; }
+
+            if (n_el > 100 * 1024 * 1024) {
+                printf("    -> too large (%llu elements), full dequant + transpose\n", (unsigned long long)n_el);
+                std::vector<float> f32_buf(n_el);
+                dequant_q4_0(src, f32_buf.data(), n_el);
+                transpose_f32(f32_buf.data(), (int)K, (int)N);
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+                double mb = (double)(K / 2) * N / (1024 * 1024);
+                printf("  %s: %dx%d INT4 %.1fMB\n", bw_name, (int)N, (int)K, mb);
+                continue;
             }
 
-            // Check which norm this is
-            const char* suf = strstr(ti.name.c_str(), "attn_norm.weight");
-            if (suf) {
-                memcpy(&input_norms[(size_t)l * H], f32_buf.data(), H * 4);
-                continue;  // Will write at end
+            std::vector<float> f32_buf(n_el);
+            dequant_q4_0(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
+
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
             }
-            suf = strstr(ti.name.c_str(), "ffn_norm.weight");
-            if (suf) {
-                memcpy(&post_norms[(size_t)l * H], f32_buf.data(), H * 4);
-                continue;
-            }
-            suf = strstr(ti.name.c_str(), "attn_q_norm.weight");
-            if (suf) {
-                memcpy(&q_norms[(size_t)l * hd], f32_buf.data(), hd * 4);
-                continue;
-            }
-            suf = strstr(ti.name.c_str(), "attn_k_norm.weight");
-            if (suf) {
-                memcpy(&k_norms[(size_t)l * hd], f32_buf.data(), hd * 4);
-                continue;
-            }
-            suf = strstr(ti.name.c_str(), "output_norm.weight");
-            if (suf) {
-                write_f32(out_dir, "final_norm", f32_buf.data(), n_el);
+        }
+
+        // Handle Q4_1 quantized tensors
+        if (ti.type == GGML_TYPE_Q4_1) {
+            uint64_t n_el = ti.nelements();
+            uint64_t K = ti.shape[0];
+            uint64_t N = ti.shape.size() > 1 ? ti.shape[1] : 1;
+
+            printf("  Converting %s: [%llu x %llu] Q4_1\n",
+                   ti.name.c_str(), (unsigned long long)N,
+                   (unsigned long long)K);
+
+            if (n_el < 1024) { printf("    -> too small, skipping\n"); continue; }
+
+            if (n_el > 100 * 1024 * 1024) {
+                printf("    -> too large (%llu elements), full dequant + transpose\n", (unsigned long long)n_el);
+                std::vector<float> f32_buf(n_el);
+                dequant_q4_1(src, f32_buf.data(), n_el);
+                transpose_f32(f32_buf.data(), (int)K, (int)N);
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+                double mb = (double)(K / 2) * N / (1024 * 1024);
+                printf("  %s: %dx%d INT4 %.1fMB\n", bw_name, (int)N, (int)K, mb);
                 continue;
             }
 
-            // Other F32 — treat as weight to requant
-            // (unlikely for Qwen3)
-            printf("  F32 FALLTHRU: %s\n", ti.name.c_str());
+            std::vector<float> f32_buf(n_el);
+            dequant_q4_1(src, f32_buf.data(), n_el);
+            transpose_f32(f32_buf.data(), (int)K, (int)N);
+
+            if (fp16_mode) {
+                write_fp16_weight(out_dir, bw_name, f32_buf.data(), (int)K, (int)N);
+            } else {
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+            }
         }
 
         // Handle Q5_0 quantized tensors
@@ -487,7 +671,7 @@ int main(int argc, char** argv) {
                    ti.name.c_str(), (unsigned long long)N,
                    (unsigned long long)K);
 
-            // Skip very small tensors (like norms in Q8_0 — shouldn't happen)
+            // Skip very small tensors (like norms in Q8_0 - shouldn't happen)
             if (n_el < 1024) {
                 printf("    -> too small, skipping\n");
                 continue;
@@ -532,44 +716,45 @@ int main(int argc, char** argv) {
                 printf("    -> too small, skipping\n");
                 continue;
             }
-            // Large tensors (embed_tokens, lm_head > 100M elements) — process in chunks
+            // Large tensors (embed_tokens, lm_head > 100M elements) - process in chunks
             if (n_el > 100 * 1024 * 1024) {
                 printf("    -> too large (%llu elements), chunked conversion\n",
                        (unsigned long long)n_el);
-                
+
                 // Create INT4 header files first
                 char int4_path[256], scale_path[256];
                 snprintf(int4_path, 256, "%s/%s.int4_t", out_dir, bw_name);
                 snprintf(scale_path, 256, "%s/%s.scale_t", out_dir, bw_name);
-                
-                if (!std::filesystem::exists(int4_path)) {
-                    // Write headers
-                    int num_kb = (int)K / 16;
-                    {
-                        FILE* hf = fopen(int4_path, "wb");
-                        int hdr[5] = {(int)K, (int)N, 16, num_kb, 1};
-                        fwrite(hdr, 4, 5, hf);
-                        fclose(hf);
-                    }
-                    {
-                        FILE* hf = fopen(scale_path, "wb");
-                        int hdr[5] = {0, 0, 0, num_kb, (int)N};
-                        fwrite(hdr, 4, 5, hf);
-                        fclose(hf);
-                    }
+
+                // Remove stale files; always start fresh
+                std::filesystem::remove(int4_path);
+                std::filesystem::remove(scale_path);
+                // Write headers
+                int num_kb = (int)K / 16;
+                {
+                    FILE* hf = fopen(int4_path, "wb");
+                    int hdr[5] = {(int)K, (int)N, 16, num_kb, 1};
+                    fwrite(hdr, 4, 5, hf);
+                    fclose(hf);
                 }
-                
+                {
+                    FILE* hf = fopen(scale_path, "wb");
+                    int hdr[5] = {0, 0, 0, num_kb, (int)N};
+                    fwrite(hdr, 4, 5, hf);
+                    fclose(hf);
+                }
+
                 // Process N rows in chunks
                 const int ROW_CHUNK = 256;
                 for (int ch = 0; ch < (int)N; ch += ROW_CHUNK) {
                     int ch_end = ch + ROW_CHUNK;
                     if (ch_end > (int)N) ch_end = (int)N;
                     int ch_rows = ch_end - ch;
-                    
+
                     // Allocate FP32 buffer for this chunk
                     uint64_t chunk_el = (uint64_t)K * ch_rows;
                     std::vector<float> chunk_f32(chunk_el);
-                    
+
                     // Dequant each row
                     // GGUF stores row-major: data[k * N + n] but Q4_K uses blocks
                     // Q4_K row stride in file
@@ -579,21 +764,21 @@ int main(int argc, char** argv) {
                         const uint8_t* row_src = src + (uint64_t)src_row * row_stride;
                         dequant_q4_K(row_src, chunk_f32.data() + (uint64_t)r * K, K);
                     }
-                    
+
                     // Transpose: GGUF [K,N] -> kernel [N,K]
                     // For chunk rows, we need [ch_rows, K] format
                     // requant_int4 expects [N, K] where N is output dimension
                     // Already have [ch_rows, K] from dequant
-                    
+
                     // Quantize each row to INT4
                     for (int r = 0; r < ch_rows; r++) {
                         float* row = chunk_f32.data() + (uint64_t)r * K;
-                        
+
                         // INT4 block-16 quant
                         int num_kb = K / 16;
                         std::vector<uint8_t> packed(K / 2);
                         std::vector<float> scales(num_kb);
-                        
+
                         for (int kb = 0; kb < num_kb; kb++) {
                             float absmax = 0.0f;
                             for (int i = 0; i < 16; i++)
@@ -611,7 +796,7 @@ int main(int argc, char** argv) {
                                 packed[(uint64_t)kb * 8 + i / 2] = packed_byte;
                             }
                         }
-                        
+
                         // Append to file
                         {
                             FILE* pf = fopen(int4_path, "ab");
@@ -620,14 +805,17 @@ int main(int argc, char** argv) {
                         }
                         {
                             FILE* sf = fopen(scale_path, "ab");
-                            fwrite(scales.data(), 4, num_kb, sf);
+                            // FP16 scales (2 bytes per value, matching write_int4_weight)
+                            std::vector<uint16_t> hsc(num_kb);
+                            for (int j = 0; j < num_kb; j++) hsc[j] = float_to_half(scales[j]);
+                            fwrite(hsc.data(), 2, num_kb, sf);
                             fclose(sf);
                         }
                     }
-                    
+
                     printf("    chunk %d-%d/%d\n", ch, ch_end, (int)N);
                 }
-                
+
                 double mb = ((double)N * K / 2 + (double)N * (K / 16) * 4) / (1024 * 1024);
                 printf("  %s: %dx%d INT4 %.1fMB (chunked)\n", bw_name, N, K, mb);
                 continue;
@@ -663,8 +851,15 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (n_el > 100 * 1024 * 1024) {
-                printf("    -> too large (%llu elements), skipping INT4 conversion\n",
+                printf("    -> too large (%llu elements), full dequant + transpose\n",
                        (unsigned long long)n_el);
+                std::vector<float> f32_buf(n_el);
+                dequant_q6_K(src, f32_buf.data(), n_el);
+                transpose_f32(f32_buf.data(), (int)K, (int)N);
+                auto i4 = requant_int4(f32_buf.data(), (int)N, (int)K);
+                write_int4_weight(out_dir, bw_name, i4.packed.data(), i4.scales.data(), i4.K, i4.N);
+                double mb = (double)(K / 2) * N / (1024 * 1024);
+                printf("  %s: %dx%d INT4 %.1fMB (full-dequant)\n", bw_name, (int)N, (int)K, mb);
                 continue;
             }
 
@@ -682,16 +877,38 @@ int main(int argc, char** argv) {
     }
 
     // Write norm files
-    for (int l = 0; l < NL; l++) {
-        char name[64];
-        snprintf(name, 64, "%d_input_layernorm", l);
-        write_f32(out_dir, name, &input_norms[(size_t)l * H], H);
-        snprintf(name, 64, "%d_post_attention_layernorm", l);
-        write_f32(out_dir, name, &post_norms[(size_t)l * H], H);
+    if (is_gemma4) {
+        for (int l = 0; l < NL; l++) {
+            char name[64];
+            snprintf(name, 64, "%d_input_layernorm", l);
+            write_f32(out_dir, name, &input_norms[(size_t)l * H], H);
+            snprintf(name, 64, "%d_post_attn_norm", l);
+            write_f32(out_dir, name, &post_norms[(size_t)l * H], H);
+            snprintf(name, 64, "%d_post_attention_layernorm", l);
+            write_f32(out_dir, name, &pre_ffn_norms[(size_t)l * H], H);
+            snprintf(name, 64, "%d_post_ffn_norm", l);
+            write_f32(out_dir, name, &post_ffn_norms[(size_t)l * H], H);
+        }
+        // Per-layer QK norms with correct head_dim (256 for SWA, 512 for FA)
+        for (int l = 0; l < NL; l++) {
+            int lhd = l_hd[l];
+            size_t off = qk_offsets[l];
+            char name[64];
+            snprintf(name, 64, "%d_attn_q_norm", l);
+            write_f32(out_dir, name, &q_norms[off], lhd);
+            snprintf(name, 64, "%d_attn_k_norm", l);
+            write_f32(out_dir, name, &k_norms[off], lhd);
+        }
+    } else {
+        for (int l = 0; l < NL; l++) {
+            char name[64];
+            snprintf(name, 64, "%d_input_layernorm", l);
+            write_f32(out_dir, name, &input_norms[(size_t)l * H], H);
+            snprintf(name, 64, "%d_post_attention_layernorm", l);
+            write_f32(out_dir, name, &post_norms[(size_t)l * H], H);
+        }
+        write_qk_norms(out_dir, NL, hd, q_norms.data(), k_norms.data());
     }
-
-    // Write Q/K head norms
-    write_qk_norms(out_dir, NL, hd, q_norms.data(), k_norms.data());
 
     // Write RoPE config (used by server at runtime)
     {

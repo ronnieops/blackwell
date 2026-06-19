@@ -46,47 +46,22 @@ option(BUILD_PYTHON_BINDINGS "Build Python bindings" ON)
 # Kernel sources
 # ---------------------------------------------------------------------------
 set(KERNEL_SOURCES
-    src/kernels/gemm.cu
-    src/kernels/gemm_int8_mma.cu
-    src/kernels/gemm_int8_wmma.cu
-    src/kernels/gemm_int8_wmma_fast.cu
     src/kernels/quantize.cu
     src/kernels/memory.cu
     src/kernels/norm.cu
+    src/kernels/apply_geglu.cu
     src/kernels/rope.cu
     src/kernels/attention.cu
-    src/kernels/prefill.cu
     src/kernels/decode.cu
     src/kernels/cuda_graphs.cu
-    src/kernels/fused_decode.cu
-    src/kernels/fused_o_norm.cu
-    src/kernels/gemv_v2.cu
     src/kernels/gemv_int8.cu
-    src/kernels/gemv_int2.cu
-    src/kernels/gemv_fp8.cu
-    src/kernels/gemv_fp16.cu
     src/kernels/gemv_fp32.cu
-    src/kernels/gemv_int8_per_row.cu
-    src/kernels/gemv_int8_pdl.cu
     src/kernels/gemv_int8_fp16sc.cu
-    src/kernels/gemv_int8_unrolled.cu
-    src/kernels/gemv_int8_warp_unrolled.cu
-    src/kernels/fp16_scale_cache.cu
-    src/kernels/gemv_bf16.cu
-    src/kernels/fused_mlp.cu
     src/kernels/sample_gpu.cu
-    src/kernels/gated_delta_net.cu
-    src/kernels/gemv_int8_qkv.cu
-    src/kernels/fused_residual_norm.cu
-    src/kernels/fused_quant_attn_wo.cu
-    src/kernels/fused_unpack_quant.cu
     src/kernels/fused_swiglu_quant.cu
-    src/kernels/fused_pack_gemv.cu
-    src/kernels/fused_swiglu_gemv.cu
     src/kernels/fused_int4_ops.cu
     src/kernels/fused_gate_up_int4.cu
     src/kernels/fused_qkv_int4.cu
-    src/kernels/persistent_attn_block.cu
 )
 
 # ---------------------------------------------------------------------------
@@ -115,33 +90,6 @@ target_compile_options(blackwell_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v,-O3>
 )
-
-# ---------------------------------------------------------------------------
-# Unit tests (GoogleTest) — optional, quiet if not found
-# ---------------------------------------------------------------------------
-enable_testing()
-find_package(GTest CONFIG)
-if(GTest_FOUND)
-    add_executable(blackwell_tests
-        tests/test_gemm.cu
-        tests/test_memory.cu
-        tests/test_norm.cu
-        tests/test_attention.cu
-    )
-    target_link_libraries(blackwell_tests PRIVATE
-        blackwell_kernels
-        GTest::gtest
-        CUDA::cudart
-    )
-    target_compile_options(blackwell_tests PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>
-        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=compute_120a>
-    )
-    target_include_directories(blackwell_tests PRIVATE include)
-else()
-    message(STATUS "GTest not found — tests disabled (set GModelTest_DIR or install libgtest-dev).")
-endif()
 
 # ---------------------------------------------------------------------------
 # Python bindings (pybind11) — optional, quiet if not found
@@ -197,34 +145,15 @@ function(add_blackwell_bench NAME SOURCE)
     set_target_properties(${NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../bench")
 endfunction()
 
-# INT4 benches
-add_blackwell_bench(text_generate_int4_1.7b bench/text_generate_int4_1.7b.cu)
-add_blackwell_bench(bench_ppl_llama32_1b bench/bench_ppl_llama32_1b.cu)
-add_blackwell_bench(bench_ppl_llama31_8b bench/bench_ppl_llama31_8b.cu)
-add_blackwell_bench(bench_ppl_llama31_8b_fp32_res bench/bench_ppl_llama31_8b_fp32_res.cu)
-add_blackwell_bench(text_generate_llama31_8b bench/text_generate_llama31_8b.cu)
-add_blackwell_bench(text_generate_llama31_8b_fp32_res bench/text_generate_llama31_8b_fp32_res.cu)
-add_blackwell_bench(text_generate_llama31_8b_int8 bench/text_generate_llama31_8b_int8.cu)
+# Active INT4 benches (Qwen3-8B production path)
 add_blackwell_bench(text_generate_int4_batched bench/text_generate_int4_batched.cu)
-add_blackwell_bench(text_generate_int4_qwen3_8b bench/text_generate_int4_qwen3_8b.cu)
-add_blackwell_bench(text_generate_gemma bench/text_generate_gemma.cu)
 add_blackwell_bench(bench_ppl_int4_8b bench/bench_ppl_int4_8b.cu)
 add_blackwell_bench(decode_int4_cgraph_8b bench/decode_int4_cgraph_8b.cu)
-
-# Tokenizer
-add_blackwell_bench(tokenize_corpus bench/tokenize_corpus.cu)
-add_blackwell_bench(tokenize_text bench/tokenize_text.cu)
-
-# Llama 3.1
-add_blackwell_bench(text_generate_llama32_1b bench/text_generate_llama32_1b.cu)
-add_blackwell_bench(text_generate_llama32_1b_fp16 bench/text_generate_llama32_1b_fp16.cu)
-add_executable(inference_server_llama server/inference_server_llama.cu)
-target_link_libraries(inference_server_llama PRIVATE blackwell_kernels CUDA::cudart)
-target_compile_options(inference_server_llama PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)
-target_include_directories(inference_server_llama PRIVATE include)
-set_target_properties(inference_server_llama PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../server")
 add_blackwell_bench(bench_gemv_int4 bench/bench_gemv_int4.cu)
-add_blackwell_bench(bench_gemv_int2 bench/bench_gemv_int2.cu)
-add_blackwell_bench(bench_ppl_int2_8b bench/bench_ppl_int2_8b.cu)
-add_blackwell_bench(text_generate_int2_qwen3_8b bench/text_generate_int2_qwen3_8b.cu)
-add_blackwell_bench(text_generate_speculative bench/text_generate_speculative.cu)
+add_blackwell_bench(bench_gemv_2warp bench/bench_gemv_2warp.cu)
+add_blackwell_bench(test_fused_int4 bench/test_fused_int4.cu)
+add_blackwell_bench(bench_kld_int4_8b bench/bench_kld_int4_8b.cu)
+add_blackwell_bench(text_generate_llama32_3b bench/text_generate_llama32_3b.cu)
+add_blackwell_bench(text_generate_gemma4_12b_qat bench/text_generate_gemma4_12b_qat.cu)
+add_blackwell_bench(text_generate_int4_qwen3_14b bench/text_generate_int4_qwen3_14b.cu)
+add_blackwell_bench(bench_ppl_int4_14b bench/bench_ppl_int4_14b.cu)

@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/bench_ppl_llama32_1b.cu — PPL benchmark for INT4 Llama 3.2 1B
 //
 // Adapted from bench_ppl_int4_8b.cu (Qwen3-8B)
@@ -81,19 +83,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float theta=(float)pos*powf(rope_theta,-2.0f*(float)d/(float)head_dim);
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
-}
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w, const float* host_sc, int K) {
-    int kblocks=K/16;
-    for(int b=0;b<kblocks;++b){
-        float sc=host_sc[token*kblocks+b];
-        for(int i=0;i<16;++i){
-            size_t byte_idx=(size_t)token*K/2+(size_t)b*8+i/2;
-            uint8_t byte=host_w[byte_idx];
-            int nib=(i&1)?((byte>>4)&0x0F):(byte&0x0F);
-            out[b*16+i]=(float)(nib-8)*sc;
-        }
-    }
 }
 
 // PPL kernel: compute log softmax and extract logprob of correct token

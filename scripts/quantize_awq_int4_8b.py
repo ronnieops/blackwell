@@ -239,7 +239,7 @@ def collect_activation_stats_real(tensor_map, shard_paths, config, corpus_path, 
 
     # Normalize
     for wn in wn_act_mag:
-        wn_act_mag[wn] = wn_act_mag[wn] / n_seqs
+        wn_act_mag[wn] = wn_act_mag[wn] / max(n_seqs, 1)
     if lm_act_mag is not None and lm_count > 0:
         lm_act_mag = lm_act_mag / lm_count
 

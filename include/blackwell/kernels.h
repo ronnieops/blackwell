@@ -4,79 +4,11 @@
 #define BLACKWELL_KERNELS_H
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 
 namespace blackwell {
 namespace kernels {
-
-// ---------------------------------------------------------------------------
-// FP4 block-scaled GEMM
-// ---------------------------------------------------------------------------
-// Computes C = (A @ B) * scale  where A is (M×K) FP4 with per-K-block scales,
-// and B is (K×N) FP4 or FP16.  Result accumulated in FP32.
-// Large CTA: 128×128×64, requires M%128==0, N%128==0, K%64==0.
-cudaError_t gemm_fp4_block_scaled(
-    float*          C,
-    const void*     A_fp4,
-    const float*    A_scale,
-    const void*     B_fp4,
-    const float*    B_scale,
-    int            M,
-    int            N,
-    int            K,
-    cudaStream_t   stream = 0);
-
-// Small CTA: 64×64×64, 4 warps, 40 KB smem. For M<128 prefill.
-// Requires M%64==0, N%64==0, K%64==0.
-cudaError_t gemm_fp4_block_scaled_small(
-    float*          C,
-    const void*     A_fp4,
-    const float*    A_scale,
-    const void*     B_fp4,
-    const float*    B_scale,
-    int            M,
-    int            N,
-    int            K,
-    cudaStream_t   stream = 0);
-
-// ---------------------------------------------------------------------------
-// FP4 GEMV (decode path)
-// ---------------------------------------------------------------------------
-cudaError_t gemv_fp4(
-    float*          y,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_fp4,
-    const float*    W_scale,
-    int            in_features,
-    int            out_features,
-    cudaStream_t   stream = 0);
-
-// ---------------------------------------------------------------------------
-// NVF4 GEMV (decode path) — UE4M3 scales, tensor core optimized
-// ---------------------------------------------------------------------------
-cudaError_t gemv_fp4_nv(
-    float*          y,
-    const void*     x_fp4,
-    const void*     x_scale,      // UE4M3 [K/16]
-    const void*     W_t_fp4,      // Transposed FP4 [N × K]
-    const void*     W_t_scale,    // UE4M3 [N/16 × K/16]
-    int            in_features,
-    int            out_features,
-    cudaStream_t   stream = 0);
-
-// FP4 GEMV with FP32 pre-computed scales + FP16 accumulator (optimized)
-// Same as gemv_fp4_nv but scales are FP32 (not UE4M3), inner loop uses __hfma.
-// Scale conversion must be done offline (UE4M3→FP32) before calling.
-cudaError_t gemv_fp4_nv_opt(
-    float*          y,
-    const void*     x_fp4,
-    const void*     x_scale,      // FP32 [K/16] (pre-converted)
-    const void*     W_t_fp4,      // Transposed FP4 [N × K]
-    const void*     W_t_scale,    // FP32 [N/16 × K/16] (pre-converted)
-    int            in_features,
-    int            out_features,
-    cudaStream_t   stream = 0);
 
 // ---------------------------------------------------------------------------
 // Memory ops
@@ -152,11 +84,34 @@ cudaError_t fused_rope_decode(
     int             max_seq_len,
     cudaStream_t    stream = 0);
 
+// Per-head Q/K RMSNorm (Gemma 4 QK head norms)
+cudaError_t head_norm(
+    float*          data,
+    const float*    weight,
+    int             n_heads,
+    int             head_dim,
+    float           eps,
+    cudaStream_t    stream = 0);
+
+cudaError_t apply_geglu(
+    float*          out,
+    const float*    gate,
+    const float*    up,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
 cudaError_t apply_swiglu(
     float*          out,
     const float*    gate,
     const float*    up,
     int             num_elements,
+    cudaStream_t    stream = 0);
+
+// Apply logit softcapping: out = tanh(x / cap) * cap (in-place)
+cudaError_t apply_logit_softcap(
+    float*          data,
+    int             N_elements,
+    float           cap,
     cudaStream_t    stream = 0);
 
 // Elementwise FP32 vector add: out[i] = a[i] + b[i]
@@ -165,6 +120,15 @@ cudaError_t vector_add_fp32(
     float*          out,
     const float*    a,
     const float*    b,
+    int             num_elements,
+    cudaStream_t    stream = 0);
+
+// ---------------------------------------------------------------------------
+// FP16→FP32 conversion (element-wise)
+// ---------------------------------------------------------------------------
+cudaError_t convert_fp16_to_fp32(
+    float*          out_f32,
+    const __half*   in_f16,
     int             num_elements,
     cudaStream_t    stream = 0);
 
@@ -321,21 +285,6 @@ cudaError_t attention_prefill_v3(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
-// Prefill layer orchestration
-// ---------------------------------------------------------------------------
-cudaError_t run_prefill_layer(
-    float*          hidden_states,
-    const int8_t*   W_q, const float* W_q_sc,
-    const int8_t*   W_k, const float* W_k_sc,
-    const int8_t*   W_v, const float* W_v_sc,
-    const int8_t*   W_o, const float* W_o_sc,
-    float*          k_cache, float* v_cache,
-    int             batch_size, int seq_len,
-    int             num_heads, int num_kv_heads,
-    int             hidden_dim, int head_dim, int max_seq_len,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
 // KV-cache (decode)
 // ---------------------------------------------------------------------------
 cudaError_t update_kv_cache(
@@ -390,70 +339,9 @@ cudaError_t load_kv_cache_qkgv(
     cudaStream_t    stream = 0);
 
 // ---------------------------------------------------------------------------
-// Fused QKV decode (single kernel: Q = x@Wq, K = x@Wk, V = x@Wv)
-// ---------------------------------------------------------------------------
-cudaError_t fused_qkv_gemv(
-    float*          Q_out,
-    float*          K_out,
-    float*          V_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_q_fp4,
-    const float*    W_q_scale,
-    const void*     W_k_fp4,
-    const float*    W_k_scale,
-    const void*     W_v_fp4,
-    const float*    W_v_scale,
-    int             hidden,
-    int             q_dim,
-    int             kv_dim,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
 // Prefill vs decode dispatch
 // ---------------------------------------------------------------------------
 enum class KernelMode { Prefill, Decode };
-cudaError_t dispatch_matmul(
-    float*          C,
-    const void*     A,
-    const void*     B,
-    const float*    A_scale,
-    const float*    B_scale,
-    int            M,
-    int            N,
-    int            K,
-    KernelMode     mode,
-    cudaStream_t   stream = 0);
-
-// ---------------------------------------------------------------------------
-// Fused RMSNorm + FP4 pack (single kernel)
-// ---------------------------------------------------------------------------
-// Input: FP32 projection output, RMSNorm weight
-// Output: FP4 packed + per-block scales
-// Replaces: fused_rmsnorm → pack_fp4 (2 kernels → 1 kernel)
-cudaError_t fused_rmsnorm_pack(
-    void*           x_out_fp4,
-    float*          x_out_scale,
-    const float*    proj,            // FP32 input (from gemv_fp4)
-    const float*    weight,          // RMSNorm weight
-    int             N,               // num elements
-    float           eps,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
-// Fused RMSNorm + INT8 quant (single kernel)
-// ---------------------------------------------------------------------------
-// Input: FP32 projection output, RMSNorm weight
-// Output: INT8 packed + per-block scales
-// Replaces: fused_rmsnorm → pack_int8 (2 kernels → 1 kernel)
-cudaError_t fused_rmsnorm_quant_int8(
-    int8_t*         x_out_i8,
-    float*          x_out_scale,
-    const float*    proj,
-    const float*    weight,
-    int             N,
-    float           eps,
-    cudaStream_t    stream = 0);
 
 // Fused RMSNorm + INT4 quant (single kernel)
 // Input: FP32 projection output, RMSNorm weight
@@ -481,81 +369,6 @@ cudaError_t gemv_int8_from_fp4(
     int             N,
     cudaStream_t    stream = 0);
 
-// Replaces: gemv_fp4(W_o) → fused_rmsnorm → pack_fp4(x) (3 kernels → 2 kernels)
-// Allocates internal temp buffer.
-cudaError_t fused_o_norm_pack(
-    void*           x_out_fp4,
-    float*          x_out_scale,
-    float*          scratch1,        // unused (kept for API compat)
-    int*            scratch2,        // unused
-    float*          scratch3,        // unused
-    const void*     attn_fp4,
-    const float*    attn_scale,
-    const void*     W_o_fp4,
-    const float*    W_o_scale,
-    const float*    rmsnorm_weight,
-    int             K,               // input features (q_dim)
-    int             N,               // output features (hidden_dim)
-    float           eps,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
-// Optimized GEMV v2 (vectorized FP4 block loads, transposed weights)
-// ---------------------------------------------------------------------------
-// Requires transposed weight layout: W_t [N×K] row-major.
-cudaError_t gemv_fp4_v2(
-    float*          y_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_t_fp4,      // TRANSPOSED: [N × K]
-    const float*    W_t_scale,    // TRANSPOSED: [N/16 × K/16]
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// GEMV Split-K: K split into K_splits atomic partial sums.
-// y_out MUST be initialized to 0 by caller.
-// Grid: (N/256, K_splits). Useful for N=6144 where 24 blocks < 36 SMs.
-cudaError_t gemv_fp4_splitk(
-    float*          y_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_t_fp4,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    int             K_splits,
-    cudaStream_t    stream = 0);
-
-// GEMV v3: Shared memory tiled kernel for large N (e.g., down_proj 6144).
-// Uses smem to load weight tiles and broadcast across threads.
-// K must be multiple of 128. N must be multiple of 256.
-cudaError_t gemv_fp4_v3(
-    float*          y_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_t_fp4,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// GEMV Batched (M×v2): Process M input vectors simultaneously.
-// Loads weight matrix once, amortizes across M outputs.
-// y_out [M][N], x_fp4 [M][K], x_scale [M][K/16], W [N][K]
-// Grid: (ceil(N/256), M). Each block computes 256 outputs for 1 token.
-// Best for decode with batch size M (2-4 tokens at once).
-cudaError_t gemv_fp4_batched(
-    float*          y_out,     // [M * N] output (row-major per token)
-    const void*     x_fp4,      // [M * K] FP4 input (row-major per token)
-    const float*    x_scale,   // [M * K/16] scales (row-major per token)
-    const void*     W_t_fp4,    // [N * K] transposed weights
-    const float*    W_t_scale, // [N/16 * K/16] transposed scales
-    int             K,
-    int             N,
-    int             M,         // batch size (number of simultaneous tokens)
-    cudaStream_t    stream = 0);
-
 // Pack FP32 to INT8 with per-block scales
 cudaError_t pack_int8(
     void*           out_int8,
@@ -573,47 +386,6 @@ cudaError_t quantize_int8(
     float*          out_scale,
     const float*    in_fp32,
     int             num_elements,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
-// FP8 E4M3 GEMV — per-row-scaled weights, FP32 activations
-// ---------------------------------------------------------------------------
-// Weight format: W_fp8 [N×K] as uint8_t (FP8 E4M3 values, 1 byte/weight).
-// Scale format:  W_scale [N] FP32 (one scale per output row).
-// Activation:    x_fp32 [K] FP32.
-// 1 warp per output row. FP8→FP32 dequant on the fly.
-
-cudaError_t gemv_fp8_fp32act(
-    float*          y_out,
-    const float*    x_fp32,
-    const void*     W_fp8,
-    const float*    W_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// FP8 GEMV with INT8 activation input (drop-in for gemv_int8_warp)
-// Activation: INT8 block-16. Weight: FP8 per-row. Output: FP32.
-
-cudaError_t gemv_fp8_int8act(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_fp8,
-    const float*    W_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// FP32 → FP8 E4M3 per-row quantization (GPU kernel)
-// out_fp8: [N×K] uint8, out_scale: [N] float (one per row)
-
-cudaError_t quantize_fp8_row(
-    void*           out_fp8,
-    float*          out_scale,
-    const float*    x_fp32,
-    int             K,
-    int             N,
     cudaStream_t    stream = 0);
 
 // INT8 block-scaled GEMV Split-K (K split into K_splits, AtomicAdd reduction)
@@ -652,16 +424,6 @@ cudaError_t gemv_fp32_int8(
     const float*    x_fp32,
     const void*     W_t_int8,
     const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// BF16 GEMV — FP32 activations × BF16 weights, FP32 accumulate.
-// No quantization error. Weight layout: W_t [N × K] BF16 row-major.
-cudaError_t gemv_bf16(
-    float*          y_out,
-    const float*    x_fp32,
-    const void*     W_t_bf16,
     int             K,
     int             N,
     cudaStream_t    stream = 0);
@@ -710,64 +472,6 @@ cudaError_t gemv_fp32_int4_warp(
     const float*    x_fp32,
     const void*     W_packed,
     const float*    W_scale,
-    int             K,
-    int             N,
-    cudaStream_t   stream = 0);
-
-// Per-row INT8 GEMV with FP32 activations — 1 scale per output row.
-// Scale format: W_scale [N] FP32 (per-row max), int8 data same block-16 layout.
-
-cudaError_t gemv_int8_per_row(
-    float*          y_out,
-    const float*    x_fp32,
-    const void*     W_t_int8,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t   stream = 0);
-
-// Fused Q/K/V GEMV — single kernel launch for all 3 projections.
-// Reads activation vector once, shared across Q/K/V.
-// Q_out: [N_q], K_out: [N_kv], V_out: [N_kv]
-cudaError_t gemv_int8_qkv(
-    float*          Q_out,
-    float*          K_out,
-    float*          V_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_q, const float* W_q_sc,
-    const void*     W_k, const float* W_k_sc,
-    const void*     W_v, const float* W_v_sc,
-    int             K,
-    int             N_q,
-    int             N_kv,
-    cudaStream_t   stream = 0);
-
-// Fused gate+up GEMV — single kernel for both MLP input projections.
-// Reads activation vector once, shared across gate/up.
-// gate_out: [N], up_out: [N]
-cudaError_t gemv_int8_gate_up(
-    float*          gate_out,
-    float*          up_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_gate, const float* W_gate_sc,
-    const void*     W_up, const float* W_up_sc,
-    int             K,
-    int             N,
-    cudaStream_t   stream = 0);
-
-// FP16 GEMV with INT8 quantized activations (block-16 scales).
-// For mixed-precision inference: early layers use FP16 weights for better quality.
-// W_fp16: __half[N][K] row-major
-// x_i8: int8[K] quantized activations
-// x_scales: float[K/16] block scales
-// y_out: float[N] result
-cudaError_t gemv_fp16_warp_launch(
-    float*          y_out,
-    const void*     W_fp16,
-    const int8_t*   x_i8,
-    const float*    x_scales,
     int             K,
     int             N,
     cudaStream_t   stream = 0);
@@ -969,23 +673,6 @@ cudaError_t fused_qkv_int4(
     int             KV_dim,
     int             M,
     cudaStream_t    stream = 0);
-// For 16-element block: scale=(max-min)/15, zero=round(-min/scale)
-// Output scale format: [2*K/16] floats, even=scale, odd=zero
-cudaError_t quantize_int4_asym(
-    uint8_t*        x_out_packed,   // [K/2] packed nibbles
-    float*          x_out_sc_zero,  // [2*K/16] scale,zero pairs
-    const float*    in_fp32,
-    int             K,
-    cudaStream_t    stream = 0);
-
-// Fused SwiGLU + INT4 quant (asymmetric) — replaces apply_swiglu + quantize_int4_asym
-cudaError_t fused_swiglu_quant_int4_asym(
-    uint8_t* out_packed,
-    float* out_sc_zero,
-    const float* gate,
-    const float* up,
-    int N,
-    cudaStream_t stream = 0);
 
 // INT8 per-row GEMV — each output row has independent block-16 scales.
 // Scale layout: W_t_scale [N × K/16] (not 2D [N/16 × K/16]).
@@ -1013,19 +700,6 @@ cudaError_t gemv_int8(
     int             N,
     cudaStream_t    stream = 0);
 
-// INT8 GEMV with PDL (Programmatic Dependent Launch)
-// Overlaps kernel execution for +3-5% speedup.
-// Requires CTK >= 12.3, SM >= 90.
-cudaError_t gemv_int8_pdl(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_t_int8,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
 // INT8 GEMV with FP16 scales (+5-8% speedup)
 // Uses FP16 scales instead of FP32, reducing scale memory by 50%.
 cudaError_t gemv_int8_fp16sc(
@@ -1034,42 +708,6 @@ cudaError_t gemv_int8_fp16sc(
     const void*     x_scale,     // __half FP16 scales [K/16]
     const void*     W_t_int8,
     const void*     W_t_scale,   // __half FP16 scales [N × K/16]
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// INT8 GEMV with 4× loop unrolling (+3-5% speedup)
-// Processes 4 K-blocks (64 values) per iteration for better ILP.
-cudaError_t gemv_int8_unrolled(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_t_int8,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// Warp-cooperative INT8 GEMV with 4× loop unrolling (+9-45% speedup)
-// 1 warp (32 threads) per output row, processes 4 K-blocks per iteration.
-cudaError_t gemv_int8_warp_unrolled(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,
-    const void*     W_t_int8,
-    const float*    W_t_scale,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// INT8 GEMV with cached FP16 scales (+2-13% speedup)
-// Converts FP32 scales to FP16 at load time, reuses cached FP16 scales.
-cudaError_t gemv_int8_fp16cached(
-    float*          y_out,
-    const void*     x_int8,
-    const float*    x_scale,     // FP32 scales [K/16]
-    const void*     W_t_int8,
-    const float*    W_t_scale,   // FP32 scales [N × K/16]
     int             K,
     int             N,
     cudaStream_t    stream = 0);
@@ -1110,88 +748,12 @@ cudaError_t gemm_int8(
     int             M, int N, int K,
     cudaStream_t    stream = 0);
 
-// INT8×INT8 GEMM with tensor core mma.sync.aligned.m16n8k32
-// C[M×N] = A_i8[M×K] × B_i8[N×K]^T × A_sc × B_sc
-// Requires M≥16, N≥8, K≥32.
-cudaError_t gemm_int8_mma(
-    float*          C,              // [M×N] output
-    const void*     A_i8,           // [M×K] INT8 activations
-    const float*    A_sc,           // [M × K/16] activation scales
-    const void*     B_i8,           // [N×K] INT8 transposed weights
-    const float*    B_sc,           // [N × K/16] weight scales
-    int             M, int N, int K,
-    cudaStream_t    stream = 0);
-
-// INT8×INT8 GEMM with WMMA m16n16k16 tensor cores
-// C[M×N] = A_i8[M×K] × B_i8[N×K]^T × A_sc × B_sc
-// Requires M≥16, N≥16, K≥16 (multiples of 16).
-// 4.8× faster than dp4a for large M.
-cudaError_t gemm_int8_wmma(
-    float*          C,              // [M×N] output
-    const void*     A_i8,           // [M×K] INT8 activations
-    const float*    A_sc,           // [M × K/16] activation scales
-    const void*     B_i8,           // [N×K] INT8 transposed weights
-    const float*    B_sc,           // [N × K/16] weight scales
-    int             M, int N, int K,
-    cudaStream_t    stream = 0);
-
-// Optimized WMMA: 32×32 tiles, 4 warps, direct FP32 accumulation
-// 1.5-2× faster than gemm_int8_wmma for M≥32.
-cudaError_t gemm_int8_wmma_fast(
-    float*          C,
-    const void*     A_i8,
-    const float*    A_sc,
-    const void*     B_i8,
-    const float*    B_sc,
-    int             M, int N, int K,
-    cudaStream_t    stream = 0);
-
-cudaError_t transpose_fp4_weights(
-    void*           dst,          // [N × K] FP4 transposed
-    float*          dst_scale,    // [N/16 × K/16] transposed
-    const void*     src,          // [K × N] FP4 original
-    const float*    src_scale,    // [K/16 × N/16] original
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
 // INT8 transpose: W (K×N) → W_t (N×K), scales (K/16 × N/16) → (N/16 × K/16)
 cudaError_t transpose_int8_weights(
     void*           dst,          // [N × K] INT8 transposed
     float*          dst_scale,    // [N/16 × K/16] transposed
     const void*     src,          // [K × N] INT8 original
     const float*    src_scale,    // [K/16 × N/16] original
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// ---------------------------------------------------------------------------
-// Fused gate + up MLP GEMV (single kernel)
-// ---------------------------------------------------------------------------
-// Computes both projections in one kernel. Uses transposed weights.
-cudaError_t fused_gate_up_gemv(
-    float*          gate_out,
-    float*          up_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_gate_t_fp4,    // TRANSPOSED: [N × K]
-    const float*    W_gate_t_scale, // TRANSPOSED
-    const void*     W_up_t_fp4,     // TRANSPOSED
-    const float*    W_up_t_scale,   // TRANSPOSED
-    int             K,
-    int             N,               // output dim
-    cudaStream_t    stream = 0);
-
-// v1: original Grid(2, N/256) implementation for comparison
-cudaError_t fused_gate_up_gemv_v1(
-    float*          gate_out,
-    float*          up_out,
-    const void*     x_fp4,
-    const float*    x_scale,
-    const void*     W_gate_t_fp4,
-    const float*    W_gate_t_scale,
-    const void*     W_up_t_fp4,
-    const float*    W_up_t_scale,
     int             K,
     int             N,
     cudaStream_t    stream = 0);
@@ -1266,106 +828,6 @@ cudaError_t apply_repetition_penalty(
     int             vocab,
     cudaStream_t    stream = 0);
 
-// ---------------------------------------------------------------------------
-// GatedDeltaNet (linear attention) for Qwen3.5-9B
-// ---------------------------------------------------------------------------
-// Conv1d update: shift state, insert new QKV, depthwise conv + SiLU
-cudaError_t gated_delta_conv1d_update(
-    float*          conv_state, // [CONV_DIM * (CONV_K-1)] in-place
-    const float*    new_qkv,    // [CONV_DIM]
-    const float*    conv_w,     // [CONV_DIM * CONV_K]
-    float*          out,        // [CONV_DIM]
-    cudaStream_t    stream = 0);
-
-// Recurrent step: Q,K broadcast + SSM update
-cudaError_t gated_delta_recurrent_step(
-    const float*    q,          // [batch, NK, HD]
-    const float*    k,          // [batch, NK, HD]
-    const float*    v,          // [batch, NV, HD]
-    const float*    g,          // [batch, NV] decay
-    const float*    beta,       // [batch, NV] gate
-    float*          q_broadcast,// [batch, NV, HD] temp buffer
-    float*          k_broadcast,// [batch, NV, HD] temp buffer
-    float*          state,      // [batch, NV, HD, HD]
-    float*          out,        // [batch, NV, HD]
-    int             batch_size,
-    cudaStream_t    stream = 0);
-
-// RMSNormGated: norm(x) * silu(gate)
-cudaError_t gated_delta_rmsnorm_gated(
-    float*          out,        // [batch, NV, HD]
-    const float*    x,          // [batch, NV, HD]
-    const float*    gate,       // [batch, NV, HD]
-    const float*    norm_w,     // [HD]
-    int             batch_size,
-    float           eps = 1e-6f,
-    cudaStream_t    stream = 0);
-
-// Fused residual add + RMSNorm + INT8 quant
-// Computes residual add + RMSNorm + quantize in single kernel
-// Saves 1 kernel launch per call (2 per layer)
-cudaError_t fused_residual_norm(
-    int8_t* x_out_i8,
-    float* x_out_scale,
-    float* proj,          // Modified in-place: proj += residual
-    const float* residual,
-    const float* norm_w,
-    int N, float eps,
-    cudaStream_t stream = 0);
-
-// Fused residual add + RMSNorm + INT4 quant (symmetric, block=16)
-// Saves 2 kernel launches vs vector_add + fused_rmsnorm + quantize_int4
-cudaError_t fused_residual_norm_int4_fp32out(
-    void*   x_out,       // [N/2] uint8_t, packed INT4 (2 vals/byte)
-    float*  x_out_sc,    // [N/16] FP32 scales
-    float*  proj_out_fp32, // [N] FP32 normalized output (can be nullptr)
-    const float* proj_in, // input projection (not modified)
-    const float* residual,
-    const float* norm_w,
-    int N, float eps,
-    cudaStream_t stream = 0);
-
-// Same as above but modifies proj_in in-place (proj = proj + residual, then norm)
-cudaError_t fused_residual_norm_int4(
-    void*   x_out,       // [N/2] uint8_t, packed INT4 (2 vals/byte)
-    float*  x_out_sc,    // [N/16] FP32 scales
-    float*  proj,        // in/out: FP32 projection (modified in-place)
-    const float* residual,
-    const float* norm_w,
-    int N, float eps,
-    cudaStream_t stream = 0);
-
-// Fused residual add + RMSNorm + INT4 quant (ASYMMETRIC, zero point, block=16)
-// Output scale format: [2 * N/16] floats, even=scale, odd=zero (as float)
-cudaError_t fused_residual_norm_int4_asym_fp32out(
-    void*   x_out,          // [N/2] uint8_t, packed INT4
-    float*  x_out_sc_zero,  // [2*N/16] scale,zero pairs
-    float*  proj_out_fp32,  // [N] FP32 normalized output (can be nullptr)
-    const float* proj_in,
-    const float* residual,
-    const float* norm_w,
-    int N, float eps,
-    cudaStream_t stream = 0);
-
-// Same as above but modifies proj_in in-place
-cudaError_t fused_residual_norm_int4_asym(
-    void*   x_out,          // [N/2] uint8_t, packed INT4
-    float*  x_out_sc_zero,  // [2*N/16] scale,zero pairs
-    float*  proj,           // in/out: FP32 projection (modified in-place)
-    const float* residual,
-    const float* norm_w,
-    int N, float eps,
-    cudaStream_t stream = 0);
-
-cudaError_t fused_unpack_fp4_quant(
-    int8_t* out_i8,
-    float* out_scale,
-    const void* in_fp4,
-    const float* fp4_scale,
-    const float* int8_scale,
-    int N,
-    cudaStream_t stream = 0);
-
 // Fused: SwiGLU activation + INT8 quant
 // Replaces: apply_swiglu → pack_int8 (2 kernels → 1 kernel)
 cudaError_t fused_swiglu_quant(
@@ -1375,58 +837,6 @@ cudaError_t fused_swiglu_quant(
     const float* up,
     int N,
     cudaStream_t stream = 0);
-
-// Persistent QKV GEMV kernel
-// Single grid launch: 16 blocks (one per Q head), 128 threads/block, 40KB smem.
-// Fuses QKV GEMV + KV cache update per layer. 4 launches/layer instead of 14.
-// Replaces separate gemv_int8_qkv calls. Uses existing proven attention_decode_gqa.
-cudaError_t persistent_qkv_gemv(
-    const void* W_q, const float* W_q_sc,
-    const void* W_k, const float* W_k_sc,
-    const void* W_v, const float* W_v_sc,
-    void* k_cache, void* v_cache,
-    const int* seq_pos_ptr,
-    const int8_t** layer_x_int8,
-    const float** layer_x_sc,
-    float* q_out, float* k_out, float* v_out,
-    int num_layers,
-    cudaStream_t stream = 0);
-
-// Fused: pack_int8 + gemv_int8_warp output projection
-// Replaces: pack_int8 → gemv_int8_warp (2 kernels → 1 kernel)
-cudaError_t fused_pack_gemv_o(
-    float* y_out,
-    int8_t* temp_i8,
-    float* temp_scale,
-    const float* x_fp32,
-    const void* W_t_int8,
-    const float* W_t_scale,
-    int K, int N,
-    cudaStream_t stream = 0);
-
-// Fused: SwiGLU activation + gemv_int8_warp down projection
-// Replaces: fused_swiglu_quant → gemv_int8_warp (2 kernels → 1 kernel)
-cudaError_t fused_swiglu_gemv(
-    float* y_out,
-    int8_t* temp_i8,
-    float* temp_scale,
-    const float* gate,
-    const float* up,
-    const void* W_t_int8,
-    const float* W_t_scale,
-    int K, int N,
-    cudaStream_t stream = 0);
-
-// Fused quantize_attn + Wo GEMV: quantize attn output to INT4 in smem, run Wo projection.
-// Saves 1 kernel launch + device memory round-trip for attn_i4.
-cudaError_t fused_quant_attn_wo(
-    float*          proj_out,
-    const float*    attn,
-    const uint8_t*  Wo_packed,
-    const float*    Wo_scale,
-    int             Q,
-    int             H,
-    cudaStream_t    stream = 0);
 
 // Batched INT4 GEMV: processes M sequences in parallel.
 // Grid: N × M blocks, 32 threads/block.
@@ -1454,77 +864,6 @@ cudaError_t gemv_int4_batched_f16wsc(
     int             K,
     int             N,
     int             M,
-    cudaStream_t    stream = 0);
-
-// INT2 symmetric block-16 GEMV.
-// W: [N][K/4] packed INT2, W_scale: [N][K/16] FP32.
-// x: [M][K/2] packed INT4, x_scale: [M][K/16] FP32.
-// Grid: N blocks, 32 threads/block (1 warp per output row).
-cudaError_t gemv_int2_batched(
-    float*          y_out,
-    const uint8_t*  x_packed,
-    const float*    x_scale,
-    const uint8_t*  W_packed,
-    const float*    W_scale,
-    int             K,
-    int             N,
-    int             M,
-    cudaStream_t    stream = 0);
-
-// Batched asymmetric INT4 GEMV with per-block zero points.
-// x_sc_zero / W_sc_zero: [2 * K/16] floats: even=scale, odd=zero.
-// Grid: N × M blocks, 32 threads/block.
-cudaError_t gemv_int4_asym_batched(
-    float*          y_out,
-    const uint8_t*  x_packed,
-    const float*    x_sc_zero,   // [M][2*K/16] scale,zero pairs
-    const uint8_t*  W_packed,
-    const float*    W_sc_zero,   // [N][2*K/16] scale,zero pairs
-    int             K,
-    int             N,
-    int             M,
-    cudaStream_t    stream = 0);
-
-// FP32 activation × asymmetric INT4 weight GEMV (weight-only quantization).
-// No activation quant — eliminates the main quality bottleneck.
-// W_sc_zero: [N][2*K/16] scale,zero pairs.
-// Grid: N blocks, 32 threads/block.
-cudaError_t gemv_fp32_int4_asym(
-    float*          y_out,
-    const float*    x_fp32,
-    const uint8_t*  W_packed,
-    const float*    W_sc_zero,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// FP32 activation × asymmetric INT5 weight GEMV (weight-only 5-bit quantization).
-// 5-bit per-block-16: 16 vals packed into 10 bytes (80 bits). PSNR ~29 dB vs BF16.
-// W_sc_zero: [N][2*K/16] scale,zero pairs.
-// Grid: N blocks, 32 threads/block.
-cudaError_t gemv_fp32_int5_asym(
-    float*          y_out,
-    const float*    x_fp32,
-    const uint8_t*  W_packed,
-    const float*    W_sc_zero,
-    int             K,
-    int             N,
-    cudaStream_t    stream = 0);
-
-// Fused gate+up INT8 GEMV: single kernel computes both projections.
-// Reads input once, 2 warps/block (warp0=gate, warp1=up). Saves 1 input read.
-// Grid: N blocks, 64 threads/block.
-cudaError_t gemv_int8_gate_up(
-    float*          gate_out,
-    float*          up_out,
-    const int8_t*   x_int8,
-    const float*    x_scale,
-    const int8_t*   W_gate,
-    const float*    W_gate_sc,
-    const int8_t*   W_up,
-    const float*    W_up_sc,
-    int             K,
-    int             N,
     cudaStream_t    stream = 0);
 
 } // namespace kernels

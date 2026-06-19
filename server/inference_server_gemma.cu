@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // server/inference_server_gemma.cu — Gemma 4 12B INT4 inference server (JSON stdio)
 //
 // Protocol: reads JSON from stdin, writes JSON to stdout.
@@ -64,8 +66,6 @@ __global__ void apply_gelu_gate(float* gate_out, const float* gate, const float*
     float gelu = 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
     gate_out[i] = gelu * up[i];
 }
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
     const float* host_sc, int K) {
     int kblocks=K/16;
     for(int b=0;b<kblocks;++b){

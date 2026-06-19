@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/text_generate_llama31_8b.cu — End-to-end text generation with INT4 Llama 3.1 8B
 //
 // Llama 3.1 8B dimensions: NL=32, H=4096, I=14336, nqh=32, nkv=8, hd=128, V=128256
@@ -75,8 +77,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
 }
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
     const float* host_sc, int K)
 {
     int kblocks=K/16;

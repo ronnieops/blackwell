@@ -188,6 +188,48 @@ cudaError_t apply_swiglu(
     return cudaPeekAtLastError();
 }
 
+// ===========================================================================
+// Head Norm kernel (Gemma 4 QK head norms)
+// ===========================================================================
+__launch_bounds__(128, 1)
+__global__ void head_norm_kernel(
+    float* __restrict__ data,
+    const float* __restrict__ weight,
+    int nh, int hd, float eps) {
+
+    int h = blockIdx.x;
+    if (h >= nh) return;
+    float* d = data + (size_t)h * hd;
+    __shared__ float wp[4];
+    float s = 0;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) s += d[i] * d[i];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if ((threadIdx.x & 31) == 0) wp[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x < 4) s = wp[threadIdx.x]; else s = 0;
+    for (int off = 2; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if (threadIdx.x == 0) wp[0] = rsqrtf(s / (float)hd + eps);
+    __syncthreads();
+    float is = wp[0];
+    for (int i = threadIdx.x; i < hd; i += blockDim.x)
+        d[i] = d[i] * is * weight[i];
+}
+
+cudaError_t head_norm(
+    float* data, const float* weight,
+    int n_heads, int head_dim, float eps,
+    cudaStream_t stream) {
+
+    dim3 grid(n_heads);
+    dim3 block(128);
+    head_norm_kernel<<<grid, block, 0, stream>>>(data, weight, n_heads, head_dim, eps);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
+// FP32 vector add
+// ===========================================================================
 __launch_bounds__(256, 1)
 __global__ void vector_add_fp32_kernel(
     float* __restrict__ out,
@@ -212,6 +254,27 @@ cudaError_t vector_add_fp32(
     dim3 block(256);
     dim3 grid((num_elements + 255) / 256);
     vector_add_fp32_kernel<<<grid, block, 0, stream>>>(out, a, b, num_elements);
+    return cudaPeekAtLastError();
+}
+
+// ===========================================================================
+// FP16→FP32 conversion
+// ===========================================================================
+__launch_bounds__(256, 1)
+__global__ void fp16_to_fp32_kernel(
+    float* __restrict__ out,
+    const __half* __restrict__ in,
+    int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = __half2float(in[idx]);
+}
+
+cudaError_t convert_fp16_to_fp32(
+    float* out, const __half* in,
+    int num_elements, cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid((num_elements + 255) / 256);
+    fp16_to_fp32_kernel<<<grid, block, 0, stream>>>(out, in, num_elements);
     return cudaPeekAtLastError();
 }
 

@@ -275,9 +275,9 @@ public:
             fread(&ll, 2, 1, f);
             std::string left(ll, '\0');
             fread(&left[0], 1, ll, f);
-            fread(&rl, 2, 1, f);
+            if(fread(&rl, 2, 1, f) != 1) return -1;
             std::string right(rl, '\0');
-            fread(&right[0], 1, rl, f);
+            if(fread(&right[0], 1, rl, f) != (size_t)rl) return -1;
             std::string key = left + " " + right;
             merge_rank[key] = (int)i;
         }

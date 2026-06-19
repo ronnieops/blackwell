@@ -67,9 +67,10 @@ class LocalTokenizer {
 public:
     LocalTokenizer(const char* model) {
         // Build path to tokenizer in weight directory
-        // model names: llama32-1b, llama31-8b, qwen3-8b, 1.7b, 8b, 9b, batched
+        // model names: llama32-1b/3b, llama31-8b, qwen3-8b, 1.7b, 8b, 9b, batched
         std::string td;
         struct { const char* key; const char* path; } tok_dirs[] = {
+            {"llama32-3b", "./weights_llama32_3b/tokenizer_data.bin"},
             {"llama32-1b", "/mnt/data/ai/models/llama32-1b-int4-from-safetensors/tokenizer_data.bin"},
             {"llama31-8b", "/mnt/data/ai/models/llama31-8b-int4-from-safetensors/tokenizer_data.bin"},
             {"gemma", "./weights_gemma/tokenizer_data.bin"},
@@ -152,14 +153,18 @@ public:
         // Determine binary path
         const char* bin = "./server/inference_server";
         const char* bin9b = "./server/inference_server_9b";
+        const char* bin_int4_14b = "./server/inference_server_qwen3_14b";
         const char* bin_int4 = "./server/inference_server_int4";
         const char* bin_int4_batched = "./server/inference_server_int4_batched";
         const char* bin_llama = "./server/inference_server_llama";
+        const char* bin_llama32_3b = "./server/inference_server_llama32_3b";
         const char* bin_gemma = "./server/inference_server_gemma";
         struct { const char* key; const char* path; } bin_dirs[] = {
             {"gemma", bin_gemma}, {"9b", bin9b},
-            {"batched", bin_int4_batched}, {"llama", bin_llama},
-            {"qwen3", bin_int4}, {"int4_batched", bin_int4_batched}, {"int4", bin_int4},
+            {"int4_14b", bin_int4_14b}, {"int4", bin_int4},
+            {"int4_batched", bin_int4_batched}, {"llama32-3b", bin_llama32_3b},
+            {"llama", bin_llama},
+            {"qwen3", bin_int4}, {"batched", bin_int4_batched},
         };
         for (auto& d : bin_dirs) { if (strstr(model, d.key)) { bin = d.path; break; } }
 
@@ -671,6 +676,7 @@ int main(int argc, char** argv) {
     }
     g_model_raw = model;
     if(strstr(model,"gemma")) g_model_name = "Gemma-12B";
+    else if(strstr(model,"llama32-3b")) g_model_name = "Llama-3.2-3B";
     else if(strstr(model,"8b")) g_model_name = "8B";
     else if(strstr(model,"9b")) g_model_name = "9B";
     else if(strstr(model,"batched")) g_model_name = "8B";

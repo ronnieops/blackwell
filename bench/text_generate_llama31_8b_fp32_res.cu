@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/text_generate_llama31_8b_fp32_res.cu — FP32 residual decode for INT4 Llama 3.1 8B
 //
 // Uses FP32 activations × INT4 packed weights (no activation quantization).
@@ -78,8 +80,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
     float c=cosf(theta),s=sinf(theta),x=pair[0],y=pair[1];
     pair[0]=x*c-y*s; pair[1]=x*s+y*c;
 }
-
-static void dequant_embed_row(float* out, int token, const uint8_t* host_w,
     const float* host_sc, int K)
 {
     int kblocks=K/16;

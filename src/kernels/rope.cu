@@ -62,8 +62,8 @@ __global__ void rope_kernel(
     // Shared memory: load cos/sin for this position into fast storage.
     // head_dim/2 cos/sin values per head per position.
     // Each thread loads two floats.
-    __shared__ float smem_cos[64];   // max head_dim/2 = 64 (for head_dim=128)
-    __shared__ float smem_sin[64];
+    __shared__ float smem_cos[256];   // max head_dim/2 = 256 (for head_dim=512)
+    __shared__ float smem_sin[256];
 
     // Each thread maps to one rotation pair (floats 2i, 2i+1).
     int tid = threadIdx.x;
@@ -157,7 +157,7 @@ __global__ void rope_out_kernel(
 // Used in CUDA Graph where seq_pos changes per replay via pinned memory.
 // cos/sin_cache layout: [MAXSEQ, head_dim/2] — precomputed for all positions.
 // ===========================================================================
-__launch_bounds__(64, 1)
+__launch_bounds__(256, 1)
 __global__ void rope_decode_kernel(
     float* __restrict__ out_inplace,
     const float* __restrict__ cos_cache,
@@ -172,8 +172,9 @@ __global__ void rope_decode_kernel(
     int seq_pos = *seq_pos_ptr;
     int num_pairs = head_dim / 2;
 
-    __shared__ float smem_cos[64];
-    __shared__ float smem_sin[64];
+    // Sized for head_dim up to 512 (256 pairs). hd<=128 uses <=64 pairs.
+    __shared__ float smem_cos[256];
+    __shared__ float smem_sin[256];
 
     int tid = threadIdx.x;
     int cos_sin_idx = seq_pos * num_pairs + tid;

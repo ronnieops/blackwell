@@ -1,3 +1,5 @@
+#include "blackwell/int4_weights.h"
+using namespace blackwell::weights;
 // bench/text_generate_llama31_8b_int8.cu — End-to-end text generation with INT8 Llama 3.1 8B
 //
 // Uses FP32 activations × INT8 weights (gemv_fp32_int8_per_row_warp).
@@ -78,7 +80,6 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
 }
 
 // Host-side embedding dequant for a single token row (INT8 embed table)
-static void dequant_embed_row(float* out, int token, const int8_t* host_w,
     const float* host_sc, int K)
 {
     int kblocks=K/16;

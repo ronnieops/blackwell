@@ -1,8 +1,7 @@
 #include "blackwell/int4_weights.h"
 using namespace blackwell::weights;
-// server/inference_server_int4.cu — INT4 Qwen3-8B inference server (JSON stdio)
-// Uses the EXACT decode loop from bench/text_generate_int4_qwen3_8b.cu
-// which produces correct coherent output at 57 t/s.
+// server/inference_server_llama32_3b.cu — Llama 3.2 3B INT4 inference server (JSON stdio)
+// 28 layers, H=3072, I=8192, nqh=24, nkv=8, hd=128, V=128256, rope_theta=500000
 //
 // Protocol: reads JSON from stdin, writes JSON to stdout.
 // Input:  {"prompts":["str1","str2"],"max_tokens":N,"temperature":T,"top_k":K,"repetition_penalty":P}
@@ -29,11 +28,11 @@ static void die(cudaError_t e, const char* m) {
     if(e!=cudaSuccess){fprintf(stderr,"FAIL %s: %s\n",m,cudaGetErrorString(e));exit(1);}
 }
 
-const int H=4096, Q=4096, KV=1024, I=12288;
-const int nqh=32, nkv=8, hd=128, MAXSEQ=2048;
+const int H=3072, Q=3072, KV=1024, I=8192;
+const int nqh=24, nkv=8, hd=128, MAXSEQ=2048;
 const float eps=1e-6f;
-const int V=151936;
-const int NL=36;
+const int V=128256;
+const int NL=28;
 
 // ── INT4 weight struct + loader ──
 struct DevW4 { int K, N; uint8_t* d; float* sc; };
@@ -95,7 +94,7 @@ __global__ void apply_rope_kernel(float* data, int n_heads, int head_dim, int po
 
 static void build_rope_cache(float* cos_cache, float* sin_cache, int max_seq, int head_dim) {
     int pairs = head_dim / 2;
-    float rope_theta = 1000000.0f;
+    float rope_theta = 500000.0f;
     for (int pos = 0; pos < max_seq; ++pos) {
         for (int d = 0; d < pairs; ++d) {
             float theta = (float)pos * powf(rope_theta, -2.0f * (float)d / (float)head_dim);
@@ -196,51 +195,58 @@ static blackwell::BpeTokenizer tokenizer;
 
 #define AL(p,n) die(cudaMalloc(&(p),(n)),"malloc " #p)
 
+static const char* g_wdir = "weights_llama32_3b";
+
 static void load_model() {
-    fprintf(stderr, "Loading %d-layer INT4 model...\n", NL);
+    fprintf(stderr, "Loading %d-layer Llama 3.2 3B INT4 model...\n", NL);
     char p[256];
     for (int l = 0; l < NL; ++l) {
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.q_proj",l); W[l].q=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.k_proj",l); W[l].k=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.v_proj",l); W[l].v=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_self_attn.o_proj",l); W[l].o=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.gate_proj",l); W[l].g=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.up_proj",l);   W[l].u=upload_w4_f16sc(p);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_mlp.down_proj",l); W[l].d=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.q_proj",g_wdir,l); W[l].q=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.k_proj",g_wdir,l); W[l].k=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.v_proj",g_wdir,l); W[l].v=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_self_attn.o_proj",g_wdir,l); W[l].o=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.gate_proj",g_wdir,l); W[l].g=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.up_proj",g_wdir,l);   W[l].u=upload_w4_f16sc(p);
+        snprintf(p,256,"%s/%d_mlp.down_proj",g_wdir,l); W[l].d=upload_w4_f16sc(p);
         if ((l+1)%7==0) fprintf(stderr, "  layer %d/%d\n", l+1, NL);
     }
-    // QK norms
-    float* qk_h=(float*)malloc(NL*2*hd*4);
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/qk_norms.f32","rb");size_t nr=fread(qk_h,4,NL*2*hd,f);if(nr!=(size_t)NL*2*hd){fprintf(stderr, "Truncated qk_norms\n");exit(1);}fclose(f);}
+    // Llama 3.2: no per-head QK norms — allocate identity weights
     for(int l=0;l<NL;++l){
-        cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qk_h+l*2*hd,hd*4,cudaMemcpyHostToDevice);
-        cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,qk_h+l*2*hd+hd,hd*4,cudaMemcpyHostToDevice);
-    } free(qk_h);
+        float* qn=(float*)calloc(hd,4); float* kn=(float*)calloc(hd,4);
+        for(int i=0;i<hd;i++){qn[i]=1.0f;kn[i]=1.0f;}
+        cudaMalloc(&W[l].qn,hd*4);cudaMemcpy(W[l].qn,qn,hd*4,cudaMemcpyHostToDevice);
+        cudaMalloc(&W[l].kn,hd*4);cudaMemcpy(W[l].kn,kn,hd*4,cudaMemcpyHostToDevice);
+        free(qn);free(kn);
+    }
     // Per-layer RMSNorm
     for(int l=0;l<NL;++l){
         float* w=(float*)malloc(H*4);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_input_layernorm.f32",l);
-        {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated layernorm %d\n",l);exit(1);}fclose(f);}
+        snprintf(p,256,"%s/%d_input_layernorm.f32",g_wdir,l);
+        {FILE*f=fopen(p,"rb");if(!f){fprintf(stderr,"FAIL open %s\n",p);exit(1);}size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated layernorm %d: got %zu items, expected %zu\n",l,nr,(size_t)H);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_in,H*4);cudaMemcpy(W[l].rn_in,w,H*4,cudaMemcpyHostToDevice);
-        snprintf(p,256,"weights_int4_qwen3_8b_fp16sc/%d_post_attention_layernorm.f32",l);
+        snprintf(p,256,"%s/%d_post_attention_layernorm.f32",g_wdir,l);
         {FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated post layernorm %d\n",l);exit(1);}fclose(f);}
         cudaMalloc(&W[l].rn_post,H*4);cudaMemcpy(W[l].rn_post,w,H*4,cudaMemcpyHostToDevice);
         free(w);
     }
     // Final norm
     {float*w=(float*)malloc(H*4);
-     FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/final_norm.f32","rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated final_norm\n");exit(1);}fclose(f);
+     snprintf(p,256,"%s/final_norm.f32",g_wdir);
+     FILE*f=fopen(p,"rb");size_t nr=fread(w,4,H,f);if(nr!=(size_t)H){fprintf(stderr,"Truncated final_norm\n");exit(1);}fclose(f);
      AL(d_fn,H*4); cudaMemcpy(d_fn,w,H*4,cudaMemcpyHostToDevice); free(w);}
-    // Embed + lm_head
-    embed_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/embed_tokens");
-    lm_head_w=upload_w4_f16sc("weights_int4_qwen3_8b_fp16sc/lm_head");
-    fprintf(stderr,"  embed: %dx%d, lm_head: %dx%d\n",embed_w.K,embed_w.N,lm_head_w.K,lm_head_w.N);
+    // Embed + lm_head (tied for Llama 3.2)
+    snprintf(p,256,"%s/embed_tokens",g_wdir);
+    embed_w=upload_w4_f16sc(p);
+    lm_head_w=upload_w4_f16sc(p);  // lm_head = embed_tokens (tied)
+    fprintf(stderr,"  embed: %dx%d, lm_head (tied): %dx%d\n",embed_w.K,embed_w.N,lm_head_w.K,lm_head_w.N);
     // Host embed for CPU dequant
     host_embed_d=new uint8_t[(size_t)embed_w.K*embed_w.N/2];
     host_embed_sc=new float[embed_w.N*(embed_w.K/16)];
-    {FILE*f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.int4_t","rb");int h[5];fread(h,4,5,f);
+    {snprintf(p,256,"%s/embed_tokens.int4_t",g_wdir);
+     FILE*f=fopen(p,"rb");int h[5];fread(h,4,5,f);
      size_t ds=(size_t)h[0]*h[1]/2;size_t nr=fread(host_embed_d,1,ds,f);if(nr!=ds){fprintf(stderr,"Truncated embed_tokens\n");exit(1);}fclose(f);
-     f=fopen("weights_int4_qwen3_8b_fp16sc/embed_tokens.scale_t","rb");fread(h,4,5,f);
+     snprintf(p,256,"%s/embed_tokens.scale_t",g_wdir);
+     f=fopen(p,"rb");fread(h,4,5,f);
      size_t ss=(size_t)h[3]*h[4];{__half* tmp=new __half[ss];size_t nr=fread(tmp,2,ss,f);if(nr!=ss){fprintf(stderr,"Truncated embed_tokens scales\n");exit(1);}
       for(size_t i=0;i<ss;++i) host_embed_sc[i]=__half2float(tmp[i]);delete[] tmp;}fclose(f);}
     fprintf(stderr,"All weights loaded.\n");
@@ -606,11 +612,9 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
         prefill_tokens_batched(input_ids, 0, gen_start);
     }
 
-    // Capture CUDA Graph for decode loop once (after prefill to set KV cache)
-    // Skip if already captured at startup
-    if (!graph_captured) {
-        capture_decode_graph();
-    }
+    // CUDA Graph path abandoned (Session 84): produces garbled output after step1
+    // Per-kernel path fast enough (65-74 t/s). Keep capture code commented for reference.
+    // if (!graph_captured) { capture_decode_graph(); }
 
     // ── Phase 2: Decode — generate new tokens one at a time ──
     for (int step = gen_start; step < total; ++step) {
@@ -643,7 +647,7 @@ static std::vector<uint32_t> generate(const std::vector<uint32_t>& input_ids,
             fflush(stdout);
         }
 
-        if (next_id == 151643) break;
+        if (next_id == 128009 || next_id == 128001) break;
     }
 
     return std::vector<uint32_t>(all_ids.begin() + gen_start, all_ids.end());
@@ -666,16 +670,21 @@ static std::string json_escape(const std::string& s) {
 }
 
 int main(int argc, char** argv) {
-    const char* model = argc > 1 ? argv[1] : "8b";
+    const char* model = argc > 1 ? argv[1] : "llama32_3b";
+    // argparse: argv[2] can be weight dir
+    if (argc > 2) g_wdir = argv[2];
 
-    fprintf(stderr, "Blackwell INT4 Server v0.9.1\n");
+    fprintf(stderr, "Blackwell Llama 3.2 3B INT4 Server\n");
     cudaDeviceProp P; cudaGetDeviceProperties(&P, 0);
     fprintf(stderr, "Device: %s (CC %d.%d)\n", P.name, P.major, P.minor);
 
     die(cudaStreamCreate(&st), "stream");
 
-    if (tokenizer.load("tokenizer_data.bin") != 0) {
-        fprintf(stderr, "FAIL: no tokenizer_data.bin\n"); return 1;
+    char tp[512]; snprintf(tp,512,"%s/tokenizer_data.bin",g_wdir);
+    if (tokenizer.load(tp) != 0) {
+        if (tokenizer.load("tokenizer_data.bin") != 0) {
+            fprintf(stderr, "FAIL: no tokenizer_data.bin\n"); return 1;
+        }
     }
 
     load_model();
